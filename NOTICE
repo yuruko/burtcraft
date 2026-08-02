@@ -43,9 +43,31 @@ Modifications made for burtcraft:
            Camera view-angle hooks (smoothed look / auto third-person) and HUD
            stack handling.
 
+  ADDED    src/main/java/adris/altoclef/tasks/misc/EatNowTask.java
+           A user task that does nothing per tick. Its only job is to keep the
+           TaskRunner enabled long enough for FoodChain to eat: see the
+           TaskRunner note below for why that is necessary at all.
+
   MODIFIED src/main/java/adris/altoclef/commandsystem/CommandExecutor.java
            Added a public getMod() accessor so the control server can read the
            live task chain (used for the "what am I doing right now" readout).
+
+  MODIFIED src/main/java/adris/altoclef/chains/FoodChain.java
+           Added requestEat(AltoClef), which drives the chain's own fillup path
+           so an external controller can make the bot eat what it is already
+           carrying. Upstream has no such entry point: `@food <n>` means "end up
+           holding n food", which is satisfied instantly when the food is
+           already in the pack, so the bot reported eating while it starved.
+           requestEat recomputes from the inventory rather than reading the
+           _hasFood field, which is a cache written only inside getPriority()
+           and is therefore stale whenever the runner is idle.
+
+  MODIFIED src/main/java/adris/altoclef/tasksystem/TaskRunner.java
+           Added isActive(). tick() returns immediately while inactive, so NO
+           chain runs -- not food, not defense -- and the runner is inactive
+           whenever no user task is running. Anything poking a chain from
+           outside the tick loop has to be able to ask whether that poke will
+           ever be read.
 
   MODIFIED src/main/java/adris/altoclef/Settings.java
            `showTaskChains` now defaults to false. Upstream's task-tree dump is

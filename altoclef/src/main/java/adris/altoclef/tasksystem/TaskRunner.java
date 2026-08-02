@@ -64,6 +64,18 @@ public class TaskRunner {
         Debug.logMessage("Stopped");
     }
 
+    /**
+     * whether the chains are actually being ticked.
+     * <p>
+     * this matters far more than it reads: while this is false, tick() returns
+     * immediately and NO chain gets a turn - not the food chain, not defense,
+     * nothing. anything that pokes a chain from outside the tick (burnt's
+     * external control server) has to know whether that poke will ever be read.
+     */
+    public boolean isActive() {
+        return _active;
+    }
+
     public TaskChain getCurrentTaskChain() {
         return _cachedCurrentTaskChain;
     }

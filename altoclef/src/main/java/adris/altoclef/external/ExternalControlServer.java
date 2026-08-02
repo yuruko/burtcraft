@@ -6,6 +6,7 @@ import adris.altoclef.commandsystem.CommandExecutor;
 import adris.altoclef.eventbus.EventBus;
 import adris.altoclef.eventbus.events.ChatMessageEvent;
 import adris.altoclef.eventbus.events.TaskFinishedEvent;
+import adris.altoclef.tasks.misc.EatNowTask;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -802,10 +803,28 @@ public class ExternalControlServer implements ClientModInitializer {
                     AltoClef mod = exec.getMod();
                     if (mod == null || mod.getFoodChain() == null) {
                         sendError(id, "food chain not ready");
-                    } else if (!mod.getFoodChain().requestEat()) {
+                        return;
+                    }
+                    if (!mod.getFoodChain().requestEat(mod)) {
                         sendError(id, "nothing edible in the inventory");
-                    } else {
+                        return;
+                    }
+                    // THE FLAG IS ONLY READ WHILE THE TASK RUNNER IS ON. the food
+                    // chain does its eating inside getPriority(), and the runner
+                    // skips every chain while it is disabled - which is exactly
+                    // whenever no user task is running. so setting the fillup flag
+                    // while the bot was idle ate nothing at all, forever, and the
+                    // controller kept reissuing eat into that void until she was a
+                    // statue. when she is idle, park a user task whose only job is
+                    // to keep the runner awake until the food is down.
+                    if (mod.getTaskRunner().isActive()) {
                         sendFinished(id);
+                    } else {
+                        EatNowTask eat = new EatNowTask();
+                        mod.runUserTask(eat, () -> {
+                            if (eat.ate()) sendFinished(id);
+                            else sendError(id, "could not get the food down - something interrupted the eat");
+                        });
                     }
                 } catch (Throwable t) {
                     sendError(id, "eat failed: " + t.getMessage());

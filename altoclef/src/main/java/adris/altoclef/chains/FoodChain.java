@@ -284,17 +284,28 @@ public class FoodChain extends SingleTaskChain {
     }
 
     /**
-     * Force an eat on the next tick, using the chain's own fillup path.
+     * force an eat on the next tick, using the chain's own fillup path.
      * <p>
-     * Burnt's "eat" action used to map to {@code @food <n>}, which only means
+     * burnt's "eat" action used to map to {@code @food <n>}, which only means
      * "END UP HOLDING n food" - with food already in the pack that is satisfied
      * instantly and nothing is ever eaten, so she reported "ate" while starving.
-     * The eat gate in getPriority() is {@code needsToEat() || _requestFillup},
+     * the eat gate in getPriority() is {@code needsToEat() || _requestFillup},
      * so setting the flag makes her actually eat what she is carrying without
      * duplicating any of the food-selection logic.
+     * <p>
+     * it takes the mod on purpose. the obvious version asked {@link #hasFood()},
+     * which reads a static cache written ONLY inside getPriority() - and
+     * getPriority() runs only while the task runner is enabled, behind six early
+     * returns. so while burnt was idle that cache was simply stale (false, its
+     * static default, on a fresh session) and this refused every single eat with
+     * "nothing edible in the inventory" while she stood there carrying bread.
+     * ask the inventory, not the cache.
      */
-    public boolean requestEat() {
-        if (!hasFood()) return false;
+    public boolean requestEat(AltoClef mod) {
+        Tuple<Integer, Optional<Item>> calculation = calculateFood(mod);
+        _hasFood = calculation.getA() > 0;
+        _cachedPerfectFood = calculation.getB();
+        if (!_hasFood || _cachedPerfectFood.isEmpty()) return false;
         _requestFillup = true;
         return true;
     }

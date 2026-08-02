@@ -38,3 +38,5 @@ logs/
 saves/
 altoclef_settings.json
 baritone/settings.txt
+# the memory the core persists at runtime - the examples create it on first run
+data/

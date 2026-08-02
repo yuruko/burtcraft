@@ -333,6 +333,23 @@ const OVEN_TARGETS = { furnace: 3, smoker: 2, campfire: 2, blast_furnace: 1 };
 const OVEN_PREREQ = { blast_furnace: /iron_ingot|iron_block/ };
 const MAX_LAVA_PILGRIMAGES = 1;                    // per home; a shrine, not a hobby
 const SAFETY_INTERVENTION_COOLDOWN_MS = 12 * 1000;
+// how long the "too hurt, do nothing" answer may hold her before it gives up and
+// lets normal behaviour resume. without a ceiling it is a hang: health does not
+// recover on its own when there is nothing to eat, so the condition that produced
+// the park is exactly the condition that keeps it true.
+const LOW_HEALTH_PARK_MAX_MS = 45 * 1000;
+// the urgent-safety branch returns before EVERY other behaviour, so a safety
+// answer that never resolves is not caution - it is a hang. found live: the game
+// refused every eat ("nothing edible in the inventory") while she was carrying
+// bread, so the low-health branch re-issued `eat` on every tick and nothing else
+// ever ran. the goal showed on screen and absolutely nothing happened, until the
+// world was closed. safety gets a ceiling and then has to share.
+const URGENT_SAFETY_MAX_MS = 90 * 1000;    // how long safety may own the loop
+const URGENT_SAFETY_YIELD_MS = 60 * 1000;  // then the rest of the brain gets a turn
+// consecutive failed eats after which eating is treated as unavailable instead
+// of retried into the ground. an eat that errors twice is a broken pipe, not bad luck.
+const EAT_FAIL_STREAK_LIMIT = 2;
+const EAT_FAIL_BACKOFF_MS = 5 * 60 * 1000;
 const MINECRAFT_MOOD_MAP = {
     cozy: 'happy',
     hype: 'excited',
@@ -518,6 +535,15 @@ class MinecraftTool extends EventEmitter {
         // task has been running with no burnt-side goal behind it
         this._lastDamageAt = 0;
         this._orphanTaskSince = 0;
+        // eat health: a refused eat is a real answer and has to be remembered,
+        // otherwise the safety branch reissues it forever (see URGENT_SAFETY_MAX_MS)
+        this._lastEatAttemptAt = 0;
+        this._lastEatFailureAt = 0;
+        this._eatFailStreak = 0;
+        this._lowHealthParkedAt = 0;
+        // how long the urgent-safety branch has continuously owned the tick
+        this._urgentSafetySince = 0;
+        this._urgentSafetyYieldUntil = 0;
         // in-game intent hud: last line sent, so it only goes on real change
         this._lastIntentSignature = null;
         this._lastIntentPushAt = 0;
@@ -927,6 +953,8 @@ class MinecraftTool extends EventEmitter {
             this.gamerMode = false;
             this._lastBotTaskPhase = '';
         }
+
+        if (pending.action === 'eat') this._noteEatOutcome(msg.status === 'success');
 
         if (msg.status === 'success') {
             if (msg.result?.persistent) {
@@ -2444,7 +2472,7 @@ class MinecraftTool extends EventEmitter {
         if (this.autonomousTimer.unref) this.autonomousTimer.unref();
     }
 
-    _urgentSafetyBehavior() {
+    _urgentSafetyBehavior(now = Date.now()) {
         const g = this.gameState;
         const health = Number(g.health);
         const hunger = Number(g.hunger);
@@ -2464,6 +2492,34 @@ class MinecraftTool extends EventEmitter {
             };
         }
         if (Number.isFinite(health) && health > 0 && health <= 8) {
+            // WITH FOOD, EAT. this used to return action:null while SAYING "backing
+            // off long enough to eat and regenerate" - so she announced a meal,
+            // issued nothing, and waited for FoodChain to save her. FoodChain only
+            // auto-eats when needsToEat() is true (health <= 10 AND foodLevel <= 19),
+            // so on a full stomach at 8hp it never fires: she parked, and
+            // _requestSafetyIntervention re-stopped her every 12s forever. found
+            // live with a diamond pickaxe, food in the bag, 8hp, staring at a
+            // crafting table for minutes.
+            //
+            // ...but only while eating is a thing that actually happens. this
+            // branch used to return `eat` on EVERY tick with no gate at all, so
+            // when the game answered "nothing edible in the inventory" (it does:
+            // the food chain's has-food cache goes stale whenever she is idle)
+            // she reissued the same doomed eat forever and the tick returned
+            // before anything else could run. that is the freeze, not the eat.
+            if (hasFood && this._eatIsWorth(now)) {
+                this._lastEatAttemptAt = now;
+                return {
+                    action: 'eat',
+                    params: this._eatParams(),
+                    say: 'i am not finishing this job this hurt. eating before anything else'
+                };
+            }
+            // no food on her at all: this is a GATHER (`@food n`), a real task
+            // with a real completion - not the instant eat that can fail into a
+            // loop. it keeps no gate on purpose. going to look for food while
+            // hurt and hungry is always better than standing still, and the
+            // ceiling in _autonomousTick is what stops it if it stops working.
             if (!hasFood && Number.isFinite(hunger) && hunger < 19) {
                 return {
                     action: 'eat',
@@ -2471,16 +2527,22 @@ class MinecraftTool extends EventEmitter {
                     say: 'i am not finishing this job this hurt with no food. backing off and finding something edible'
                 };
             }
+            // NOTHING USEFUL TO ISSUE. this is the only branch that may legitimately
+            // do nothing - and it must EXPIRE. a "stand still until things are sane"
+            // instruction with no exit condition is indistinguishable from a hang, and
+            // standing at 8hp is not safer than getting on with something.
+            if (!this._lowHealthParkedAt) this._lowHealthParkedAt = now;
+            if (now - this._lowHealthParkedAt > LOW_HEALTH_PARK_MAX_MS) return null;
             return {
                 action: null,
                 params: {},
-                say: hasFood
-                    ? 'i am not finishing this job this hurt. backing off long enough to eat and regenerate'
-                    : hostiles
+                say: hostiles
                     ? 'no food and too hurt for heroics. aborting the job and letting them pass'
                     : 'too hurt to keep forcing this. pausing until the situation is sane'
             };
         }
+        // healthy again (or at least off the floor): the park may start over next time
+        this._lowHealthParkedAt = 0;
         if (Number.isFinite(hunger) && hunger <= 4) {
             // hasFood used to mean action:null here - she announced a food break
             // and then did NOTHING, over and over, while holding bread.
@@ -2489,8 +2551,8 @@ class MinecraftTool extends EventEmitter {
             // tick: that burned every 25s cycle on a no-op and looked exactly
             // like standing still doing nothing. back off instead, so the rest of
             // the idle brain gets its turn.
-            if (Date.now() - (this._lastEatAttemptAt || 0) < EAT_RETRY_GAP_MS) return null;
-            this._lastEatAttemptAt = Date.now();
+            if (!this._eatIsWorth(now)) return null;
+            this._lastEatAttemptAt = now;
             return {
                 action: 'eat',
                 params: this._eatParams(),
@@ -2507,6 +2569,33 @@ class MinecraftTool extends EventEmitter {
             };
         }
         return null;
+    }
+
+    // is issuing another `eat` worth the tick? two things make it not: the last
+    // one is too recent to have moved the hunger bar yet, or the game has been
+    // refusing them outright. the second case matters more than it looks - an
+    // eat is the one safety answer that can fail silently and permanently (the
+    // in-game food chain reports "nothing edible" from a cache that goes stale
+    // while she is idle), and the safety branch that issues it returns before
+    // every other behaviour. an eat nobody checks is how she froze.
+    _eatIsWorth(now = Date.now()) {
+        if (this._eatFailStreak >= EAT_FAIL_STREAK_LIMIT &&
+            now - this._lastEatFailureAt < EAT_FAIL_BACKOFF_MS) return false;
+        return now - this._lastEatAttemptAt >= EAT_RETRY_GAP_MS;
+    }
+
+    // remember whether eating actually works, so _eatIsWorth can stop offering it
+    _noteEatOutcome(ok) {
+        if (ok) {
+            this._eatFailStreak = 0;
+            return;
+        }
+        this._eatFailStreak++;
+        this._lastEatFailureAt = Date.now();
+        if (this._eatFailStreak === EAT_FAIL_STREAK_LIMIT) {
+            this.log('warn', `eating has failed ${this._eatFailStreak}x - treating food as unavailable for ${Math.round(EAT_FAIL_BACKOFF_MS / 60000)}min so it stops eating every tick`);
+            this.recentEvents.record('tried to eat and the food never made it to my mouth');
+        }
     }
 
     _requestSafetyIntervention(action, params = {}, say = null) {
@@ -3170,10 +3259,31 @@ class MinecraftTool extends EventEmitter {
         if (this._recoverStalledGoal()) return;
         if (this._recoverLoopingGoal()) return;
         if (!this.autonomous) return;
-        const urgentSafety = this._urgentSafetyBehavior();
-        if (urgentSafety) {
-            this._requestSafetyIntervention(urgentSafety.action, urgentSafety.params, urgentSafety.say);
-            return;
+        // SAFETY IS NOT ALLOWED TO OWN THE LOOP FOREVER. this branch returns
+        // before every other behaviour, so if the situation it reacts to cannot
+        // be fixed by the action it picks, she stands still with the safety goal
+        // on screen and nothing ever runs again. that is not a hypothetical: a
+        // permanently-failing eat at 8hp froze the bot solid. the individual
+        // answers already back off; this is the floor under all of them,
+        // including ones that don't exist yet.
+        const urgentSafety = this._urgentSafetyBehavior(now);
+        if (!urgentSafety) {
+            this._urgentSafetySince = 0;
+            this._urgentSafetyYieldUntil = 0;
+        } else if (now >= this._urgentSafetyYieldUntil) {
+            if (!this._urgentSafetySince) this._urgentSafetySince = now;
+            if (now - this._urgentSafetySince <= URGENT_SAFETY_MAX_MS) {
+                this._requestSafetyIntervention(urgentSafety.action, urgentSafety.params, urgentSafety.say);
+                return;
+            }
+            // the ceiling: it has been reacting to the same danger this whole
+            // time and is no safer for it. standing still hurt is not safer
+            // than getting on with something.
+            const held = Math.round((now - this._urgentSafetySince) / 1000);
+            this.log('warn', `safety has owned the loop for ${held}s without fixing anything (${urgentSafety.action || 'stand still'}); yielding so she can do something else`);
+            this.recentEvents.record('stopped waiting to feel safe and got on with something');
+            this._urgentSafetySince = 0;
+            this._urgentSafetyYieldUntil = now + URGENT_SAFETY_YIELD_MS;
         }
         // persistent behaviors (explore/idle/follow) never finish on their own -
         // without a dwell budget the first autonomous explore (or nightfall idle)
