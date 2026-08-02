@@ -702,6 +702,22 @@ public final class Settings {
     public final Setting<Boolean> chatDebug = new Setting<>(false);
 
     /**
+     * BURNT FORK, DEFAULT ON: never write baritone's own messages into the game chat.
+     * <p>
+     * Baritone narrates itself - "Done building", "Death position saved", path
+     * failures, calculation notices - through {@code logDirect}, which is the "show
+     * this regardless of chatDebug" path, so {@code chatDebug} does not silence any
+     * of it. Every one of those lines lands on stream, and the burtcraft companion's
+     * chat capture can pick them up and feed them back to her brain as though a
+     * person had spoken. She is a VTuber; the pathfinder is not a cast member.
+     * <p>
+     * This suppresses the CHAT/toast output only. The text is still written to the
+     * game log (stdout), because reading latest.log is how these problems actually
+     * get diagnosed. Set to false to get vanilla baritone chatter back.
+     */
+    public final Setting<Boolean> chatSilence = new Setting<>(true);
+
+    /**
      * Allow chat based control of Baritone. Most likely should be disabled when Baritone is imported for use in
      * something else
      */

@@ -668,6 +668,24 @@ public class TaskCatalogue {
         CataloguedResource result = new CataloguedResource(matches, getTask);
         Block[] blocks = ItemHelper.itemsToBlocks(matches);
         // DEFAULT BEHAVIOUR: Mine if present & assume overworld is required!
+        //
+        // "mine if present" means: if a placed block of this item is anywhere in
+        // sight, go break THAT instead of obtaining the item properly. it is enabled
+        // here for every catalogued item whose Item maps to a real Block - which
+        // silently includes everything CRAFTABLE that happens to be placeable.
+        //
+        // that is why "@get torch" sent her hunting for torches to smash instead of
+        // making them out of coal and sticks, and the same applied
+        // to crafting_table, chest, planks, ladders, beds - anything with a recipe.
+        // on a shared server that is not a shortcut, it is stealing the furniture off
+        // somebody's base, and it is a direct source of the "You are not allowed to
+        // interact with this block!" denials.
+        //
+        // the recipe helpers therefore call dontMineIfPresent(): if she knows how to
+        // BUILD a thing, building it is the answer and the placed block is nobody's
+        // spare parts. mining stays the default for everything else (ores, dirt,
+        // gravel, sand - things you genuinely get by digging). a caller that really
+        // wants the old behaviour can still chain .mineIfPresent() after the helper.
         if (blocks.length != 0) {
             result.mineIfPresent();
         }
@@ -798,12 +816,16 @@ public class TaskCatalogue {
 
     private static CataloguedResource shapedRecipe2x2(String name, Item match, int outputCount, String s0, String s1, String s2, String s3) {
         CraftingRecipe recipe = CraftingRecipe.newShapedRecipe(name, new ItemTarget[]{t(s0), t(s1), t(s2), t(s3)}, outputCount);
-        return put(name, new Item[]{match}, count -> new CraftInInventoryTask(new RecipeTarget(match, count, recipe)));
+        // IF SHE KNOWS THE RECIPE, SHE BUILDS IT. see dontMineIfCraftable() below.
+        return put(name, new Item[]{match}, count -> new CraftInInventoryTask(new RecipeTarget(match, count, recipe)))
+                .dontMineIfPresent();
     }
 
     private static CataloguedResource shapedRecipe3x3(String name, Item match, int outputCount, String s0, String s1, String s2, String s3, String s4, String s5, String s6, String s7, String s8) {
         CraftingRecipe recipe = CraftingRecipe.newShapedRecipe(name, new ItemTarget[]{t(s0), t(s1), t(s2), t(s3), t(s4), t(s5), t(s6), t(s7), t(s8)}, outputCount);
-        return put(name, new Item[]{match}, count -> new CraftInTableTask(new RecipeTarget(match, count, recipe)));
+        // IF SHE KNOWS THE RECIPE, SHE BUILDS IT. see dontMineIfCraftable() below.
+        return put(name, new Item[]{match}, count -> new CraftInTableTask(new RecipeTarget(match, count, recipe)))
+                .dontMineIfPresent();
     }
 
     private static CataloguedResource shapedRecipe2x2Block(String name, Item match, String material) {

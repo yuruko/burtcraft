@@ -1,5 +1,6 @@
 package adris.altoclef.external;
 
+import net.minecraft.client.tutorial.TutorialSteps;
 import adris.altoclef.AltoClef;
 import adris.altoclef.commandsystem.CommandExecutor;
 import adris.altoclef.eventbus.EventBus;
@@ -183,7 +184,12 @@ public class ExternalControlServer implements ClientModInitializer {
                     }
                     manualKeyWasDown = down;
                     keepAwakeTick(mc);
+                    tutorialGuardTick(mc);
                     autoThirdPersonTick(mc);
+                    // end an expired container showcase even if the task that opened it
+                    // never calls closeScreen() again - an open screen blocks movement,
+                    // so the linger must always have a floor under it.
+                    adris.altoclef.util.helpers.StorageHelper.tickScreenShowcase();
                 } catch (Throwable ignored) { }
             });
         } catch (Throwable t) {
@@ -481,7 +487,7 @@ public class ExternalControlServer implements ClientModInitializer {
             java.util.List<String> lines = new java.util.ArrayList<>(3);
             java.util.List<Integer> colours = new java.util.ArrayList<>(3);
             if (manualControl) {
-                lines.add("manual - yuru has the keyboard");
+                lines.add("manual - operator has the keyboard");
                 colours.add(0xFFFFC65B);
             } else {
                 // a stale line claiming she is mid-task is worse than no line at all
@@ -505,6 +511,65 @@ public class ExternalControlServer implements ClientModInitializer {
         } catch (Throwable ignored) { }
     }
 
+    // ---- kill the tutorial hints ---------------------------------------------
+    // "Look around" (tutorial.look.title) sat on screen permanently. same root cause
+    // as the 10fps AFK throttle: baritone drives the player in CODE, so no real mouse
+    // input ever reaches the game, the tutorial never decides she has learned to look
+    // around, and the toast never goes away. she is not learning to play minecraft.
+    // re-enforced periodically because joining a world / a rewritten options.txt puts
+    // the step back. env kill switch, like the rest of the client-side nudges.
+    private static final boolean HIDE_TUTORIAL = !"0".equals(System.getenv("BURTCRAFT_HIDE_TUTORIAL"));
+    private static int tutorialGuardTicks = 0;
+
+    private static void tutorialGuardTick(Minecraft mc) {
+        if (!HIDE_TUTORIAL) return;
+        if (++tutorialGuardTicks < 40) return;   // ~2s
+        tutorialGuardTicks = 0;
+        try {
+            if (mc.options.tutorialStep != TutorialSteps.NONE) {
+                mc.options.tutorialStep = TutorialSteps.NONE;
+                // setStep stops the running step, which is what actually removes the
+                // toast already on screen - the option alone only stops the next one.
+                mc.getTutorial().setStep(TutorialSteps.NONE);
+                log("tutorial hints were on (\"look around\" never clears for a bot) - turned off");
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    // ---- how big is the room -------------------------------------------------
+    // returns the edge length of the largest clear cube she is standing in, measured
+    // from her feet upward (the floor is not counted - a room is supposed to have one).
+    // expands one shell at a time and stops as soon as a shell is more than a tenth
+    // solid, so standing in a tunnel costs a handful of block lookups and only a real
+    // hall ever walks the full radius. capped so this can never become a survey.
+    private static final int CLEAR_SCAN_MAX_RADIUS = 22;      // edge 45
+    private static final double CLEAR_SHELL_SOLID_TOLERANCE = 0.10;
+
+    private static int measureClearEdge(Minecraft mc) {
+        if (mc.player == null || mc.level == null) return 0;
+        BlockPos feet = mc.player.blockPosition();
+        int radius = 0;
+        for (int r = 1; r <= CLEAR_SCAN_MAX_RADIUS; r++) {
+            int checked = 0;
+            int solid = 0;
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    for (int dy = 1; dy <= 2 * r; dy++) {
+                        // shell only: skip anything already counted by a smaller radius
+                        if (Math.abs(dx) != r && Math.abs(dz) != r && dy != 2 * r) continue;
+                        checked++;
+                        BlockPos at = feet.offset(dx, dy, dz);
+                        if (!mc.level.getBlockState(at).isAir()) solid++;
+                    }
+                }
+            }
+            if (checked == 0) break;
+            if ((double) solid / checked > CLEAR_SHELL_SOLID_TOLERANCE) break;
+            radius = r;
+        }
+        return radius <= 0 ? 0 : radius * 2 + 1;
+    }
+
     // ---- auto third-person ---------------------------------------------------
     // baritone aims the camera at its next foothold, so while she walks she stares
     // at the dirt and the stream sees nothing. this ONLY changes the view mode -
@@ -514,6 +579,24 @@ public class ExternalControlServer implements ClientModInitializer {
     private static boolean autoThirdPersonActive = false;
     private static int lookDownTicks = 0;
     private static int lookUpTicks = 0;
+    // the "human camera": an occasional deliberate drop to third person while walking.
+    // env kill switch so it can go without a rebuild.
+    private static final boolean VANITY_CAMERA = !"0".equals(System.getenv("BURTCRAFT_VANITY_CAMERA"));
+    // was 90s + up to 150s jitter (so 1.5-4min apart) and only ever while walking,
+    // which on stream read as "basically always first person". much shorter gap, and
+    // it may now fire while she is standing still or working too - see the trigger.
+    private static final long VANITY_MIN_GAP_MS = 30_000L;
+    private static final long VANITY_GAP_JITTER_MS = 45_000L;
+    private static final long VANITY_MIN_HOLD_MS = 8_000L;
+    private static final long VANITY_HOLD_JITTER_MS = 14_000L;
+    // how often the shot happens even though she is NOT travelling. people flip to
+    // third person to look at themselves while idling, not just while walking.
+    private static final double VANITY_IDLE_CHANCE = 0.55;
+    // front view is the "look at my own face" beat - the one that reads most like a
+    // person messing about, so it is worth more than the old 1-in-4.
+    private static final double VANITY_FRONT_CHANCE = 0.4;
+    private static long nextVanityAt = 0L;
+    private static long vanityUntil = 0L;
 
     private static void autoThirdPersonTick(Minecraft mc) {
         if (!AUTO_THIRD_PERSON) return;
@@ -530,6 +613,41 @@ public class ExternalControlServer implements ClientModInitializer {
 
             if (staringDown && moving) { lookDownTicks++; lookUpTicks = 0; }
             else { lookUpTicks++; lookDownTicks = 0; }
+
+            // HUMAN CAMERA. people do not play a whole session locked in first person -
+            // they drop to third to look at themselves, check their surroundings, admire
+            // a build, then flip back. this is that, on a long random cadence, and only
+            // while she is actually travelling: never mid-mine (the camera snap there is
+            // load-bearing) and never over the head-down handling below, which owns the
+            // "staring at the dirt" case and would otherwise fight this for the camera.
+            if (VANITY_CAMERA && !staringDown && !autoThirdPersonActive) {
+                if (vanityUntil > 0 && System.currentTimeMillis() > vanityUntil) {
+                    if (mc.options.getCameraType() != CameraType.FIRST_PERSON) {
+                        mc.options.setCameraType(CameraType.FIRST_PERSON);
+                    }
+                    vanityUntil = 0;
+                    nextVanityAt = System.currentTimeMillis() + VANITY_MIN_GAP_MS
+                        + (long) (Math.random() * VANITY_GAP_JITTER_MS);
+                } else if (vanityUntil == 0 && System.currentTimeMillis() > nextVanityAt) {
+                    // NOT gated on `moving` any more. requiring travel meant the whole
+                    // camera only ever existed on long walks - every fight, craft, build
+                    // and idle moment stayed locked in first person, which is most of a
+                    // session. while she is still it fires on a coin-flip instead, so it
+                    // stays a occasional human beat rather than a metronome.
+                    boolean take = moving || Math.random() < VANITY_IDLE_CHANCE;
+                    if (take && mc.options.getCameraType() == CameraType.FIRST_PERSON) {
+                        mc.options.setCameraType(Math.random() < VANITY_FRONT_CHANCE
+                            ? CameraType.THIRD_PERSON_FRONT : CameraType.THIRD_PERSON_BACK);
+                        vanityUntil = System.currentTimeMillis() + VANITY_MIN_HOLD_MS
+                            + (long) (Math.random() * VANITY_HOLD_JITTER_MS);
+                    } else if (!take) {
+                        // lost the coin flip: wait out another gap rather than re-rolling
+                        // every tick, which would make "sometimes" mean "within 50ms".
+                        nextVanityAt = System.currentTimeMillis() + VANITY_MIN_GAP_MS
+                            + (long) (Math.random() * VANITY_GAP_JITTER_MS);
+                    }
+                }
+            }
 
             if (!autoThirdPersonActive && lookDownTicks >= LOOK_DOWN_TICKS) {
                 // don't fight a view the operator chose themselves
@@ -549,6 +667,17 @@ public class ExternalControlServer implements ClientModInitializer {
     private static void resetAutoCamera() {
         lookDownTicks = 0;
         lookUpTicks = 0;
+        // hand the camera back cleanly: f1 manual control and world loss both land here,
+        // and a vanity shot left running would keep the operator in third person.
+        if (vanityUntil > 0) {
+            try {
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.options.getCameraType() != CameraType.FIRST_PERSON) {
+                    mc.options.setCameraType(CameraType.FIRST_PERSON);
+                }
+            } catch (Throwable ignored) { }
+            vanityUntil = 0;
+        }
         if (autoThirdPersonActive) {
             try {
                 Minecraft mc = Minecraft.getInstance();
@@ -1021,6 +1150,15 @@ public class ExternalControlServer implements ClientModInitializer {
                         }
                         gs.add("nearby", nb);
                     } catch (Throwable ignored) { }
+
+                    // HOW BIG IS THE ROOM SHE IS STANDING IN.
+                    // burnt's home has to be a real space: 20x20x20 clear, plus a block
+                    // of edge per furnace in the collection. node owns that rule; this
+                    // just measures. grows a cube outward from head height and stops at
+                    // the first shell that is mostly solid, so a cave or a hillside ends
+                    // the scan almost immediately and only a genuine hall costs anything.
+                    // the floor is deliberately excluded - a room needs one.
+                    try { gs.addProperty("clearEdge", measureClearEdge(mc)); } catch (Throwable ignored) { }
 
                     if (isNight && !lastWasNight) sendEvent("nightfall", new JsonObject());
                     lastWasNight = isNight;

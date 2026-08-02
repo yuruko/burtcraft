@@ -1049,7 +1049,18 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             if (itemState != null) {
                 result.add(itemState);
             } else {
-                result.add(Blocks.AIR.defaultBlockState());
+                // getStateForPlacement ran against the SYNTHETIC context above (the
+                // player's own feet, Direction.UP), so a null here means "that fake
+                // context did not suit this block" - NOT "this block cannot be
+                // placed". blocks with real placement constraints (a chest, which
+                // inspects its neighbours to decide single vs double) fail it
+                // routinely, and mapping them to AIR silently deleted them from the
+                // placeable list. altoclef's PlaceBlockTask then could not find the
+                // requested block and fell back to cobblestone, which is why
+                // "@place chest" put down STONE and left the chest in the inventory.
+                // the default state is a far better approximation than "nothing".
+                result.add(stack.isEmpty() ? Blocks.AIR.defaultBlockState()
+                        : ((BlockItem) stack.getItem()).getBlock().defaultBlockState());
             }
             // </toxic cloud>
         }

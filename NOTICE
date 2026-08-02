@@ -90,6 +90,27 @@ Modifications made for burtcraft:
              renderPathAsLine, renderGoal, renderGoalAnimated,
              renderGoalXZBeacon, renderSelectionBoxes) from enabled to
              disabled, so pathfinding overlays never appear on a live stream.
+           - Added `chatSilence` (default ENABLED): suppress Baritone's own
+             chat/toast output. Baritone narrates itself ("Done building",
+             "Death position saved", path failures) through logDirect, which is
+             deliberately exempt from `chatDebug`, so there was no upstream way
+             to quiet it. On a stream that text is on camera, and a controller
+             that captures game chat can read it back as though a player had
+             said it.
+
+  MODIFIED src/api/java/baritone/api/utils/Helper.java
+           logDirect(boolean, Component...) -- the single funnel every logDirect
+           overload passes through -- returns early when `chatSilence` is set,
+           after writing the same text to stdout so the game log keeps it for
+           diagnosis. Nothing else in the tree writes to chat directly.
+
+  MODIFIED src/main/java/baritone/process/BuilderProcess.java
+           approxPlaceable(): when getStateForPlacement returns null, fall back
+           to the block's default state instead of recording AIR. That call is
+           made against a synthetic BlockPlaceContext (the player's own feet,
+           Direction.UP), so blocks with real placement constraints -- a chest,
+           which inspects its neighbours to decide single vs double -- fail it
+           routinely and were silently deleted from the placeable list.
 
   MODIFIED src/main/java/baritone/pathing/movement/CalculationContext.java
            Added the `waterForbidden` field and the water pricing that backs

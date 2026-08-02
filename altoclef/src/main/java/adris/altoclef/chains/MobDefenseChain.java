@@ -9,6 +9,7 @@ import adris.altoclef.tasks.movement.DodgeProjectilesTask;
 import adris.altoclef.tasks.movement.RunAwayFromCreepersTask;
 import adris.altoclef.tasks.movement.RunAwayFromHostilesTask;
 import adris.altoclef.tasks.speedrun.DragonBreathTracker;
+import adris.altoclef.tasksystem.Task;
 import adris.altoclef.tasksystem.TaskRunner;
 import adris.altoclef.util.baritone.CachedProjectile;
 import adris.altoclef.util.helpers.*;
@@ -75,6 +76,12 @@ public class MobDefenseChain extends SingleTaskChain {
     // until something kills her. holding the engagement until the danger is actually gone
     // is what stops the teardown/rebuild cycle.
     private static final double DISENGAGE_KEEP_DISTANCE = 16;
+    // below this, running really is the right call even from one zombie
+    private static final float STAND_AND_FIGHT_MIN_HEALTH = 8;
+    // how long a chosen defensive answer is held before a sibling answer may replace
+    // it. must comfortably exceed a baritone path calculation (~1s at these ranges)
+    // or the answer never gets far enough to be one. see commitTo().
+    private static final double DEFENSE_COMMIT_SECONDS = 2.5;
     private static boolean _shielding = false;
     private final DragonBreathTracker _dragonBreathTracker = new DragonBreathTracker();
     private final KillAura _killAura = new KillAura();
@@ -86,8 +93,124 @@ public class MobDefenseChain extends SingleTaskChain {
 
     private float _cachedLastPriority;
 
+    // the answers this chain can give. they are SIBLINGS inside ONE chain, so
+    // TaskChain priority arbitrates none of them against each other - see commitTo().
+    private enum DefenseMode {NONE, DODGE, FIGHT, FLEE}
+
+    private DefenseMode _defenseMode = DefenseMode.NONE;
+    private final TimerGame _defenseCommitment = new TimerGame(DEFENSE_COMMIT_SECONDS);
+    private Class<?> _committedFightTarget;
+
     public MobDefenseChain(TaskRunner runner) {
         super(runner);
+    }
+
+    /**
+     * Hold a chosen defensive answer long enough for it to actually happen.
+     * <p>
+     * dodge / fight / flee all live in THIS chain and all return 65-80, so the
+     * chain-level hysteresis (DISENGAGE_KEEP_DISTANCE) never arbitrates between
+     * them: whichever branch matches on a given tick just calls setTask(), and
+     * SingleTaskChain.setTask() stops and resets the entire sub-task tree whenever
+     * the new task isn't equal() to the old one. isProjectileClose() flickers as
+     * arrows fly and land, so "arrow inbound -> dodge" and "no arrow -> kill the
+     * skeleton" traded the task back and forth about once a second. every trade
+     * restarts baritone pathing, which takes ~1s+ at these ranges, so she never
+     * finished a single path - she stood still in a crowd and was beaten to death
+     * (2026-08-01: killed by an enderman after flipping dodge/kill/flee 19 times in
+     * her last 20 seconds).
+     * <p>
+     * so: once an answer is picked, keep it. real escalations (fusing creeper,
+     * warden-class mob) bypass this via forceMode().
+     * <p>
+     * BEWARE isFinished() ON THESE TASKS. it does NOT mean "the work is done" - for a
+     * CustomBaritoneGoalTask it is {@code _cachedGoal.isInGoal(playerPos)}, i.e. "the
+     * condition happens to hold on THIS tick". GoalDodgeProjectiles is satisfied the
+     * instant no arrow is inbound; a run-away goal the instant she is briefly far
+     * enough. both flicker every tick as arrows and mobs move. a first version of this
+     * method released the commitment whenever the running task was "finished", which
+     * fired precisely when the sibling branch wanted the slot - dodge and flee then
+     * traded the task ~1x/sec and she died a second time (2026-08-01 22:17:57, shot by
+     * a Pillager she never got away from). the finished-check therefore only ever
+     * applies ACROSS answer classes, never between two evasions.
+     *
+     * @return true if the caller may (re)set its task, false if we are mid-commitment
+     * to a different answer and the caller must leave the running task alone.
+     */
+    private boolean commitTo(AltoClef mod, DefenseMode mode) {
+        if (_defenseMode == mode) return true;
+        if (_defenseMode == DefenseMode.NONE) {
+            forceMode(mode);
+            return true;
+        }
+        // DODGE and FLEE are the SAME ANSWER: get away. swapping between them buys
+        // nothing and costs a full task-tree teardown plus a fresh path calculation.
+        if (isEvasion(_defenseMode) && isEvasion(mode)) {
+            // one-way escalation only. fleeing hostiles subsumes dodging their arrows,
+            // so dodge may become flee; flee must NEVER fall back to dodge, because a
+            // two-way door here is exactly the ping-pong this whole mechanism exists
+            // to stop.
+            if (_defenseMode == DefenseMode.DODGE && mode == DefenseMode.FLEE) {
+                forceMode(mode);
+                return true;
+            }
+            return false;
+        }
+        if (_defenseCommitment.elapsed() || currentTaskDone(mod)) {
+            forceMode(mode);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isEvasion(DefenseMode m) {
+        return m == DefenseMode.DODGE || m == DefenseMode.FLEE;
+    }
+
+    private boolean currentTaskDone(AltoClef mod) {
+        Task current = getCurrentTask();
+        return current == null || current.stopped() || current.isFinished(mod);
+    }
+
+    private void forceMode(DefenseMode mode) {
+        if (_defenseMode != mode) {
+            _defenseMode = mode;
+            _committedFightTarget = null;
+        }
+        _defenseCommitment.reset();
+    }
+
+    private void releaseDefenseMode() {
+        _defenseMode = DefenseMode.NONE;
+        _committedFightTarget = null;
+    }
+
+    /**
+     * Pick ONE hostile to commit to, and keep picking it.
+     * <p>
+     * the old loop had two identical branches, so it always took toDealWith.get(0) -
+     * whose order comes from the entity tracker and reorders freely. a skeleton and
+     * an enderman standing together therefore swapped the kill target, and with it
+     * the whole task tree, on alternate ticks. hold the target while it is alive and
+     * still a problem; otherwise take the closest, since that is what is hitting her.
+     */
+    private Class<?> pickFightTarget(AltoClef mod, List<Entity> toDealWith) {
+        if (_committedFightTarget != null) {
+            for (Entity e : toDealWith) {
+                if (e.getClass() == _committedFightTarget && e.isAlive()) return _committedFightTarget;
+            }
+        }
+        Entity closest = null;
+        double best = Double.POSITIVE_INFINITY;
+        for (Entity e : toDealWith) {
+            double d = e.distanceToSqr(mod.getPlayer());
+            if (d < best) {
+                best = d;
+                closest = e;
+            }
+        }
+        _committedFightTarget = (closest != null ? closest : toDealWith.get(0)).getClass();
+        return _committedFightTarget;
     }
 
     public static double getCreeperSafety(Vec3 pos, Creeper creeper) {
@@ -184,10 +307,26 @@ public class MobDefenseChain extends SingleTaskChain {
             _wasPuttingOutFire = false;
         }
 
-        if (mod.getFoodChain().needsToEat() || mod.getMLGBucketChain().isFallingOhNo(mod) ||
-                !mod.getMLGBucketChain().doneMLG() || mod.getMLGBucketChain().isChorusFruiting()) {
+        // MLG bucket / chorus fruit genuinely own the controls - stand down.
+        if (mod.getMLGBucketChain().isFallingOhNo(mod) || !mod.getMLGBucketChain().doneMLG() ||
+                mod.getMLGBucketChain().isChorusFruiting()) {
             _killAura.stopShielding(mod);
             stopShielding(mod);
+            releaseDefenseMode();
+            return Float.NEGATIVE_INFINITY;
+        }
+        // eating used to stand defense down the same way, and that is what let the
+        // enderman finish her on 2026-08-01: needsToEat() turns on at health <= 10,
+        // i.e. exactly while she is being hit, and this early return then cancelled
+        // dodging, fleeing AND the force field for the whole chew. eating does not
+        // need the chain to yield at all - FoodChain.getPriority() returns
+        // NEGATIVE_INFINITY and eats asynchronously by holding right-click. so only
+        // stand down when nothing is actually attacking; in danger, defend and let
+        // the meal be interrupted. being alive beats being fed.
+        if (mod.getFoodChain().needsToEat() && !isInDanger(mod)) {
+            _killAura.stopShielding(mod);
+            stopShielding(mod);
+            releaseDefenseMode();
             return Float.NEGATIVE_INFINITY;
         }
 
@@ -202,6 +341,8 @@ public class MobDefenseChain extends SingleTaskChain {
         // Run away if a weird mob is close by.
         Optional<Entity> universallyDangerous = getUniversallyDangerousMob(mod);
         if (universallyDangerous.isPresent() && mod.getPlayer().getHealth() <= 10) {
+            // a warden-class mob at low health outranks any commitment.
+            forceMode(DefenseMode.FLEE);
             _runAwayTask = new RunAwayFromHostilesTask(DANGER_KEEP_DISTANCE, true);
             setTask(_runAwayTask);
             return 70;
@@ -229,6 +370,8 @@ public class MobDefenseChain extends SingleTaskChain {
             } else {
                 _doingFunkyStuff = true;
                 //Debug.logMessage("RUNNING AWAY!");
+                // a lit creeper always wins the argument.
+                forceMode(DefenseMode.FLEE);
                 _runAwayTask = new RunAwayFromCreepersTask(CREEPER_KEEP_DISTANCE);
                 setTask(_runAwayTask);
                 return 50 + blowingUp.getSwelling(1) * 50;
@@ -261,16 +404,26 @@ public class MobDefenseChain extends SingleTaskChain {
             if (!mod.getFoodChain().needsToEat() && mod.getModSettings().isDodgeProjectiles() && isProjectileClose(mod)) {
                 _doingFunkyStuff = true;
                 //Debug.logMessage("DODGING");
-                _runAwayTask = new DodgeProjectilesTask(ARROW_KEEP_DISTANCE_HORIZONTAL, ARROW_KEEP_DISTANCE_VERTICAL);
-                setTask(_runAwayTask);
+                // refused = we are mid-fight/mid-flight; return the priority anyway so
+                // the running answer keeps the chain and keeps ticking.
+                if (commitTo(mod, DefenseMode.DODGE)) {
+                    _runAwayTask = new DodgeProjectilesTask(ARROW_KEEP_DISTANCE_HORIZONTAL, ARROW_KEEP_DISTANCE_VERTICAL);
+                    setTask(_runAwayTask);
+                }
                 return 65;
             }
         }
         // Dodge all mobs cause we boutta die son
-        if (isInDanger(mod) && !escapeDragonBreath(mod) && !mod.getFoodChain().isShouldStop()) {
+        // ...unless it is a single melee mob she can actually take. see
+        // shouldStandAndFight: without that check she flees from the first hit onward
+        // and dies with her back turned, which is how she lost a fight to one zombie.
+        if (isInDanger(mod) && !escapeDragonBreath(mod) && !mod.getFoodChain().isShouldStop()
+            && !shouldStandAndFight(mod)) {
             if (_targetEntity == null) {
-                _runAwayTask = new RunAwayFromHostilesTask(DANGER_KEEP_DISTANCE, true);
-                setTask(_runAwayTask);
+                if (commitTo(mod, DefenseMode.FLEE)) {
+                    _runAwayTask = new RunAwayFromHostilesTask(DANGER_KEEP_DISTANCE, true);
+                    setTask(_runAwayTask);
+                }
                 return 70;
             }
         }
@@ -399,30 +552,24 @@ public class MobDefenseChain extends SingleTaskChain {
                 // spawn owns nothing, so "nothing equipped" is the normal case, not the edge case.
                 // let a reasonably healthy bot punch ONE ordinary melee mob; anything ranged or
                 // explosive still gets fled from, and 2+ mobs still gets fled from.
-                if (toDealWith.size() == 1 && numberOfProblematicEntities == 1 && mod.getPlayer().getHealth() > 10) {
-                    Entity only = toDealWith.get(0);
-                    boolean outrangesUs = only instanceof AbstractSkeleton || only instanceof Witch
-                            || only instanceof Pillager || only instanceof Creeper;
-                    if (!outrangesUs) canDealWith = 2;
+                if (toDealWith.size() == 1 && numberOfProblematicEntities == 1
+                        && mod.getPlayer().getHealth() > STAND_AND_FIGHT_MIN_HEALTH
+                        && !outrangesUs(toDealWith.get(0))) {
+                    canDealWith = 2;
                 }
                 if (canDealWith > numberOfProblematicEntities) {
                     // We can deal with it.
-                    _runAwayTask = null;
-                    for (Entity ToDealWith : toDealWith) {
-                        if (ToDealWith instanceof Skeleton || ToDealWith instanceof Witch ||
-                                ToDealWith instanceof Pillager || ToDealWith instanceof Piglin ||
-                                ToDealWith instanceof Stray) {
-                            setTask(new KillEntitiesTask(ToDealWith.getClass()));
-                            return 65;
-                        }
-                        setTask(new KillEntitiesTask(ToDealWith.getClass()));
-                        return 65;
+                    if (commitTo(mod, DefenseMode.FIGHT)) {
+                        _runAwayTask = null;
+                        setTask(new KillEntitiesTask(pickFightTarget(mod, toDealWith)));
                     }
                     return 65;
                 } else {
                     // We can't deal with it
-                    _runAwayTask = new RunAwayFromHostilesTask(DANGER_KEEP_DISTANCE, true);
-                    setTask(_runAwayTask);
+                    if (commitTo(mod, DefenseMode.FLEE)) {
+                        _runAwayTask = new RunAwayFromHostilesTask(DANGER_KEEP_DISTANCE, true);
+                        setTask(_runAwayTask);
+                    }
                     return 80;
                 }
             }
@@ -434,6 +581,9 @@ public class MobDefenseChain extends SingleTaskChain {
         } else {
             _runAwayTask = null;
         }
+        // nothing left to defend against - drop the commitment so the NEXT threat is
+        // answered on the tick it appears rather than after a stale hold expires.
+        releaseDefenseMode();
         return 0;
     }
 
@@ -691,6 +841,38 @@ public class MobDefenseChain extends SingleTaskChain {
             }
         }
         return false;
+    }
+
+    // mobs that punish running away, because they hit you from further than you can
+    // hit back (or explode). fleeing these is correct; fleeing a zombie is not.
+    private boolean outrangesUs(Entity e) {
+        return e instanceof AbstractSkeleton || e instanceof Witch
+            || e instanceof Pillager || e instanceof Creeper;
+    }
+
+    // COMMIT TO THE FIGHT.
+    // isVulnurable() is `armor < 5 && health < 18`, which for a bot with no armour is
+    // true after ONE HIT. so from first blood the panic flee (70) outranks the decision
+    // to fight (65): she swings once, turns, and a melee mob follows her and beats her
+    // to death from behind. a fresh spawn owns no armour, so that is the NORMAL case.
+    // if the entire threat is one ordinary melee mob and she can still take a few hits,
+    // stand and finish it.
+    private boolean shouldStandAndFight(AltoClef mod) {
+        if (mod.getPlayer().getHealth() <= STAND_AND_FIGHT_MIN_HEALTH) return false;
+        int close = 0;
+        try {
+            synchronized (BaritoneHelper.MINECRAFT_LOCK) {
+                for (Entity h : mod.getEntityTracker().getHostiles()) {
+                    if (!h.closerThan(mod.getPlayer(), SAFE_KEEP_DISTANCE)) continue;
+                    if (!EntityHelper.isAngryAtPlayer(mod, h)) continue;
+                    if (outrangesUs(h)) return false;   // running IS right against these
+                    if (++close > 1) return false;      // a crowd is not a fight
+                }
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return close == 1;
     }
 
     private boolean isVulnurable(AltoClef mod) {

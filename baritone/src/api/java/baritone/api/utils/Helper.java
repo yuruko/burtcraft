@@ -172,6 +172,17 @@ public interface Helper {
             component.append(Component.literal(" "));
         }
         Arrays.asList(components).forEach(component::append);
+        // BURNT FORK. every logDirect overload funnels through here, so this is the
+        // one place that decides whether baritone is allowed to talk. see
+        // Settings.chatSilence: its chatter goes on stream and can be re-ingested by
+        // the companion's chat capture as if a player said it. keep the text in the
+        // game log (that is how these bugs get diagnosed), keep it out of chat.
+        if (BaritoneAPI.getSettings().chatSilence.value) {
+            try {
+                System.out.println("[Baritone] " + component.getString());
+            } catch (Throwable ignored) { /* never let logging break pathing */ }
+            return;
+        }
         if (logAsToast) {
             logToast(getPrefix(), component);
         } else {

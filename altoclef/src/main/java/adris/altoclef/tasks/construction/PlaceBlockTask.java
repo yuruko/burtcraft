@@ -189,17 +189,40 @@ public class PlaceBlockTask extends Task implements ITaskRequiresGrounded {
         @Override
         public BlockState desiredState(int x, int y, int z, BlockState blockState, List<BlockState> available) {
             if (x == 0 && y == 0 && z == 0) {
-                // Place!!
+                // WHAT SHE WAS ASKED FOR WINS. the throwaway test used to run first,
+                // inside the same loop, so a caller that named a block AND allowed
+                // throwaways got whichever came first in the inventory - i.e. she
+                // dumped cobblestone into a spot she was told to put something
+                // specific in. throwaways are the "any solid block will do" case and
+                // may only apply once the real request is not available.
                 if (!available.isEmpty()) {
                     for (BlockState possible : available) {
                         if (possible == null) continue;
-                        if (_useThrowaways && _mod.getClientBaritoneSettings().acceptableThrowawayItems.value.contains(possible.getBlock().asItem())) {
-                            return possible;
-                        }
                         if (Arrays.asList(_toPlace).contains(possible.getBlock())) {
                             return possible;
                         }
                     }
+                    if (_useThrowaways) {
+                        for (BlockState possible : available) {
+                            if (possible == null) continue;
+                            if (_mod.getClientBaritoneSettings().acceptableThrowawayItems.value.contains(possible.getBlock().asItem())) {
+                                return possible;
+                            }
+                        }
+                    }
+                }
+                // NOT in `available` does NOT mean "place cobblestone". baritone
+                // derives that list from a synthetic BlockPlaceContext
+                // (BuilderProcess.approxPlaceable), and anything whose
+                // getStateForPlacement dislikes that fake context used to be recorded
+                // as AIR and vanish. substituting cobblestone for a NAMED request is
+                // never right: isFinished() checks for the block she asked for, never
+                // sees it, and she re-places stone forever while the real item stays
+                // in her bag. that is exactly the "she just places stones and the
+                // inventory never changes" report. ask for the real thing; if it
+                // truly cannot be placed, failing is the honest outcome.
+                if (_toPlace != null && _toPlace.length > 0 && _toPlace[0] != null) {
+                    return _toPlace[0].defaultBlockState();
                 }
                 Debug.logInternal("Failed to find throwaway block");
                 // No throwaways available!!

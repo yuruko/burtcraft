@@ -135,9 +135,9 @@ class MinecraftBotBridge extends EventEmitter {
         super();
 
         this.config = {
-            // left link: your controller's ws server (core/minecraft_tool.js). note it is
-            // the SERVER and this bridge is the client, so the controller can restart freely.
-            controllerWsUrl: config.controllerWsUrl || config.burntWsUrl || process.env.MINECRAFT_BRIDGE_URL || 'ws://localhost:7431',
+            // left link: burnt's minecraftTool ws server (fixed - 7425 was a
+            // three-way port conflict with chrome-devtools/code_service_v2/livekit)
+            burntWsUrl: config.burntWsUrl || process.env.MINECRAFT_BRIDGE_URL || 'ws://localhost:7431',
             // right link: the altoclef external-control companion inside minecraft
             altoclefHost: config.altoclefHost || process.env.ALTOCLEF_HOST || '127.0.0.1',
             altoclefPort: config.altoclefPort || parseInt(process.env.ALTOCLEF_PORT || '7440', 10),
@@ -146,6 +146,12 @@ class MinecraftBotBridge extends EventEmitter {
             reconnectDelay: config.reconnectDelay || 5000,
             heartbeatInterval: config.heartbeatInterval || 30000,
             companionStateTimeout: config.companionStateTimeout || 15000,
+            // orphan reaper (see _startOrphanWatch). burnt gone this long after having
+            // been connected = exit. 0 disables it, for deliberately running the relay
+            // standalone.
+            orphanExitMs: config.orphanExitMs ?? parseInt(process.env.MINECRAFT_BRIDGE_ORPHAN_MS || '90000', 10),
+            // never reached burnt at all - be patient, burnt may still be booting
+            orphanStartupMs: config.orphanStartupMs ?? parseInt(process.env.MINECRAFT_BRIDGE_ORPHAN_STARTUP_MS || '600000', 10),
             debug: config.debug ?? true
         };
 
@@ -157,6 +163,10 @@ class MinecraftBotBridge extends EventEmitter {
         this.wsReconnectTimer = null;
         this.stopped = false;
         this.lastBurntContactAt = 0;
+        // orphan reaper state
+        this.everConnected = false;
+        this.burntLostAt = 0;
+        this.orphanTimer = null;
 
         // right link state
         this.mc = null;
@@ -203,26 +213,29 @@ class MinecraftBotBridge extends EventEmitter {
         this.stopped = false;
         if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
         clearTimeout(this.wsReconnectTimer);
-        this.log('info', `connecting to controller ws at ${this.config.controllerWsUrl}...`);
+        this.log('info', `connecting to burnt tool ws at ${this.config.burntWsUrl}...`);
         try {
-            this.ws = new WebSocket(this.config.controllerWsUrl);
+            this.ws = new WebSocket(this.config.burntWsUrl);
             this.ws.on('open', () => this._onWsOpen());
             this.ws.on('message', (d) => this._onWsMessage(d));
-            this.ws.on('error', (e) => this.log('error', 'controller ws error', e.message));
+            this.ws.on('error', (e) => this.log('error', 'burnt ws error', e.message));
             this.ws.on('close', () => this._onWsClose());
         } catch (err) {
-            this.log('error', 'failed to connect to controller', err.message);
+            this.log('error', 'failed to connect to burnt', err.message);
             this._scheduleWsReconnect();
         }
         // bring up the right link in parallel
         if (!this.mc) this._connectAltoclef();
         this._startCompanionWatchdog();
+        this._startOrphanWatch();
     }
 
     _onWsOpen() {
         this.connected = true;
+        this.everConnected = true;
+        this.burntLostAt = 0;
         this.lastBurntContactAt = Date.now();
-        this.log('info', 'connected to controller ws');
+        this.log('info', 'connected to burnt tool ws');
         this.emit('connected');
 
         this.send({
@@ -245,7 +258,7 @@ class MinecraftBotBridge extends EventEmitter {
         this.lastBurntContactAt = Date.now();
         let msg;
         try { msg = JSON.parse(data); } catch { return this.log('error', 'bad ws message'); }
-        this.log('debug', `controller -> ${msg.type}`, msg);
+        this.log('debug', `burnt -> ${msg.type}`, msg);
 
         switch (msg.type) {
             case 'action': return this._handleAction(msg);
@@ -253,7 +266,7 @@ class MinecraftBotBridge extends EventEmitter {
             case 'config':
                 // burnt toggled enabled/autonomous - purely informational for the
                 // bridge; the altoclef bot doesn't need it, but log for visibility
-                this.log('info', 'config from controller', { enabled: msg.enabled, autonomous: msg.autonomous });
+                this.log('info', 'config from burnt', { enabled: msg.enabled, autonomous: msg.autonomous });
                 return;
             case 'heartbeat_ack':
                 return;
@@ -275,9 +288,9 @@ class MinecraftBotBridge extends EventEmitter {
         // unattended, while the freshly started tool has no matching action id
         // or completion callback. Clear stale bookkeeping and ask the companion
         // to halt before reconnecting.
-        this._abortActiveWork('controller connection lost', true);
+        this._abortActiveWork('burnt control connection lost', true);
         if (wasConnected) {
-            this.log('info', 'disconnected from controller ws');
+            this.log('info', 'disconnected from burnt tool ws');
             this.emit('disconnected');
         }
         this._stopHeartbeat();
@@ -286,8 +299,44 @@ class MinecraftBotBridge extends EventEmitter {
 
     _scheduleWsReconnect() {
         if (this.stopped) return;
+        if (!this.burntLostAt) this.burntLostAt = Date.now();
         clearTimeout(this.wsReconnectTimer);
         this.wsReconnectTimer = setTimeout(() => this.connect(), this.config.reconnectDelay);
+    }
+
+    // ORPHAN REAPER. this relay is spawned detached + unref'd "so it outlives burnt",
+    // and it reconnects forever - which together mean nothing can ever kill it. burnt's
+    // shutdown sweep is real code, but the launcher terminates burnt with
+    // `taskkill /F`, and a FORCE kill on windows delivers no signal at all, so the
+    // SIGINT/SIGTERM handler that runs the sweep never fires. `/T` cannot reach a
+    // deliberately-detached child either. a relay from the previous DAY was still
+    // running because of this, and every later burnt "handed off" to it - so bridge
+    // code changes silently never took effect.
+    //
+    // the only property that actually matters is being immune to HOW burnt dies, so
+    // the bridge reaps itself: no burnt, no reason to exist.
+    _startOrphanWatch() {
+        if (this.config.orphanExitMs <= 0) return;   // explicitly disabled
+        // ARM ONCE. connect() runs again on every reconnect attempt (every 5s), so
+        // clearing and re-creating the interval here meant the 15s tick was reset
+        // before it could ever fire - the reaper looked armed and never ran.
+        if (this.orphanTimer) return;
+        this.orphanTimer = setInterval(() => {
+            if (this.stopped || this.connected) return;
+            const lostFor = this.burntLostAt ? Date.now() - this.burntLostAt : 0;
+            // never reached burnt at all: someone may have started the relay first and
+            // burnt is still booting, so be patient. once burnt HAS been seen and then
+            // vanished, it is gone - do not sit here for a day pretending otherwise.
+            const limit = this.everConnected ? this.config.orphanExitMs : this.config.orphanStartupMs;
+            if (lostFor < limit) return;
+            this.log('warn', `burnt has been unreachable for ${Math.round(lostFor / 1000)}s - shutting the relay down instead of orphaning it`);
+            clearInterval(this.orphanTimer);
+            // disconnect() also tells the companion to halt, which is what we want:
+            // burnt is gone, so nothing should be left driving the bot unattended.
+            Promise.resolve(this.disconnect()).catch(() => { /* exiting anyway */ })
+                .finally(() => process.exit(0));
+        }, 15000);
+        this.orphanTimer.unref?.();
     }
 
     send(message) {
@@ -352,8 +401,15 @@ class MinecraftBotBridge extends EventEmitter {
         }
 
         if (translated === null) {
+            // null means "this action maps to no altoclef command", which is only
+            // honestly a missing-feature answer for an action altoclef really cannot
+            // do. when the action IS supported, null almost always means the caller
+            // left out a required parameter - saying "no built-in task" there sent
+            // people looking for a missing feature that exists (see place/equip).
             return this._respond(actionId, 'error', {
-                error: `altoclef has no built-in task for "${action}" yet`
+                error: SUPPORTED_ACTIONS.has(action)
+                    ? `"${action}" is missing something it needs - check its parameters`
+                    : `altoclef has no built-in task for "${action}" yet`
             });
         }
 
@@ -420,7 +476,17 @@ class MinecraftBotBridge extends EventEmitter {
             case 'move':
                 if (p.x !== undefined && p.y !== undefined && p.z !== undefined) {
                     const { x, y, z } = this._worldPoint(p, 'move coordinates');
-                    const where = `${x} ${y} ${z}`;
+                    // TWO args, not three. `goto x y z` is GetToBlockTask, which demands
+                    // that EXACT block - and when it cannot be reached (she is in a cave
+                    // under it, it is inside terrain, it is occupied) AltoClef never
+                    // fails, it just falls into an escalating wander-and-retry: 5, 10,
+                    // 15, 20, 25, 30 blocks, forever. that out-and-back IS the "looping
+                    // between two spots" report. `goto x z` is GetToXZTask - reach the
+                    // column at whatever height the ground happens to be - which is what
+                    // "go there" has always meant for travel. it also makes the swimming-y
+                    // problem structurally impossible instead of merely corrected.
+                    // pass precise:true when a caller genuinely means one specific block.
+                    const where = p.precise === true ? `${x} ${y} ${z}` : `${x} ${z}`;
                     return { command: `goto ${where}${dimension ? ' ' + dimension : ''}` };
                 }
                 // Do not concatenate a free-form target into an AltoClef
@@ -515,7 +581,12 @@ class MinecraftBotBridge extends EventEmitter {
                 return { command: `hud ${payload}` };
             }
             case 'hunt':     return { command: `meat ${amount(p.amount, 5)}` }; // hunt animals for meat
-            case 'equip':    return p.target ? { command: `equip ${item(p.target)}` } : null;
+            // altoclef's @equip takes an ITEM LIST, so "wear all of this" is one
+            // command. burnt resolves a bare "put your armor on" into that list from
+            // her inventory before it gets here; a single named piece still works.
+            case 'equip':
+                if (itemList) return { command: `equip ${itemList}` };
+                return p.target ? { command: `equip ${item(p.target)}` } : null;
             case 'deposit':  return { command: `deposit${itemList ? ' ' + itemList : ''}` };
             case 'stash': {
                 const start = p.start;
@@ -537,8 +608,13 @@ class MinecraftBotBridge extends EventEmitter {
 
             // place a block from the inventory nearby ('bed' also sets spawn) -
             // the homestead loop uses this to install her ovens/chest/bed at home
+            // unlike equip ("wear what you have" is answerable from inventory), there is
+            // no sane default for WHAT to put down - so say that, instead of returning
+            // null and letting the caller report "altoclef has no built-in task for
+            // place yet", which is false and told nobody what was actually missing.
             case 'place':
-                return p.target ? { command: `place ${item(p.target)}` } : null;
+                if (!p.target) throw new Error('place needs to know which block to put down');
+                return { command: `place ${item(p.target)}` };
 
             case 'inventory': return { command: `inventory${p.item || p.target ? ' ' + item(p.item || p.target) : ''}` };
             case 'coords':    return { command: 'coords' };
@@ -844,7 +920,7 @@ class MinecraftBotBridge extends EventEmitter {
             const now = Date.now();
             const contactLimit = Math.max(15000, this.config.heartbeatInterval * 2.5);
             if (this.connected && this.lastBurntContactAt && now - this.lastBurntContactAt > contactLimit) {
-                this.log('warn', `controller stopped answering heartbeats for ${Math.round((now - this.lastBurntContactAt) / 1000)}s; dropping the control link`);
+                this.log('warn', `burnt stopped answering heartbeats for ${Math.round((now - this.lastBurntContactAt) / 1000)}s; dropping the control link`);
                 try { this.ws?.terminate(); } catch { /* close handler stops work */ }
                 return;
             }
@@ -887,6 +963,7 @@ class MinecraftBotBridge extends EventEmitter {
         this.stopped = true;
         clearTimeout(this.wsReconnectTimer);
         clearTimeout(this.mcReconnectTimer);
+        clearInterval(this.orphanTimer);
         this._stopHeartbeat();
         this._stopCompanionWatchdog();
         // SIGTERM/Ctrl+C must be as safe as a dropped Burnt websocket. Without
@@ -915,8 +992,8 @@ if (isMain) {
     if (!acquireBridgeLock()) process.exit(0);
     const bridge = new MinecraftBotBridge({ debug: true });
 
-    bridge.on('connected', () => console.log('✅ bridge <-> controller connected'));
-    bridge.on('disconnected', () => console.log('❌ bridge <-> controller disconnected'));
+    bridge.on('connected', () => console.log('✅ bridge <-> burnt connected'));
+    bridge.on('disconnected', () => console.log('❌ bridge <-> burnt disconnected'));
     bridge.on('mcConnected', () => console.log('✅ bridge <-> altoclef connected'));
     bridge.on('mcDisconnected', () => console.log('❌ bridge <-> altoclef disconnected'));
 

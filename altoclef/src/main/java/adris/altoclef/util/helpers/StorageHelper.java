@@ -17,6 +17,7 @@ import baritone.utils.ToolSet;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ChatScreen;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.gui.screens.PauseScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.options.OptionsSubScreen;
@@ -45,6 +46,28 @@ public class StorageHelper {
 
     public static List<PlayerSlot> INACCESSIBLE_PLAYER_SLOTS = Stream.concat(Stream.of(PlayerSlot.CRAFT_INPUT_SLOTS), Stream.of(PlayerSlot.ARMOR_SLOTS)).toList();
 
+    // ---- container showcase ---------------------------------------------------
+    // she does her container work in a handful of ticks, so on stream the crafting
+    // table / furnace / inventory was a single-frame flicker and it read as "she is
+    // standing still doing nothing". hold the GUI open for a beat after the work is
+    // done so the audience can actually see her using it.
+    //
+    // bounded and self-clearing on purpose: an open screen blocks movement, so this
+    // may only ever DELAY a close, never prevent one. tickScreenShowcase() force-
+    // closes on expiry so a task that calls closeScreen() exactly once (onStop) can
+    // never strand her staring into a chest.
+    private static final long SHOWCASE_MS = showcaseMillis();
+    private static Screen showcaseScreen = null;
+    private static long showcaseUntil = 0L;
+
+    private static long showcaseMillis() {
+        try {
+            String raw = System.getenv("BURTCRAFT_CONTAINER_SHOWCASE_MS");
+            if (raw != null && !raw.isBlank()) return Math.max(0L, Long.parseLong(raw.trim()));
+        } catch (Throwable ignored) { }
+        return 1400L;
+    }
+
     public static void closeScreen() {
         if (Minecraft.getInstance().player == null)
             return;
@@ -54,9 +77,40 @@ public class StorageHelper {
                         !(screen instanceof PauseScreen) &&
                         !(screen instanceof OptionsSubScreen) &&
                         !(screen instanceof ChatScreen)) {
+            // a container screen is the interesting one to watch - give it its beat
+            // before closing. AbstractContainerScreen covers the crafting table,
+            // furnace family, chests AND her own inventory.
+            if (SHOWCASE_MS > 0 && screen instanceof AbstractContainerScreen) {
+                long now = System.currentTimeMillis();
+                if (showcaseScreen != screen) {
+                    showcaseScreen = screen;
+                    showcaseUntil = now + SHOWCASE_MS;
+                    return;
+                }
+                if (now < showcaseUntil) return;
+            }
+            clearShowcase();
             // Close the screen if we're in-game
             Minecraft.getInstance().player.closeContainer();
+        } else {
+            clearShowcase();
         }
+    }
+
+    // drive the showcase from the client tick as well, so an expired linger always
+    // ends even when nothing calls closeScreen() again.
+    public static void tickScreenShowcase() {
+        if (SHOWCASE_MS <= 0 || showcaseScreen == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.screen != showcaseScreen) { clearShowcase(); return; }
+        if (System.currentTimeMillis() < showcaseUntil) return;
+        clearShowcase();
+        mc.player.closeContainer();
+    }
+
+    private static void clearShowcase() {
+        showcaseScreen = null;
+        showcaseUntil = 0L;
     }
 
     public static ItemStack getItemStackInSlot(Slot slot) {

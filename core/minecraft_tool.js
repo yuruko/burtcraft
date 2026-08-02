@@ -217,6 +217,12 @@ export const PICKAXE_TIERS = ['netherite', 'diamond', 'iron', 'golden', 'stone',
 // best -> worst, so a lower index is a better piece (see _armorToWear)
 const ARMOR_TIERS = ['netherite', 'diamond', 'iron', 'chainmail', 'golden', 'leather', 'turtle'];
 const ARMOR_SLOTS = ['helmet', 'chestplate', 'leggings', 'boots'];
+// words people and llms use for "armour" that are not minecraft item ids. an equip
+// carrying one of these means "wear what you have", not "wear a thing called gear".
+const GENERIC_ARMOR_WORDS = new Set([
+    'armor', 'armour', 'armor_set', 'armour_set', 'gear', 'equipment', 'my_armor',
+    'my_armour', 'your_armor', 'your_armour', 'all', 'everything', 'kit'
+]);
 // shapes that read as "please do something" - imperatives, favours, invitations.
 // used only to decide whether an ask reaches her; she still chooses freely.
 // how long a person's request stays actionable. long enough that she finishes
@@ -263,6 +269,11 @@ const WATER_ESCAPE_PROGRESS_BLOCKS = 6;
 const WATER_EXIT_SETTLE_MS = 5 * 60 * 1000;
 // coarse terrain memory (see _cellKey): 64-block cells, bounded, route-sampled
 const TERRAIN_CELL = 64;
+// how far a single protection refusal is taken to extend, in 64-block cells either
+// way (1 => a 3x3 block of cells, ~192 blocks across). server land claims are much
+// bigger than one cell, and being wrong here is cheap: the world is large and she
+// only loses ground she was refused from anyway.
+const CLAIM_SPREAD_CELLS = 1;
 const TERRAIN_CELL_CAP = 4000;
 const LANDING_SPOT_TRIES = 48;
 // a long march into terrain she knows NOTHING about is the actual engine of every
@@ -283,8 +294,14 @@ const DROWNED_BEARING_CAP = 24;
 // effect: the best-scoring escape from a claim at A is the familiar ground at B, and
 // from B it is A. she then walks back and forth between two spots forever. so every
 // committed long-distance destination is remembered and refused for a while.
-const RECENT_DESTINATION_CAP = 32;
-const RECENT_DESTINATION_TTL_MS = 30 * 60 * 1000;
+const RECENT_DESTINATION_CAP = 96;
+// "where have i already looked" is a SEARCH memory, not a ping-pong guard. at 30
+// minutes it was forgotten mid-hunt and the same land got re-checked, and a process
+// restart wiped it outright (it was ram-only). hours, persisted, so a long hunt for
+// unclaimed land actually covers new ground. the relaxed pass in _pickLandingSpot
+// stops a long memory from ever boxing her in.
+const RECENT_DESTINATION_TTL_MS = 6 * 60 * 60 * 1000;
+const VISITED_SPOT_TTL_MS = RECENT_DESTINATION_TTL_MS;
 const RECENT_DESTINATION_RADIUS = 140;        // blocks: wider than a claim, tighter than a venture
 // only long relocations record the place she is LEAVING. without that the first hop
 // back is never caught (she started at A, so A was never a recorded destination), but
@@ -1005,8 +1022,14 @@ class MinecraftTool extends EventEmitter {
         // the slower autonomous-choice cadence. It also protects operator/LLM
         // goals when self-play is disabled.
         if (freshObservation && this.enabled && this.connected && this.gameConnected) {
+            // WATER GOES FIRST. it used to run after _recoverPinnedByMobs, which
+            // `return`s when it fires - so any tick where she was pinned by mobs
+            // skipped the water check entirely. that is exactly the state that
+            // strands her in the sea, so the one watchdog with a hard deadline was
+            // starved precisely when it was needed. it returns true only while an
+            // escape is genuinely still closing on land.
+            if (this._waterWatchdog()) return;
             if (this._recoverPinnedByMobs()) return;
-            this._waterWatchdog();
             this._pushIntentHud();
             this._maybeNarrateToRoom();
         }
@@ -1574,6 +1597,28 @@ class MinecraftTool extends EventEmitter {
             }
             action = action.trim().toLowerCase();
             if (!params || typeof params !== 'object' || Array.isArray(params)) params = {};
+
+            // "put your armor on" names no item, and altoclef's @equip needs one - so
+            // the bridge translated a target-less equip to null and answered "no
+            // built-in task for equip", i.e. the bot stood there. an instruction to
+            // gear up is about the SLOTS, not a named item: resolve it from what she
+            // is actually carrying. also covers the llm asking for the generic
+            // "armor", which is not an item id either.
+            if (action === 'equip') {
+                const named = String(params.target || '').trim().toLowerCase();
+                const generic = !named || GENERIC_ARMOR_WORDS.has(named.replace(/\s+/g, '_'));
+                if (generic && !Array.isArray(params.items)) {
+                    const picks = this._allArmorToWear();
+                    // the bridge's _itemList wants {item} OBJECTS (same ItemList syntax
+                    // `deposit` uses) - a bare string array is silently filtered to
+                    // empty and falls back into the null/"no such task" path.
+                    if (picks.length) params = { ...params, target: undefined, items: picks.map((p) => ({ item: p.item })) };
+                    else {
+                        reject(new Error(this._armorRefusalReason()));
+                        return;
+                    }
+                }
+            }
 
             // favorite-spot navigation: 'go_home' and 'move' with a saved-spot
             // name both resolve to real coordinates here, so every caller (llm
@@ -2290,6 +2335,16 @@ class MinecraftTool extends EventEmitter {
         if (coords) {
             return { action: 'move', params: { x: +coords[1], y: +coords[2], z: +coords[3] } };
         }
+        // "put your armor on" / "armor up" / "gear up". a real instruction people give
+        // her constantly in game, and it used to fall through to freeform - which meant
+        // the host llm had to guess the tool call, guessed a target-less equip, and the
+        // bridge answered "no built-in task for equip". mapped explicitly so it just
+        // happens; executeAction resolves which pieces from the live inventory.
+        if (/\b(?:armou?r|gear)\s*(?:yourself\s*)?up\b/.test(t)
+            || /\b(?:put|throw|get)\s+(?:your|ur|yr|some|that|the)?\s*(?:armou?r|gear)\s+on\b/.test(t)
+            || /\b(?:put on|wear|equip)\s+(?:your|ur|yr|some|that|the)?\s*(?:armou?r|gear)\b/.test(t)) {
+            return { action: 'equip' };
+        }
         // claiming a home. she should be able to be GIVEN one by the people standing
         // next to her, not only by her own brain - "set your home here", "this is home
         // now", "make this your base". checked before the navigation patterns because
@@ -2568,19 +2623,48 @@ class MinecraftTool extends EventEmitter {
         try {
             for (const key of Object.keys(this.memory.getClaimedAreas?.() || {})) this._claimedCells.add(key);
         } catch { /* best-effort */ }
+        // rehydrate where she has already been sent. without this the search history
+        // was ram-only: every process restart handed her a blank map and she
+        // re-checked ground she had already walked.
+        try {
+            const now = Date.now();
+            for (const v of this.memory.getVisitedSpots?.() || []) {
+                const at = Number(v?.at) || 0;
+                if (now - at > VISITED_SPOT_TTL_MS) continue;
+                this._recentDestinations.push({ x: Number(v.x), z: Number(v.z), at });
+            }
+            while (this._recentDestinations.length > RECENT_DESTINATION_CAP) this._recentDestinations.shift();
+        } catch { /* best-effort */ }
     }
 
     // the server just told her she may not touch this place. remember the GROUND, not
     // the goal: a claim belongs to the location and outlives whatever she was trying
     // to do there, so blacklisting the action alone sends her straight back.
+    // mirror the search memory to disk. best-effort on purpose: failing to remember
+    // is a worse walk, not a broken bot.
+    _persistVisited(x, z, at) {
+        try { this.memory.recordVisitedSpot?.(x, z, at); } catch { /* best-effort */ }
+    }
+
     _recordClaimHere(point) {
         this._ensureTerrainLoaded();
         const p = point || this.gameState.position;
         if (!p || !Number.isFinite(Number(p.x))) return;
-        const key = this._cellKey(Number(p.x), Number(p.z));
-        if (this._claimedCells.has(key)) return;
-        this._claimedCells.add(key);
-        try { this.memory.recordClaimedArea(key); } catch { /* best-effort */ }
+        const x = Number(p.x);
+        const z = Number(p.z);
+        // a claim is a REGION, not the 64-block cell she happened to be standing in.
+        // marking one cell meant the next pick 70 blocks away - still deep inside the
+        // same player's base - scored as unclaimed, so she walked back in and got
+        // refused again from another angle. mark the footprint so ONE refusal teaches
+        // her the whole plot.
+        for (let dx = -CLAIM_SPREAD_CELLS; dx <= CLAIM_SPREAD_CELLS; dx++) {
+            for (let dz = -CLAIM_SPREAD_CELLS; dz <= CLAIM_SPREAD_CELLS; dz++) {
+                const key = this._cellKey(x + dx * TERRAIN_CELL, z + dz * TERRAIN_CELL);
+                if (this._claimedCells.has(key)) continue;
+                this._claimedCells.add(key);
+                try { this.memory.recordClaimedArea(key); } catch { /* best-effort */ }
+            }
+        }
     }
 
     _isClaimedCell(x, z) {
@@ -2593,6 +2677,10 @@ class MinecraftTool extends EventEmitter {
     // escape from A is always B, and from B is always A, forever.
     _rememberDestination(spot) {
         if (!spot || !Number.isFinite(Number(spot.x))) return;
+        // the on-disk history must be in hand before we dedupe against it, or a
+        // caller that runs before the first _pickLandingSpot re-adds ground she
+        // already walked. cheap: the loader self-guards after the first call.
+        this._ensureTerrainLoaded();
         const x = Number(spot.x);
         const z = Number(spot.z);
         const now = Date.now();
@@ -2603,8 +2691,13 @@ class MinecraftTool extends EventEmitter {
         // bounce the oldest entry IS the spot she must not return to - so it fell out of
         // the ring after a few hops and the ping-pong resumed. one slot per place fixes it.
         for (const d of this._recentDestinations) {
-            if (Math.hypot(x - d.x, z - d.z) < RECENT_DESTINATION_RADIUS) { d.at = now; return; }
+            if (Math.hypot(x - d.x, z - d.z) < RECENT_DESTINATION_RADIUS) {
+                d.at = now;
+                this._persistVisited(x, z, now);
+                return;
+            }
         }
+        this._persistVisited(x, z, now);
         this._recentDestinations.push({ x, z, at: now });
         while (this._recentDestinations.length > RECENT_DESTINATION_CAP) this._recentDestinations.shift();
     }
@@ -3784,6 +3877,54 @@ class MinecraftTool extends EventEmitter {
             }
         }
         return best;
+    }
+
+    // EVERY armour upgrade she is carrying, best piece per slot. "put your armor on"
+    // means all of it, not the single best piece - _armorToWear() answers a different
+    // question (the one next upgrade the idle loop should do) and using it for an
+    // explicit instruction left her in one boot.
+    _allArmorToWear() {
+        const g = this.gameState;
+        const inv = Array.isArray(g.inventory) ? g.inventory : [];
+        if (!inv.length) return [];
+        const worn = (Array.isArray(g.armor) ? g.armor : []).map((a) => String(a || '').toLowerCase());
+        const rank = (name) => {
+            const tier = ARMOR_TIERS.findIndex((t) => name.includes(t));
+            return tier === -1 ? -1 : ARMOR_TIERS.length - tier;
+        };
+        const picks = [];
+        for (const slot of ARMOR_SLOTS) {
+            const wornPiece = worn.find((w) => w.includes(slot));
+            const wornRank = wornPiece ? rank(wornPiece) : 0;
+            let best = null;
+            for (const raw of inv) {
+                const name = String(typeof raw === 'string' ? raw : (raw?.item || raw?.name || '')).toLowerCase();
+                if (!name.includes(slot)) continue;
+                const r = rank(name);
+                if (r <= 0 || r <= wornRank) continue;
+                const item = (name.match(/[a-z_]*_?(?:netherite|diamond|iron|chainmail|golden|leather|turtle)[a-z_]*/) || [])[0]
+                    || name.replace(/^[0-9\s]+/, '').replace(/^minecraft:/, '');
+                const clean = item.replace(/^minecraft:/, '').trim();
+                if (!clean) continue;
+                if (!best || r > best.rank) best = { slot, item: clean, rank: r };
+            }
+            if (best) picks.push(best);
+        }
+        return picks;
+    }
+
+    // why an "armour up" instruction cannot be carried out. the old path answered
+    // "altoclef has no built-in task for equip yet", which is not true and told
+    // nobody anything useful.
+    _armorRefusalReason() {
+        const g = this.gameState;
+        const worn = (Array.isArray(g.armor) ? g.armor : []).filter(Boolean);
+        if (!Array.isArray(g.inventory) || !g.inventory.length) {
+            return 'i cannot see my inventory right now, so i do not know what armour i am carrying';
+        }
+        if (worn.length >= ARMOR_SLOTS.length) return 'already wearing a full set - nothing in my bag beats it';
+        if (worn.length) return 'nothing in my bag is an upgrade on what i already have on';
+        return 'i am not carrying any armour to put on';
     }
 
     _survivalPrep() {

@@ -16,6 +16,10 @@ const MAX_OVENS = 32;
 // 64-block cells, so ~4000 covers a 500x500-chunk slab of explored world
 const MAX_TERRAIN_CELLS = 4000;
 const MAX_CLAIMED_CELLS = 400;
+const MAX_VISITED_SPOTS = 256;
+// merge radius for "i have already looked here". matches the tool's
+// RECENT_DESTINATION_RADIUS so the persisted view and the live view agree.
+const VISITED_MERGE_RADIUS = 140;
 const OVEN_MERGE_DIST = 3;                  // same block, re-reported by the scan
 // the oven family. every furnace/smoker/campfire the bot installs becomes a
 // named unit in a collection it keeps track of - a cheap, durable source of
@@ -54,7 +58,12 @@ export class MinecraftMemory {
             // coarse map of where she has been wet vs stood: "wet"/"dry" keyed by
             // 64-block cell. without this she re-learns where the ocean is by
             // swimming into it once per restart.
-            terrain: {}
+            terrain: {},
+            // every long-distance destination she has actually committed to, as
+            // {x,z,at}. this used to live ONLY in ram, so "where have i already
+            // looked" died with every process restart and she re-checked the same
+            // ground forever. persisted here so a restart costs her nothing.
+            visited: []
         };
         this._dirty = false;
         this._saveTimer = null;
@@ -265,6 +274,34 @@ export class MinecraftMemory {
         const keys = Object.keys(this.data.claims);
         if (keys.length >= MAX_CLAIMED_CELLS) delete this.data.claims[keys[0]];
         this.data.claims[k] = Date.now();
+        this._save();
+        return true;
+    }
+
+    // ground she has already gone and looked at. NOT a claim (she may be perfectly
+    // welcome there) - just "i have been sent here before", which is what stops her
+    // re-checking the same land after a restart. kept as a flat list because the
+    // reader matches by radius, not by cell.
+    getVisitedSpots() {
+        return Array.isArray(this.data.visited) ? this.data.visited : [];
+    }
+
+    recordVisitedSpot(x, z, at = Date.now()) {
+        const px = Number(x);
+        const pz = Number(z);
+        if (!Number.isFinite(px) || !Number.isFinite(pz)) return false;
+        if (!Array.isArray(this.data.visited)) this.data.visited = [];
+        // one slot per PLACE: refresh a nearby entry rather than appending a second,
+        // or a cap-sized ring quietly evicts the very spot she keeps returning to.
+        for (const v of this.data.visited) {
+            if (Math.hypot(px - v.x, pz - v.z) < VISITED_MERGE_RADIUS) {
+                v.at = at;
+                this._save();
+                return true;
+            }
+        }
+        this.data.visited.push({ x: Math.round(px), z: Math.round(pz), at });
+        while (this.data.visited.length > MAX_VISITED_SPOTS) this.data.visited.shift();
         this._save();
         return true;
     }
