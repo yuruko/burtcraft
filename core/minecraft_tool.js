@@ -403,6 +403,9 @@ class MinecraftTool extends EventEmitter {
             port: DEFAULT_PORT,
             actionTimeout: DEFAULT_ACTION_TIMEOUT,
             autonomousTickMs: DEFAULT_AUTONOMOUS_TICK_MS,
+            // kill a stale NODE process squatting our port and rebind. off by
+            // default - see the EADDRINUSE branch in initialize().
+            reclaimPort: false,
             debug: false
         };
 
@@ -630,10 +633,19 @@ class MinecraftTool extends EventEmitter {
             await this.initializePromise;
         } catch (err) {
             this.initializePromise = null;
-            // EADDRINUSE = a previous burnt / stale tool / test stand-in is still
-            // squatting our port. latest instance wins: stop the old node process
-            // holding it and bind again, so a restart never needs manual cleanup.
-            if ((err?.code === 'EADDRINUSE' || /EADDRINUSE/.test(String(err?.message))) && !opts._portReclaimed) {
+            // EADDRINUSE = a stale tool / test stand-in is still squatting our
+            // port. with `reclaimPort: true` the latest instance wins: stop the
+            // old NODE process holding it and bind again, so a restart never
+            // needs manual cleanup.
+            //
+            // OFF BY DEFAULT, deliberately. this kills another process, and on a
+            // dev box the thing on your port is at least as likely to be an
+            // unrelated node server you care about. opt in only when this
+            // controller owns the port outright:
+            //     await mc.initialize({ port: 7431, reclaimPort: true })
+            if (this.config.reclaimPort
+                && (err?.code === 'EADDRINUSE' || /EADDRINUSE/.test(String(err?.message)))
+                && !opts._portReclaimed) {
                 const freed = await this._reclaimPort(this.config.port);
                 if (freed) return this.initialize({ ...opts, _portReclaimed: true });
             }

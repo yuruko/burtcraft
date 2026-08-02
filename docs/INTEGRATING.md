@@ -20,12 +20,19 @@ const mc = new MinecraftTool({
 });
 
 await mc.initialize({ port: 7431, actionTimeout: 300000, debug: false });
+// optional: { reclaimPort: true } - see the warning below
 mc.enable();                        // gate: nothing dispatches until enabled
 mc.setAutonomousMode(true);         // optional: idle self-play
 ```
 
 `initialize()` starts the **ws server**. The bridge dials in. Until it does,
 `getStatus().connected` is false and every action fails honestly.
+
+> **`reclaimPort`.** If the port is already taken, `reclaimPort: true` kills the
+> Node process holding it and rebinds — handy when this controller owns the port
+> and you restart it constantly. It is **off by default**, because on a dev box
+> the thing on your port is at least as likely to be an unrelated server you
+> care about. With it off you get a normal `EADDRINUSE` and nothing dies.
 
 ---
 
