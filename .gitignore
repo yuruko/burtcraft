@@ -1,0 +1,40 @@
+# --- secrets (never commit) ---
+# minecraft/xbox refresh token minted by msa_auth.mjs. grants account access.
+.msa_auth.json
+.env
+*.pem
+
+# --- build output ---
+build/
+out/
+dist/
+bin/
+*.class
+*.jar
+# ...except the gradle wrappers, which the build genuinely needs.
+# needs the leading **/ - a pattern containing a slash is anchored to this file's
+# directory, so a bare `!gradle/wrapper/...` would miss altoclef/ and baritone/.
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# --- gradle ---
+.gradle/
+gradle-app.setting
+
+# --- node ---
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# --- ide ---
+.idea/
+.vs/
+*.iml
+*.code-workspace
+
+# --- runtime junk ---
+run/
+logs/
+*.log
+saves/
+altoclef_settings.json
+baritone/settings.txt

@@ -1,0 +1,17 @@
+# normalize text to LF in the repo; check out native on windows.
+* text=auto
+
+# keep shell scripts and the gradle wrapper LF regardless of platform -
+# CRLF here breaks them on linux/macos.
+*.sh        text eol=lf
+gradlew     text eol=lf
+
+# windows-only scripts stay CRLF
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+
+# never touch binaries
+*.jar       binary
+*.png       binary
+*.jpg       binary
+*.ico       binary

@@ -1,0 +1,39 @@
+{
+  "name": "burtcraft",
+  "version": "0.1.0",
+  "description": "Give an AI VTuber a real Minecraft body. AltoClef + Baritone, driven from Node over a documented wire protocol.",
+  "type": "module",
+  "main": "core/index.js",
+  "exports": {
+    ".": "./core/index.js",
+    "./core": "./core/index.js",
+    "./bridge": "./bridge/minecraft_bot_bridge.js"
+  },
+  "scripts": {
+    "bridge": "node bridge/minecraft_bot_bridge.js",
+    "example:hello": "node examples/01_hello_bot.mjs",
+    "example:chat": "node examples/02_viewer_chat.mjs",
+    "example:context": "node examples/03_context_block.mjs",
+    "example:llm": "node examples/04_llm_tool.mjs",
+    "example:adapter": "node examples/05_vtuber_adapter.mjs",
+    "check": "node --check core/minecraft_tool.js && node --check bridge/minecraft_bot_bridge.js"
+  },
+  "keywords": [
+    "minecraft",
+    "ai-vtuber",
+    "vtuber",
+    "altoclef",
+    "baritone",
+    "agent",
+    "llm",
+    "tool-use",
+    "fabric"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

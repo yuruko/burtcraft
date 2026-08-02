@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "altoclef",
+  "version": "${version}",
+  "name": "Alto Clef",
+  "description": "Plays Block Game",
+  "authors": [
+    "TacoTechnica",
+    "James Green",
+    "Marvion Kirito"
+  ],
+  "contact": {
+    "homepage": "https://fabricc.net/",
+    "sources": "https://github.com/FabricMC/fabric-example-mod"
+  },
+  "license": "CC0-1.0",
+  "icon": "assets/altoclef/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "adris.altoclef.AltoClef"
+    ],
+    "client": [
+      "adris.altoclef.external.ExternalControlServer"
+    ]
+  },
+  "mixins": [
+    "altoclef.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.1.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

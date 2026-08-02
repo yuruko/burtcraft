@@ -1,0 +1,115 @@
+burtcraft
+=========
+
+This repository bundles two third-party Minecraft projects, in modified form,
+so that the integration can be built and run without hunting down matching
+upstream revisions. Each keeps its own license file and its own terms.
+
+Nothing below is a claim of ownership over that upstream work.
+
+
+--------------------------------------------------------------------------
+1. altoclef/    -- MIT License
+--------------------------------------------------------------------------
+
+Upstream:  https://github.com/gaucho-matrero/altoclef
+Copyright: (c) 2020 Adris Jautakas and the AltoClef contributors
+           (TacoTechnica, James Green, Marvion Kirito, and others)
+License:   MIT -- see altoclef/LICENSE
+
+This copy is a fork tracking Minecraft 26.1.2 / Fabric / Java 25.
+
+Modifications made for burtcraft:
+
+  ADDED    src/main/java/adris/altoclef/external/ExternalControlServer.java
+           A localhost-only, newline-delimited-JSON TCP server (default port
+           7440) that exposes AltoClef's command executor and live game state
+           to an out-of-process controller. Registered as an ADDITIVE Fabric
+           "client" entrypoint in fabric.mod.json; it modifies no existing
+           AltoClef class. Also draws the optional on-screen intent HUD and
+           owns the F1 manual-control toggle.
+
+  ADDED    src/main/java/adris/altoclef/commands/PlaceCommand.java
+           `@place <block>`, backed by PlaceBlockNearbyTask.
+
+  ADDED    src/main/java/adris/altoclef/mixins/KeyboardInputLockMixin.java
+           src/main/java/adris/altoclef/mixins/MouseInputLockMixin.java
+           Suppress physical keyboard/mouse input while the bot is driving, so
+           a human at the same machine cannot fight the bot for control. F1
+           releases the lock.
+
+  ADDED    src/main/java/adris/altoclef/mixins/MixinLocalPlayer.java
+           src/main/java/adris/altoclef/mixins/ClientUIMixin.java
+           Camera view-angle hooks (smoothed look / auto third-person) and HUD
+           stack handling.
+
+  MODIFIED src/main/java/adris/altoclef/commandsystem/CommandExecutor.java
+           Added a public getMod() accessor so the control server can read the
+           live task chain (used for the "what am I doing right now" readout).
+
+  MODIFIED src/main/java/adris/altoclef/Settings.java
+           `showTaskChains` now defaults to false. Upstream's task-tree dump is
+           an unreadable spew over a live stream, and a regenerated settings
+           file used to silently bring it back.
+
+  MODIFIED src/main/resources/fabric.mod.json
+           Registered the "client" entrypoint above; bumped the Minecraft /
+           Java / Fabric Loader dependency floors for 26.1.2.
+
+  MODIFIED build.gradle, gradle.properties, settings.gradle
+           Retarget to Minecraft 26.1.2 (which ships unobfuscated, so there are
+           no Yarn mappings and Loom has no remapJar task -- `jar` is already
+           the shippable artifact). Baritone is jar-in-jar'd into the AltoClef
+           jar so only one jar is ever deployed.
+
+
+--------------------------------------------------------------------------
+2. baritone/    -- GNU Lesser General Public License v3.0
+--------------------------------------------------------------------------
+
+Upstream:  https://github.com/cabaletta/baritone
+Copyright: (c) Leijurv and the Baritone contributors
+License:   LGPL-3.0 -- see baritone/LICENSE
+
+This copy is a fork tracking Minecraft 26.1.2.
+
+As required by LGPL-3.0 section 5(a), the modifications are listed here and
+carry prominent notices in-source (search the tree for `BURNT:`). This
+directory remains licensed under LGPL-3.0; the MIT license at the repository
+root does NOT apply to it. Corresponding source for these modifications is
+this directory itself.
+
+Modifications made for burtcraft:
+
+  MODIFIED src/api/java/baritone/api/Settings.java
+           - Added `avoidWaterWhileDry`: while the player is dry, refuse to
+             path into water at all.
+           - Added `waterWalkCostMultiplier`: scales the cost of every swimming
+             movement once already wet.
+           - Changed the default of the debug render settings (renderPath,
+             renderPathAsLine, renderGoal, renderGoalAnimated,
+             renderGoalXZBeacon, renderSelectionBoxes) from enabled to
+             disabled, so pathfinding overlays never appear on a live stream.
+
+  MODIFIED src/main/java/baritone/pathing/movement/CalculationContext.java
+           Added the `waterForbidden` field and the water pricing that backs
+           the two settings above: water costs COST_INF while dry, and the
+           multiplier applies once wet. Vanilla prices a swum block low enough
+           that a long swim looks cheaper than walking around, which made the
+           bot cross oceans instead of going around them.
+
+  MODIFIED src/main/java/baritone/pathing/movement/movements/MovementDescend.java
+           Do not break a fall by dropping into water -- that is still getting
+           in the water, which the settings above exist to prevent.
+
+  REMOVED  dist/
+           Prebuilt jars for Minecraft 1.18.0 and 1.20.4 (~12 MB) that are not
+           reachable from this 26.1.2 fork. They remain available upstream.
+
+
+--------------------------------------------------------------------------
+3. Everything else
+--------------------------------------------------------------------------
+
+core/, bridge/, examples/, docs/, mod/ and scripts/ are original work,
+MIT-licensed -- see LICENSE.

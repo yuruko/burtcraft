@@ -1,0 +1,129 @@
+# Wire protocol
+
+Two hops, both localhost-only, both newline-delimited JSON (one object per
+line). You only need this document if you are replacing one of the three
+processes — the Node library speaks it for you.
+
+```
+ your vtuber            the bridge             minecraft
+ (ws SERVER :7431) <--> (ws + tcp client) <--> (tcp SERVER :7440)
+        hop 1                                    hop 2
+```
+
+The direction of hop 1 surprises people: **your VTuber is the server**, the
+bridge is the client that dials in. This is so you can restart your VTuber
+without restarting Minecraft. The bridge reconnects on its own.
+
+---
+
+## Hop 1 — VTuber (ws server, :7431) <-> bridge
+
+Port from `MINECRAFT_BRIDGE_PORT`, default `7431`. Bound to `127.0.0.1`.
+
+### Bridge -> VTuber
+
+| type | Shape | Meaning |
+|---|---|---|
+| `handshake` | `{type, version, pid}` | Sent on connect. |
+| `heartbeat` | `{type, at}` | Liveness ping; answer with `heartbeat_ack`. |
+| `bridge_status` | `{type, gameConnected, companionSocketConnected, ...}` | Whether the bridge's own link to the game is up. This is how you know the difference between "bridge running" and "game running". |
+| `state` | `{type, gameState:{...}}` | Live game state, roughly every 2s. |
+| `event` | `{type, event, data}` | Something happened (see [events](#game-events)). |
+| `response` | `{type, id, ok, error?, result?}` | Terminal outcome for the action with that `id`. |
+
+### VTuber -> bridge
+
+| type | Shape | Meaning |
+|---|---|---|
+| `action` | `{type, action, params, id, priority}` | Do a thing. `id` correlates with the eventual `response`. |
+| `heartbeat_ack` | `{type, at}` | Reply to `heartbeat`. |
+
+---
+
+## Hop 2 — bridge <-> in-game companion (tcp server, :7440)
+
+Port from `-Daltoclef.control.port`, else `$ALTOCLEF_CONTROL_PORT`, else `7440`.
+Bound to localhost on purpose — the bot must never be reachable off-box.
+
+### Bridge -> companion
+
+```jsonc
+{"type":"command","id":"<id>","command":"get diamond 3"}  // no leading '@'
+{"type":"chat","id":"<id>","text":"#explore"}             // raw line (baritone/chat)
+{"type":"ping"}
+```
+
+### Companion -> bridge
+
+```jsonc
+{"type":"hello","username":"Steve"}
+{"type":"ack","id":"<id>"}
+{"type":"finished","id":"<id>"}              // from altoclef's onFinish
+{"type":"error","id":"<id>","error":"..."}   // from altoclef's onError
+{"type":"state","gameState":{...}}           // ~every 2s
+{"type":"event","event":"task_finished"|"chat",...}
+{"type":"pong"}
+```
+
+**Completion is real.** `finished` / `error` are driven by AltoClef's actual
+`TaskFinishedEvent`, not a timer. An earlier version of the bridge faked
+execution with `setTimeout` plus random success and never touched Minecraft at
+all — if the companion is not connected, actions now fail honestly instead.
+
+---
+
+## `gameState`
+
+Sent about every 2 seconds. Fields are best-effort; **always guard with `?.` or
+defaults** rather than assuming a key is present, because most of them are
+skipped when the value cannot be read this tick.
+
+| Field | Notes |
+|---|---|
+| `health`, `maxHealth`, `hunger` | rounded |
+| `position` | `{x, y, z}` block coords |
+| `dimension` | e.g. `minecraft:overworld` |
+| `onGround`, `inWater`, `inLava`, `underwater` | |
+| `air`, `maxAir` | drowning headroom |
+| `xpLevel` | |
+| `selectedItem`, `offhandItem` | |
+| `mainHandDurability`, `mainHandMaxDurability` | absent when the item is not damageable |
+| `eating`, `needsToEat`, `hasFood` | from AltoClef's FoodChain |
+| `multiplayer`, `server`, `nearbyPlayerNames` | **ground truth** — the companion reports what it actually joined, never what your config intended |
+| `botTask` | high-level goal + phase, e.g. `beating the game.: getting blaze rods` |
+| `botAction` | deepest micro-action |
+
+`botTask` is what lets a character say what it is genuinely doing right now. It
+comes from `getTaskRunner().getCurrentTaskChain()`; older mod builds without the
+`CommandExecutor.getMod()` accessor degrade gracefully to no phase.
+
+---
+
+## Game events
+
+Delivered as `{type:'event', event, data}` and re-emitted by the Node library as
+`gameEvent(event, data)`. This is the main feed for a VTuber brain.
+
+Examples: `task_finished`, `chat`, `creeper_spotted`, `nightfall`, `died`,
+`diamonds_found`, `protection_denied`, `manual_control`.
+
+`protection_denied` is worth special handling on public servers: it fires when
+the server rejects an interaction ("you are not allowed to interact with this
+block"). Two denials inside a minute during a goal means the bot is standing in
+someone's claim, and the right response is to remember the area and leave, not
+to retry.
+
+---
+
+## Adding an action
+
+1. **Node side** — add it to the action enum and, if it needs no game round
+   trip, answer it locally from `getStatus()` / memory.
+2. **Bridge** — map it to an AltoClef command string in the translation table.
+3. **Mod side** — only if AltoClef has no command for it; add a `Command`
+   subclass and register it. `PlaceCommand.java` in the fork is a small worked
+   example.
+
+Actions that never reach the game (answered from memory) include `status`,
+`enable`, `disable`, `autonomous`, `inventory`, `coords`, `favorite`,
+`unfavorite`, `favorites`, `set_home`, `gamer`, `gamer_stop`.
