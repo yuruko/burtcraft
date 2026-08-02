@@ -208,10 +208,10 @@ class MinecraftBotBridge extends EventEmitter {
             this.ws = new WebSocket(this.config.controllerWsUrl);
             this.ws.on('open', () => this._onWsOpen());
             this.ws.on('message', (d) => this._onWsMessage(d));
-            this.ws.on('error', (e) => this.log('error', 'burnt ws error', e.message));
+            this.ws.on('error', (e) => this.log('error', 'controller ws error', e.message));
             this.ws.on('close', () => this._onWsClose());
         } catch (err) {
-            this.log('error', 'failed to connect to burnt', err.message);
+            this.log('error', 'failed to connect to controller', err.message);
             this._scheduleWsReconnect();
         }
         // bring up the right link in parallel
@@ -222,7 +222,7 @@ class MinecraftBotBridge extends EventEmitter {
     _onWsOpen() {
         this.connected = true;
         this.lastBurntContactAt = Date.now();
-        this.log('info', 'connected to burnt tool ws');
+        this.log('info', 'connected to controller ws');
         this.emit('connected');
 
         this.send({
@@ -245,7 +245,7 @@ class MinecraftBotBridge extends EventEmitter {
         this.lastBurntContactAt = Date.now();
         let msg;
         try { msg = JSON.parse(data); } catch { return this.log('error', 'bad ws message'); }
-        this.log('debug', `burnt -> ${msg.type}`, msg);
+        this.log('debug', `controller -> ${msg.type}`, msg);
 
         switch (msg.type) {
             case 'action': return this._handleAction(msg);
@@ -253,7 +253,7 @@ class MinecraftBotBridge extends EventEmitter {
             case 'config':
                 // burnt toggled enabled/autonomous - purely informational for the
                 // bridge; the altoclef bot doesn't need it, but log for visibility
-                this.log('info', 'config from burnt', { enabled: msg.enabled, autonomous: msg.autonomous });
+                this.log('info', 'config from controller', { enabled: msg.enabled, autonomous: msg.autonomous });
                 return;
             case 'heartbeat_ack':
                 return;
@@ -275,9 +275,9 @@ class MinecraftBotBridge extends EventEmitter {
         // unattended, while the freshly started tool has no matching action id
         // or completion callback. Clear stale bookkeeping and ask the companion
         // to halt before reconnecting.
-        this._abortActiveWork('burnt control connection lost', true);
+        this._abortActiveWork('controller connection lost', true);
         if (wasConnected) {
-            this.log('info', 'disconnected from burnt tool ws');
+            this.log('info', 'disconnected from controller ws');
             this.emit('disconnected');
         }
         this._stopHeartbeat();
@@ -844,7 +844,7 @@ class MinecraftBotBridge extends EventEmitter {
             const now = Date.now();
             const contactLimit = Math.max(15000, this.config.heartbeatInterval * 2.5);
             if (this.connected && this.lastBurntContactAt && now - this.lastBurntContactAt > contactLimit) {
-                this.log('warn', `burnt stopped answering heartbeats for ${Math.round((now - this.lastBurntContactAt) / 1000)}s; dropping the control link`);
+                this.log('warn', `controller stopped answering heartbeats for ${Math.round((now - this.lastBurntContactAt) / 1000)}s; dropping the control link`);
                 try { this.ws?.terminate(); } catch { /* close handler stops work */ }
                 return;
             }
@@ -915,8 +915,8 @@ if (isMain) {
     if (!acquireBridgeLock()) process.exit(0);
     const bridge = new MinecraftBotBridge({ debug: true });
 
-    bridge.on('connected', () => console.log('✅ bridge <-> burnt connected'));
-    bridge.on('disconnected', () => console.log('❌ bridge <-> burnt disconnected'));
+    bridge.on('connected', () => console.log('✅ bridge <-> controller connected'));
+    bridge.on('disconnected', () => console.log('❌ bridge <-> controller disconnected'));
     bridge.on('mcConnected', () => console.log('✅ bridge <-> altoclef connected'));
     bridge.on('mcDisconnected', () => console.log('❌ bridge <-> altoclef disconnected'));
 

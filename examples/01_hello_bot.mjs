@@ -37,15 +37,13 @@
 // loads a world. an app that only checks `connected` will happily narrate
 // gameplay that is not happening.
 
+import net from 'net';
 import os from 'os';
 import path from 'path';
 import { MinecraftTool, MinecraftMemory } from '../core/index.js';
 
-// port 7431 is the bridge's default (override with MINECRAFT_BRIDGE_PORT on
-// BOTH sides). heads up: if the port is already taken by another node process,
-// initialize() will try to reclaim it by stopping that process - which is what
-// you want after a crash, and very much not what you want if your production
-// bot is the one sitting on it. keep one owner per port.
+// port 7431 is the bridge's default. override with MINECRAFT_BRIDGE_PORT - on
+// BOTH sides, or they will not find each other.
 const PORT = Number(process.env.MINECRAFT_BRIDGE_PORT || 7431);
 
 // how long to sit here waiting for a bridge before we stop being hopeful
@@ -96,7 +94,36 @@ tool.on('disconnected', () => {
 tool.on('faultDetected', (fault) => console.log(`[event] fault: ${fault.code} - ${fault.message}`));
 tool.on('faultCleared', () => console.log('[event] fault cleared'));
 
+// ---------------------------------------------------------------------------
+// look before you bind
+//
+// if the port is already taken, initialize() does something helpful and
+// slightly alarming: it finds the process listening there and, if it is a node
+// process, stops it and binds anyway. that is correct after a crash left a
+// zombie holding the socket. it is very much not correct when the owner is your
+// production bot, quietly working, and you just ran an example.
+//
+// so: probe first, refuse if busy. one owner per port.
+// ---------------------------------------------------------------------------
+function portIsFree(port) {
+    return new Promise((resolve) => {
+        const probe = net.createServer();
+        probe.once('error', () => resolve(false));
+        probe.once('listening', () => probe.close(() => resolve(true)));
+        probe.listen(port, '127.0.0.1');
+    });
+}
+
 async function main() {
+    if (!(await portIsFree(PORT))) {
+        console.log(`port ${PORT} is already in use - something else owns this bot.`);
+        console.log('not starting. if that is a stale process, stop it; if it is your real');
+        console.log(`bot, leave it alone and run this on a spare port instead:\n`);
+        console.log(`    MINECRAFT_BRIDGE_PORT=7531 node examples/01_hello_bot.mjs\n`);
+        console.log('(the bridge needs the same value, or it will keep dialling 7431.)');
+        return;
+    }
+
     // starts the ws server and the autonomy timer. idempotent - calling it
     // twice is safe. it does NOT enable the bot; see enable() below.
     await tool.initialize({

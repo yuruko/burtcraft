@@ -1,18 +1,15 @@
-// node/tools/minecraft_tool.js
-// the burnt-side brain for the minecraft (burtcraft) integration.
+// core/minecraft_tool.js
+// the controller half of burtcraft: the machine that owns the minecraft body.
 //
-// execute_minecraft() in ../tools.js depends on a singleton `minecraftTool`
-// that was referenced but never actually shipped - this is that module.
+// this module runs a websocket SERVER. the bridge (bridge/minecraft_bot_bridge.js,
+// which relays into the game) is the CLIENT that connects to it. your vtuber is
+// the always-on endpoint, so it is the stable one; the bridge reconnects to it
+// whenever minecraft (re)launches.
 //
-// topology: this module runs a websocket SERVER. the minecraft_bot_bridge.js
-// process (which lives next to altoclef/baritone and relays into the game) is
-// the CLIENT that connects to it. burnt's node server is always-on, so it's the
-// stable endpoint; the bridge reconnects to it whenever minecraft (re)launches.
-//
-//   burnt.js (tool system)
-//      -> minecraftTool  (ws server, THIS file, port 7431)
+//   your vtuber's brain (an llm - yours)
+//      -> MinecraftTool  (ws server, THIS file, port 7431)
 //         <-> minecraft_bot_bridge.js  (ws client, relays commands)
-//             <-> altoclef external command server (in-game)
+//             <-> altoclef external control server (in-game)
 //                 <-> baritone -> minecraft world
 //
 // responsibilities kept here (decoupled from altoclef command syntax, which the
@@ -21,11 +18,17 @@
 //   - live game-state sync from bridge events/state/heartbeat
 //   - autonomous behavior (idle / mood-weighted / reactive safety)
 //   - natural-language chat-command interpretation for viewer-driven play
-//   - session stats + burnt-voice commentary queue (never touches the tts
-//     speech queue directly - see note on commentary below)
+//   - session stats + an internal commentary queue
 //
-// import is side-effect free: the server + timers only start on initialize(),
-// which execute_minecraft() calls lazily on first use.
+// what is deliberately NOT here: any llm call, database, http request, or spoken
+// output. this file emits events and answers getStatus(); your character does
+// the talking. commentary entries are CUES for your brain to rewrite, never
+// lines to speak verbatim. see docs/INTEGRATING.md.
+//
+// import is side-effect free apart from the module-level singleton export at the
+// bottom (which constructs a MinecraftMemory rooted at ./data relative to cwd).
+// import { MinecraftTool } instead of the default if you want to control that.
+// the server + timers only start on initialize().
 
 import { WebSocketServer } from 'ws';
 import EventEmitter from 'events';
@@ -107,10 +110,10 @@ const EAT_RETRY_GAP_MS = 60 * 1000;
 // 'look' is instant (just a rotation), so it must not be tracked as a goal or
 // the stall/loop watchdogs would supervise a thing that finishes immediately
 // 'hud' is text on a screen, not a goal: being in here keeps it off the goal tracker
-// AND exempt from the f1 guard below, which is deliberate - when yuru takes the
+// AND exempt from the f1 guard below, which is deliberate - when the operator takes the
 // keyboard the hud should still be able to say so rather than freeze on a stale line.
-// 'set_home' is a memory write, not a goal - and it stays allowed under f1 so yuru can
-// walk her somewhere good and say "this is home" while holding the keyboard.
+// 'set_home' is a memory write, not a goal - and it stays allowed under f1 so the operator can
+// walk the bot somewhere good and say "this is home" while holding the keyboard.
 const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'status', 'inventory', 'coords', 'enable', 'disable', 'autonomous', 'look', 'boat', 'hud', 'set_home']);
 
 // the in-game intent line: "<what she's doing>" / "<why>" / "<live altoclef phase>".
@@ -240,7 +243,7 @@ const OCEAN_BIOME_RE = /ocean|river/i;
 const WATER_ORBIT_WINDOW_MS = 18 * 1000;
 const WATER_WADE_LIMIT_MS = 15 * 1000;
 const WATER_PROGRESS_BLOCKS = 32;
-// yuru's rule, stated plainly: she is NEVER in open water for minutes. half a
+// a hard rule, stated plainly: the bot is NEVER in open water for minutes. half a
 // minute of continuous swimming is already too long on stream, so the ceiling
 // is 30s and the wade tripwire is 15s. baritone is separately priced out of
 // water entirely (baritone Settings.avoidWaterWhileDry), so this is the net
@@ -1212,8 +1215,8 @@ class MinecraftTool extends EventEmitter {
             case 'manual_control':
                 this.manualControl = data.on === true;
                 this.recentEvents.record(this.manualControl
-                    ? 'yuru took the keyboard (f1) - hands off the controls'
-                    : 'got the controls back from yuru');
+                    ? 'the operator took the keyboard (f1) - hands off the controls'
+                    : 'got the controls back from the operator');
                 if (this.manualControl) this._failAllPending('operator took manual control (f1)');
                 break;
             case 'protection_denied': {
@@ -1644,7 +1647,7 @@ class MinecraftTool extends EventEmitter {
             // f1 manual control: the human owns the keyboard - bot goals are
             // refused (the companion enforces this too); chat/status still work
             if (this.manualControl && !NON_TASK_ACTIONS.has(action)) {
-                reject(new Error('manual control is on (f1) - yuru has the keyboard right now'));
+                reject(new Error('manual control is on (f1) - the operator has the keyboard right now'));
                 return;
             }
 
@@ -3065,7 +3068,7 @@ class MinecraftTool extends EventEmitter {
             return;
         }
         if (!this.enabled || !this.connected || !this.gameConnected) return;
-        if (this.manualControl) return; // yuru has the keyboard (f1)
+        if (this.manualControl) return; // the operator has the keyboard (f1)
         if (this._stateIsStale()) return;
         this._observeMinecraftState();
         if (this._waterWatchdog()) return;

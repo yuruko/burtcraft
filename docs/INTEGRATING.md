@@ -75,6 +75,23 @@ await mc.executeAction(action, params, { source, waitForCompletion, priority });
 `source` is `'llm'`, `'viewer'`, or `'autonomy'`. **Always set it** — see
 [arbitration](#arbitration) below.
 
+> **The number one integration trap.** Not every action reaches the game. The
+> bridge's translator knows 27 game-bound actions; the rest are **control-plane
+> actions your host dispatcher must answer itself** from `getStatus()` and
+> memory:
+>
+> `enable` `disable` `status` `autonomous` `gamer` `gamer_stop` `favorite`
+> `unfavorite` `favorites`
+>
+> Hand one of those to `executeAction` and it gets relayed to a bridge that has
+> no translation for it, and you get an error instead of the obvious local
+> answer. `set_home` is the exception that resolves inside `executeAction` (it is
+> a pure memory write), and `go_home` / `move` with a saved-spot name are
+> rewritten into coordinate moves for you.
+>
+> `examples/04_llm_tool.mjs` splits the actions into families for exactly this
+> reason — copy that dispatcher rather than writing a passthrough.
+
 ### Reading
 
 ```js
@@ -169,6 +186,31 @@ The same principle runs through the lower layers: `gameState.multiplayer` and
 `server` report what the game actually joined, never what your config intended.
 
 ---
+
+## Sharp edges
+
+Things that are reasonable in context but will surprise you once:
+
+- **`getStatus()` is not a pure getter.** It advances internal affect state as a
+  side effect. Call it freely, but do not treat it as free.
+- **When nothing is connected it still returns a fully-populated `gameState`** —
+  health 20/20, position 0,0,0. That is the honesty trap in miniature. Gate on
+  `gameConnected` before you let any of it reach a prompt.
+- **`shouldSurfaceChat()` is random and stateful.** Ambient lines are sampled
+  (~50% behind a 75s gap) and the call updates per-sender timestamps, so the
+  same input can answer differently twice. That is deliberate — it is what stops
+  the bot replying to every line — but it means it is not a pure predicate.
+- **`recordViewerSuggestion()` returns `null` for three different reasons**
+  (blocked verb, not request-shaped, sender on cooldown) and does not tell you
+  which.
+- **`shutdown()` is synchronous** despite the name. `await` is harmless.
+- **Importing the default singleton has side effects** — it constructs a
+  `MinecraftMemory` rooted at `./data` relative to your cwd and registers a
+  process exit hook. Import `{ MinecraftTool }` and construct it yourself if you
+  want control over that.
+- **Error ordering can mislead.** With the bridge up but no world loaded, an
+  action reports stale telemetry rather than "not in a world" — the staleness
+  check runs first. The bot is fine; the message points at the wrong thing.
 
 ## Multiplayer manners
 

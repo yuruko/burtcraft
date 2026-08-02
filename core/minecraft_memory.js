@@ -17,18 +17,21 @@ const MAX_OVENS = 32;
 const MAX_TERRAIN_CELLS = 4000;
 const MAX_CLAIMED_CELLS = 400;
 const OVEN_MERGE_DIST = 3;                  // same block, re-reported by the scan
-// the oven family. burnt collects antique toasters in real life and treats
-// appliances as people; in here, every furnace/smoker/campfire she installs is a
-// unit that joins the collection and gets a name.
+// the oven family. every furnace/smoker/campfire the bot installs becomes a
+// named unit in a collection it keeps track of - a cheap, durable source of
+// "things that are mine" for a character to refer back to.
 export const OVEN_KINDS = ['furnace', 'blast_furnace', 'smoker', 'campfire', 'soul_campfire'];
-// auto-names for units the idle brain installs, in her antique-toaster register
-// (model names, chrome-and-bakelite era, a couple of clergy). her own brain can
-// override with a name when it places one through the tool.
-const OVEN_NAME_POOL = [
-    'sunbeam', 'old chrome', 'bakelite betty', 'the deacon', 'toastmaster',
-    'hotpoint', 'the duchess', 'dominion', 'mr. radiant', 'coronet',
-    'the vicar', 'proctor', 'kenmore', 'the widow', 'general electric',
-    'the archbishop', 'westinghouse', 'little chief', 'the magistrate', 'universal'
+// auto-names for units the idle brain installs, used only when the brain does
+// not supply one through the tool.
+//
+// THIS IS CHARACTER FLAVOR, and it is the one place persona leaks into the
+// otherwise neutral memory layer. the default below is deliberately plain.
+// pass your own register to the constructor - burnt's, for instance, is a set of
+// antique-toaster model names because she collects them:
+//     new MinecraftMemory(path, { ovenNames: ['sunbeam', 'bakelite betty', ...] })
+const DEFAULT_OVEN_NAME_POOL = [
+    'the first one', 'old reliable', 'number two', 'the spare', 'the good one',
+    'backup', 'the corner unit', 'the loud one', 'the new one', 'the small one'
 ];
 
 function cleanText(value, max = 120) {
@@ -41,7 +44,9 @@ function safePoint(position) {
 }
 
 export class MinecraftMemory {
-    constructor(filePath = DEFAULT_PATH, { registerExitHook = true } = {}) {
+    constructor(filePath = DEFAULT_PATH, { registerExitHook = true, ovenNames = null } = {}) {
+        // character flavor, injectable - see DEFAULT_OVEN_NAME_POOL above
+        this.ovenNames = Array.isArray(ovenNames) && ovenNames.length ? ovenNames : DEFAULT_OVEN_NAME_POOL;
         this.filePath = filePath;
         this.data = {
             version: 1, journal: [], landmarks: [], failures: [], favorites: [], home: null, wheatSpots: [],
@@ -297,7 +302,7 @@ export class MinecraftMemory {
     // pool is exhausted so a big collection never collides.
     _nextOvenName() {
         const taken = new Set(this.data.ovens.map((o) => String(o.name || '').toLowerCase()));
-        const free = OVEN_NAME_POOL.filter((n) => !taken.has(n));
+        const free = this.ovenNames.filter((n) => !taken.has(n));
         if (free.length) return free[Math.floor(Math.random() * free.length)];
         return `unit ${this.data.ovens.length + 1}`;
     }

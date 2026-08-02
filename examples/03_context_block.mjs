@@ -265,8 +265,8 @@ function deriveKit(g) {
 
     const hay = names.join(' ');
     const kit = [];
-    // PICKAXE_TIERS comes from core - worst to best, so `find` gives the lowest
-    // tier present. swap to a reverse scan if you want the best one instead.
+    // PICKAXE_TIERS comes from core ordered best -> worst (netherite first), so
+    // `find` returns the best pickaxe actually being carried.
     const tier = PICKAXE_TIERS.find((t) => hay.includes(`${t}_pickaxe`));
     kit.push(tier ? `pickaxe(${tier})` : 'NO pickaxe');
     if (/_sword/.test(hay)) kit.push('sword');
