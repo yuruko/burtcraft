@@ -19,3 +19,8 @@ export {
 export { MinecraftMemory, OVEN_KINDS } from './minecraft_memory.js';
 export { MinecraftAffect, appraiseMinecraftState } from './minecraft_affect.js';
 export { RecentEvents } from './recent_events.js';
+export {
+    Settlement, Homestead, Outpost, ToasterHomestead, ToasterOutpost,
+    toasterHomesteadDimensions, toasterOutpostDimensions,
+    settlementFromJSON, mainIsBiggest, fitOutpostBelowHomestead, toasterBlueprint
+} from './settlements.js';

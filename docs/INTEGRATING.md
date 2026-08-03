@@ -76,17 +76,18 @@ await mc.executeAction(action, params, { source, waitForCompletion, priority });
 [arbitration](#arbitration) below.
 
 > **The number one integration trap.** Not every action reaches the game. The
-> bridge's translator knows 27 game-bound actions; the rest are **control-plane
+> bridge's translator knows the game-bound actions; the rest are **control-plane
 > actions your host dispatcher must answer itself** from `getStatus()` and
 > memory:
 >
 > `enable` `disable` `status` `autonomous` `gamer` `gamer_stop` `favorite`
-> `unfavorite` `favorites`
+> `unfavorite` `favorites` `set_outpost` `outposts`
 >
 > Hand one of those to `executeAction` and it gets relayed to a bridge that has
 > no translation for it, and you get an error instead of the obvious local
-> answer. `set_home` is the exception that resolves inside `executeAction` (it is
-> a pure memory write), and `go_home` / `move` with a saved-spot name are
+> answer. `set_home`, `set_outpost`, and `outposts` resolve inside
+> `executeAction` as memory operations; `go_home`, `go_outpost`, `build_outpost`,
+> and `move` with a saved-spot name are
 > rewritten into coordinate moves for you.
 >
 > `examples/04_llm_tool.mjs` splits the actions into families for exactly this
@@ -128,6 +129,9 @@ mc.stopGamerMode();
 ```js
 mc.setFavoriteHere('the lava pit');
 mc.setHome('the homestead');
+mc.setOutpostHere('east toaster', 2); // level 1-4; main home stays larger
+mc.getStatus().homeProject;           // persistent goal, %, phase, components
+mc.getStatus().settlements;           // exact anchors and dimensions
 await mc.shutdown();
 ```
 
@@ -184,6 +188,9 @@ in this stack and the easiest one to write by accident.
 
 The same principle runs through the lower layers: `gameState.multiplayer` and
 `server` report what the game actually joined, never what your config intended.
+`gameState.settlementBuild` is likewise a real block survey. A torch in inventory
+does not satisfy `lit`, and a project reaches 100% only when its floor, walls,
+roof, clear interior, two toast slots, walk-through, and side torches all match.
 
 ---
 

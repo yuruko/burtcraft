@@ -7,6 +7,7 @@ import adris.altoclef.eventbus.EventBus;
 import adris.altoclef.eventbus.events.ChatMessageEvent;
 import adris.altoclef.eventbus.events.TaskFinishedEvent;
 import adris.altoclef.tasks.misc.EatNowTask;
+import adris.altoclef.tasks.construction.ToasterBuildTask;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -1004,6 +1005,7 @@ public class ExternalControlServer implements ClientModInitializer {
                 try {
                     String botTask = "";
                     String botAction = "";
+                    JsonArray botTaskPath = new JsonArray();
                     int depth = 0;
                     adris.altoclef.commandsystem.CommandExecutor exec = AltoClef.getCommandExecutor();
                     AltoClef acMod = exec != null ? exec.getMod() : null;
@@ -1015,10 +1017,14 @@ public class ExternalControlServer implements ClientModInitializer {
                             depth = chain.size();
                             botTask = String.valueOf(chain.get(0));
                             botAction = String.valueOf(chain.get(chain.size() - 1));
+                            for (adris.altoclef.tasksystem.Task task : chain) {
+                                botTaskPath.add(String.valueOf(task));
+                            }
                         }
                     }
                     gs.addProperty("botTask", botTask);
                     gs.addProperty("botAction", botAction);
+                    gs.add("botTaskPath", botTaskPath);
                     gs.addProperty("botTaskDepth", depth);
                 } catch (Throwable t) { /* task readout is best-effort */ }
 
@@ -1178,6 +1184,10 @@ public class ExternalControlServer implements ClientModInitializer {
                     // the scan almost immediately and only a genuine hall costs anything.
                     // the floor is deliberately excluded - a room needs one.
                     try { gs.addProperty("clearEdge", measureClearEdge(mc)); } catch (Throwable ignored) { }
+                    try {
+                        JsonObject toaster = ToasterBuildTask.getLatestTelemetry();
+                        if (toaster != null) gs.add("settlementBuild", toaster);
+                    } catch (Throwable ignored) { }
 
                     if (isNight && !lastWasNight) sendEvent("nightfall", new JsonObject());
                     lastWasNight = isNight;

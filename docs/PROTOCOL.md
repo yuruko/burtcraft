@@ -92,6 +92,7 @@ skipped when the value cannot be read this tick.
 | `multiplayer`, `server`, `nearbyPlayerNames` | **ground truth** — the companion reports what it actually joined, never what your config intended |
 | `botTask` | high-level goal + phase, e.g. `beating the game.: getting blaze rods` |
 | `botAction` | deepest micro-action |
+| `settlementBuild` | exact toaster survey: kind/role/anchor/dimensions, phase, percent, shell/interior checks, two-slot check, walk-through check, side-torch counts, and remaining smooth stone |
 
 `botTask` is what lets a character say what it is genuinely doing right now. It
 comes from `getTaskRunner().getCurrentTaskChain()`; older mod builds without the
@@ -113,6 +114,18 @@ block"). Two denials inside a minute during a goal means the bot is standing in
 someone's claim, and the right response is to remember the area and leave, not
 to retry.
 
+## Cancellation and replacement
+
+The controller treats `stop` as a synchronization barrier. A replacement goal
+is not sent after the bridge's `executing` acknowledgement; it waits for the
+terminal stop response proving that AltoClef released the old task tree. Agent,
+operator, mode-switch, and gamer sources may use this path to replace current
+work. Duplicate gamer starts share the same transition.
+
+If that terminal stop response is lost, the controller closes the relay socket.
+Relay and companion disconnect fail-safes then issue their own stop before
+reconnecting, preventing an old task from continuing unsupervised.
+
 ---
 
 ## Adding an action
@@ -126,4 +139,18 @@ to retry.
 
 Actions that never reach the game (answered from memory) include `status`,
 `enable`, `disable`, `autonomous`, `inventory`, `coords`, `favorite`,
-`unfavorite`, `favorites`, `set_home`, `gamer`, `gamer_stop`.
+`unfavorite`, `favorites`, `set_home`, `set_outpost`, `outposts`, `gamer`,
+`gamer_stop`.
+
+### Settlement actions
+
+| Action | Parameters | Companion command |
+|---|---|---|
+| `build_settlement` | `role` (`homestead`/`outpost`), integer `x,y,z,width,depth,height` | `@toaster_build ...` |
+| `install_appliance` | `target` (furnace/smoker/blast furnace/campfire), integer `x,y,z` | `@place_at ...` |
+| `set_outpost` | local `target` name and optional level 1-4 | persisted only |
+| `build_outpost` | saved outpost name | resolves its persisted geometry, then builds |
+
+The bridge validates roles, world bounds, dimensions, and appliance allowlists;
+it never interpolates arbitrary command text. Reissuing a build is safe because
+the companion changes only blocks that disagree with the settlement schematic.

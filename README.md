@@ -23,7 +23,7 @@ already knows how to survive.
 | | |
 |---|---|
 | **A wire protocol** | Newline-delimited JSON over localhost. Documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). |
-| **A Node library** | `core/` — ws server, 37 actions, live game state, place memory, an autonomy loop. No LLM calls, no database, no HTTP, no opinions about what your character says. |
+| **A Node library** | `core/` — ws server, live game state, durable place/settlement memory, and an autonomy loop. No LLM calls, database, HTTP, or dialogue opinions. |
 | **A relay** | `bridge/` — translates actions into real AltoClef commands and back. |
 | **An in-game mod** | `mod/ExternalControlServer.java` — the only piece that runs inside Minecraft. |
 | **Two vendored forks** | `altoclef/` and `baritone/`, patched for Minecraft 26.1.2 and for not swimming across oceans. See [NOTICE](NOTICE). |
@@ -116,6 +116,31 @@ node examples/01_hello_bot.mjs
 
 Every example runs standalone with no game attached, so you can read the output
 and learn the API before any of the above works.
+
+### Toaster settlements
+
+Burtcraft includes a reusable settlement hierarchy (`Settlement`, `Homestead`,
+`Outpost`) and Burnt's concrete `ToasterHomestead` / `ToasterOutpost` geometry.
+A toaster is an idempotently repaired rectangular smooth-stone prism with a
+clear interior, smooth floor/walls/ceiling, a three-wide doorless walk-through,
+two long roof slots, side torches, and deterministic middle-gallery appliance
+positions. The main homestead expands before each furnace; supported outposts
+remain strictly smaller.
+
+```js
+await mc.executeAction('set_home', { target: 'main toaster' });
+const project = mc.getStatus().homeProject; // durable %/phase/components
+await mc.executeAction('build_settlement', {
+  role: 'homestead', ...project.dimensions,
+  ...mc.getStatus().settlements[0].anchor
+});
+await mc.executeAction('set_outpost', { target: 'east toaster', level: 2 });
+await mc.executeAction('build_outpost', { target: 'east toaster' });
+```
+
+Construction progress is surveyed from real world blocks and persisted by the
+Node controller, so restarting either process resumes the same project instead
+of trusting inventory or an elapsed timer.
 
 ---
 
@@ -215,6 +240,17 @@ LLM-issued goals a grace window before autonomy is allowed to take over. The
 library ships this arbitration; do not defeat it by calling `executeAction`
 untagged.
 
+Explicit decisions are interruptible. Calls sourced as `agent`, `operator`,
+`mode-switch`, or `gamer` cancel the current AltoClef task, wait for the game to
+confirm the stop, and only then dispatch the replacement. This includes the
+gamer button: clicking it during `craft bread` starts one stop-to-speedrun
+transition instead of returning "busy". Autonomous picks still wait their turn.
+
+Finite tasks also have progress watchdogs. A craft with no movement or inventory
+change is stopped after 20 seconds (45 seconds by default for other work, 90 for
+speedrun), and dead persistent exploration is restarted rather than displaying
+an activity label forever.
+
 ### Fail honestly
 
 If Minecraft is not running, actions fail. Do not paper over it — let your
@@ -236,7 +272,8 @@ reusable at all.
 `follow` `stop` `idle` `attack` `defend` `speedrun` `gamer` `gamer_stop`
 `explore` `hunt` `eat` `equip` `deposit` `stash` `give` `locate` `inventory`
 `coords` `chat` `cover_lava` `favorite` `unfavorite` `favorites` `set_home`
-`go_home` `place` `look` `boat`
+`go_home` `set_outpost` `outposts` `go_outpost` `build_outpost`
+`build_settlement` `install_appliance` `place` `look` `boat`
 
 Selected mappings to the underlying commands:
 

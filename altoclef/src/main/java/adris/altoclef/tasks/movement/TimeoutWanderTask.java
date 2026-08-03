@@ -239,10 +239,18 @@ public class TimeoutWanderTask extends Task implements ITaskRequiresGrounded {
             mod.getClientBaritone().getExploreProcess().explore((int) _origin.x(), (int) _origin.z());
         }
         if (!_progressChecker.check(mod)) {
+            // ExploreProcess may remain "active" forever while producing no
+            // path. Reset it so the next tick makes a fresh exploration request.
+            mod.getClientBaritone().getExploreProcess().onLostControl();
+            mod.getClientBaritone().getPathingBehavior().forceCancel();
+            _origin = mod.getPlayer().position();
             _progressChecker.reset();
             if (!_forceExplore) {
                 _failCounter++;
                 Debug.logMessage("Failed exploring.");
+            } else {
+                _failCounter++;
+                Debug.logMessage("Exploration produced no movement; restarting it.");
             }
         }
         return null;
@@ -264,12 +272,14 @@ public class TimeoutWanderTask extends Task implements ITaskRequiresGrounded {
         // Why the heck did I add this in?
         //if (_origin == null) return true;
 
-        if (Float.isInfinite(_distanceToWander)) return false;
-
         // If we fail 10 times or more, we may as well try the previous task again.
+        // Search tasks use infinite wander, so failure must be checked before
+        // the infinite-distance shortcut or the counter is dead code.
         if (_failCounter > 10) {
             return true;
         }
+
+        if (Float.isInfinite(_distanceToWander)) return false;
 
         if (mod.getPlayer() != null && mod.getPlayer().position() != null && (mod.getPlayer().onGround() ||
                 mod.getPlayer().isInWater())) {

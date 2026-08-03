@@ -16,7 +16,7 @@
     "example:context": "node examples/03_context_block.mjs",
     "example:llm": "node examples/04_llm_tool.mjs",
     "example:adapter": "node examples/05_vtuber_adapter.mjs",
-    "check": "node --check core/minecraft_tool.js && node --check bridge/minecraft_bot_bridge.js"
+    "check": "node --check core/minecraft_tool.js && node --check core/minecraft_memory.js && node --check core/settlements.js && node --check bridge/minecraft_bot_bridge.js && node tests/settlements.test.mjs && node tests/reliability.test.mjs"
   },
   "keywords": [
     "minecraft",

@@ -24,6 +24,7 @@ import org.apache.commons.lang3.ArrayUtils;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Place a block type at a position
@@ -34,6 +35,7 @@ public class PlaceBlockTask extends Task implements ITaskRequiresGrounded {
     private static final int PREFERRED_MATERIALS = 32;
     private final BlockPos _target;
     private final Block[] _toPlace;
+    private BlockState _desiredState;
     private final boolean _useThrowaways;
     private final boolean _autoCollectStructureBlocks;
     private final MovementProgressChecker _progressChecker = new MovementProgressChecker();
@@ -50,6 +52,12 @@ public class PlaceBlockTask extends Task implements ITaskRequiresGrounded {
 
     public PlaceBlockTask(BlockPos target, Block... toPlace) {
         this(target, toPlace, false, false);
+    }
+
+    /** Place an exact state, used when orientation is part of the structure. */
+    public PlaceBlockTask(BlockPos target, BlockState desiredState) {
+        this(target, new Block[]{desiredState.getBlock()}, false, false);
+        _desiredState = desiredState;
     }
 
     public static int getMaterialCount(AltoClef mod) {
@@ -153,7 +161,8 @@ public class PlaceBlockTask extends Task implements ITaskRequiresGrounded {
     @Override
     protected boolean isEqual(Task other) {
         if (other instanceof PlaceBlockTask task) {
-            return task._target.equals(_target) && task._useThrowaways == _useThrowaways && Arrays.equals(task._toPlace, _toPlace);
+            return task._target.equals(_target) && task._useThrowaways == _useThrowaways
+                && Arrays.equals(task._toPlace, _toPlace) && Objects.equals(task._desiredState, _desiredState);
         }
         return false;
     }
@@ -165,6 +174,7 @@ public class PlaceBlockTask extends Task implements ITaskRequiresGrounded {
             return WorldHelper.isSolid(mod, _target);
         }
         BlockState state = mod.getWorld().getBlockState(_target);
+        if (_desiredState != null) return state.equals(_desiredState);
         return ArrayUtils.contains(_toPlace, state.getBlock());
     }
 
@@ -189,6 +199,7 @@ public class PlaceBlockTask extends Task implements ITaskRequiresGrounded {
         @Override
         public BlockState desiredState(int x, int y, int z, BlockState blockState, List<BlockState> available) {
             if (x == 0 && y == 0 && z == 0) {
+                if (_desiredState != null) return _desiredState;
                 // WHAT SHE WAS ASKED FOR WINS. the throwaway test used to run first,
                 // inside the same loop, so a caller that named a block AND allowed
                 // throwaways got whichever came first in the inventory - i.e. she

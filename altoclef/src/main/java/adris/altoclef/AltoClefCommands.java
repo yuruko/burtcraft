@@ -38,7 +38,9 @@ public class AltoClefCommands {
                 new CoverWithSandCommand(),
                 new CoverWithBlocksCommand(),
                 new SelfCareCommand(),
-                new PlaceCommand()
+                new PlaceCommand(),
+                new PlaceAtCommand(),
+                new ToasterBuildCommand()
                 //new TestMoveInventoryCommand(),
                 //    new TestSwapInventoryCommand()
         );

@@ -1,0 +1,25 @@
+package adris.altoclef.tasks.construction.settlement;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Blocks;
+
+import java.util.List;
+
+/** Burnt's large, smooth-stone primary toaster. */
+public final class ToasterHomestead extends Homestead {
+    public ToasterHomestead(String name, BlockPos anchor, int width, int depth, int height) {
+        super(name, anchor, width, depth, height, Blocks.SMOOTH_STONE);
+    }
+
+    @Override
+    public String kind() { return "toaster_homestead"; }
+
+    @Override
+    public boolean isEntrance(BlockPos pos) { return ToasterGeometry.isEntrance(this, pos); }
+
+    @Override
+    public boolean isToastSlot(BlockPos pos) { return ToasterGeometry.isToastSlot(this, pos); }
+
+    @Override
+    public List<BlockPos> torchPositions() { return ToasterGeometry.torchPositions(this); }
+}

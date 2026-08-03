@@ -37,7 +37,8 @@ const SUPPORTED_ACTIONS = new Set([
     'move', 'get', 'mine', 'collect', 'craft', 'follow', 'stop', 'idle',
     'defend', 'attack', 'speedrun', 'eat', 'hunt', 'equip', 'deposit',
     'stash', 'give', 'inventory', 'coords', 'locate', 'cover_lava',
-    'explore', 'chat', 'place', 'look', 'boat', 'hud'
+    'explore', 'chat', 'place', 'build_settlement', 'install_appliance',
+    'look', 'boat', 'hud'
 ]);
 // These controls may run alongside a real AltoClef goal. They must never take
 // ownership of gameState.currentTask or an instant completion will make a mine,
@@ -246,7 +247,8 @@ class MinecraftBotBridge extends EventEmitter {
                 'movement', 'mining', 'collecting', 'crafting', 'combat',
                 'inventory', 'follow', 'speedrun', 'exploration', 'chat',
                 'look', 'boat', 'world_state_v2', 'action_lifecycle',
-                'companion_readiness', 'telemetry_watchdog'
+                'companion_readiness', 'telemetry_watchdog',
+                'toaster_settlements_v1', 'settlement_progress'
             ]
         });
         this._startHeartbeat();
@@ -616,6 +618,27 @@ class MinecraftBotBridge extends EventEmitter {
                 if (!p.target) throw new Error('place needs to know which block to put down');
                 return { command: `place ${item(p.target)}` };
 
+            case 'build_settlement': {
+                const role = String(p.role || '').trim().toLowerCase();
+                if (!['homestead', 'outpost'].includes(role)) throw new Error('build_settlement role must be homestead or outpost');
+                const at = this._worldPoint(p, 'settlement anchor');
+                const dims = ['width', 'depth', 'height'].map((key) => {
+                    const value = Number(p[key]);
+                    if (!Number.isInteger(value) || value < 5 || value > 64) throw new Error(`settlement ${key} must be an integer from 5 to 64`);
+                    return value;
+                });
+                return { command: `toaster_build ${role} ${at.x} ${at.y} ${at.z} ${dims.join(' ')}` };
+            }
+
+            case 'install_appliance': {
+                const kind = item(p.target);
+                if (!['furnace', 'blast_furnace', 'smoker', 'campfire', 'soul_campfire'].includes(kind)) {
+                    throw new Error('install_appliance needs a furnace, smoker, blast furnace, or campfire kind');
+                }
+                const at = this._worldPoint(p, 'appliance position');
+                return { command: `place_at ${at.x} ${at.y} ${at.z} ${kind}` };
+            }
+
             case 'inventory': return { command: `inventory${p.item || p.target ? ' ' + item(p.item || p.target) : ''}` };
             case 'coords':    return { command: 'coords' };
             case 'locate': {
@@ -638,10 +661,6 @@ class MinecraftBotBridge extends EventEmitter {
                 if (!message || /^[\/@#]/.test(message) || /[\r\n\u0000]/.test(message)) throw new Error('commands and control characters are not allowed through minecraft chat');
                 return { chat: message.slice(0, 240) };
             }
-
-            // altoclef has no generic build task; surfaced as unsupported so burnt
-            // can improvise commentary instead of pretending it built something
-            case 'build': return null;
 
             default: return null;
         }

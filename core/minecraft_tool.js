@@ -34,6 +34,10 @@ import { WebSocketServer } from 'ws';
 import EventEmitter from 'events';
 import { RecentEvents } from './recent_events.js';
 import { MinecraftMemory, OVEN_KINDS } from './minecraft_memory.js';
+import {
+    ToasterHomestead, ToasterOutpost, toasterHomesteadDimensions,
+    toasterOutpostDimensions, fitOutpostBelowHomestead, mainIsBiggest
+} from './settlements.js';
 import { MinecraftAffect } from './minecraft_affect.js';
 
 const DEFAULT_PORT = parseInt(process.env.MINECRAFT_BRIDGE_PORT || '7431', 10);
@@ -46,6 +50,15 @@ const DEFAULT_ACTION_TIMEOUT = 90000;
 
 // autonomous idle cadence - how often to consider doing something unprompted.
 const DEFAULT_AUTONOMOUS_TICK_MS = 25000;
+
+// Explicit decisions may replace the single AltoClef task already running.
+// Autonomous menu picks deliberately remain non-preempting so they cannot
+// thrash each other. A viewer request may replace only viewer/autonomous work.
+const PREEMPTING_SOURCES = new Set(['agent', 'operator', 'request', 'mode-switch', 'gamer']);
+const REPLACEABLE_SOURCES = new Set([
+    'autonomous', 'request', 'safety', 'recovery', 'loop-recovery',
+    'dwell-rotation', 'orphan-recovery', 'water-escape', 'protection', 'pinned'
+]);
 
 // min gap between reactions of the same kind, so chat can't farm spam and a
 // stream of damage events doesn't flood commentary.
@@ -69,7 +82,14 @@ const MAX_TELEMETRY_AGE_MS = 15000;
 // the in-game task before it reconnects.
 const BRIDGE_SILENCE_MS = 75000;
 const TELEMETRY_FAULT_MS = 45000;
-const AUTONOMOUS_STALL_MS = 120000;
+// Finite work may not look alive while producing no movement or inventory
+// change indefinitely. Crafting is tighter because missing ingredients can
+// otherwise leave AltoClef wandering/rescanning while the HUD says "crafting".
+const AUTONOMOUS_STALL_MS = 45000;
+const ACTION_STALL_MS = Object.freeze({
+    craft: 20000,
+    speedrun: 90000
+});
 // loop detection: she can "make progress" (position keeps changing) while going nowhere -
 // orbiting one patch, or grinding a goal that never resolves. catch both.
 const LOOP_CONFINE_RADIUS = 24;            // blocks (horizontal): orbiting within this = "same spot"
@@ -78,7 +98,8 @@ const DEFAULT_FINITE_GOAL_MAX_MS = 15 * 60 * 1000;
 const GOAL_MAX_RUNTIME_MS = {
     // A full speedrun is intentionally long-lived. Movement/confinement and
     // no-progress checks still apply, but there is no arbitrary wall-clock stop.
-    speedrun: null
+    speedrun: null,
+    build_settlement: null
 };
 const LOOP_AVOID_MS = 2 * 60 * 1000;       // after a break, don't re-pick the same action for this long
 // "pinned": the freeze where altoclef's MobDefenseChain (priority 70-80) preempts burnt's
@@ -114,7 +135,7 @@ const EAT_RETRY_GAP_MS = 60 * 1000;
 // keyboard the hud should still be able to say so rather than freeze on a stale line.
 // 'set_home' is a memory write, not a goal - and it stays allowed under f1 so the operator can
 // walk the bot somewhere good and say "this is home" while holding the keyboard.
-const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'status', 'inventory', 'coords', 'enable', 'disable', 'autonomous', 'look', 'boat', 'hud', 'set_home']);
+const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'status', 'inventory', 'coords', 'enable', 'disable', 'autonomous', 'look', 'boat', 'hud', 'set_home', 'set_outpost', 'outposts']);
 
 // the in-game intent line: "<what she's doing>" / "<why>" / "<live altoclef phase>".
 // verbs are present-continuous so the hud reads as a sentence about a person rather
@@ -124,7 +145,7 @@ const INTENT_VERBS = {
     move: 'heading to', follow: 'following', explore: 'exploring', idle: 'killing time',
     defend: 'fighting back', attack: 'going after', eat: 'eating', hunt: 'hunting',
     equip: 'gearing up', deposit: 'stashing loot', stash: 'stashing loot',
-    place: 'placing', speedrun: 'speedrunning', locate: 'searching for',
+    place: 'placing', install_appliance: 'installing', build_settlement: 'building', speedrun: 'speedrunning', locate: 'searching for',
     give: 'handing over', cover_lava: 'capping lava', boat: 'sorting out a boat'
 };
 // fallback WHY when a goal carries no `say` of its own - keyed on who wanted it.
@@ -194,7 +215,7 @@ const PERSISTENT_ACTIONS = new Set(['follow', 'idle', 'explore']);
 // spawner, digging out a stronghold, boating an ocean), so burnt's external
 // stall/loop killer must NOT abort it - the task has its own timeout/wander
 // recovery. these stay finite (they do finish), just exempt from the watchdog.
-const WATCHDOG_EXEMPT_ACTIONS = new Set(['speedrun']);
+const WATCHDOG_EXEMPT_ACTIONS = new Set();
 // autonomous-sourced persistent behaviors never emit a finish, so the tick loop
 // rotates them out after a bounded dwell instead of parking on them forever.
 // idle gets a longer stay: it's the nightfall shelter behavior and a full
@@ -312,6 +333,9 @@ const HOMESTEAD_BIAS = 0.75;                       // chance the arc outranks th
 const HOMESTEAD_SETTLE_DIST_MP = 450;              // min blocks from session anchor (multiplayer)
 const HOMESTEAD_SETTLE_DIST_SP = 120;              // min blocks (singleplayer)
 const HOMESTEAD_NEAR_HOME = 32;                    // "at home" radius for placement steps
+const TOASTER_FURNACE_TARGET = 24;
+const TOASTER_NEAR_RADIUS = 40;
+const OUTPOST_MIN_HOME_DISTANCE = 180;
 // THE OBSESSION: furnaces, smokers, bread, fire. the homestead arc provisions the
 // first of each once; this is the part that never finishes. a person with a
 // fixation doesn't tick it off a list - she keeps the fuel bin full, keeps adding
@@ -388,11 +412,13 @@ function defaultGameState() {
         underwater: false,
         isInCombat: false,
         currentTask: null,
+        settlementBuild: null,
         // live altoclef task readout from the in-game companion: botTask is the
         // high-level goal + phase ("beating the game.: getting blaze rods"),
         // botAction is the concrete micro-action underneath. empty when idle.
         botTask: '',
         botAction: '',
+        botTaskPath: [],
         botTaskDepth: 0,
         timeOfDay: 'day',
         onGround: true,
@@ -422,6 +448,8 @@ function mcCompletionLabel(action, params) {
         case 'give': return t ? `handed over ${t}` : 'gave items';
         case 'locate': return t ? `found the ${t}` : 'located a structure';
         case 'place': return t ? `placed ${t.replace(/_/g, ' ')} at the spot` : 'placed a block';
+        case 'install_appliance': return t ? `installed ${t.replace(/_/g, ' ')} in the toaster gallery` : 'installed an appliance';
+        case 'build_settlement': return `finished the ${String(params.role || 'toaster').replace(/_/g, ' ')}`;
         case 'build': return 'built something';
         default: return null; // status/coords/inventory/idle/stop/etc - not accomplishments
     }
@@ -557,6 +585,7 @@ class MinecraftTool extends EventEmitter {
         this.manualControl = false;
         // homestead drive state
         this._homesteadCooldowns = new Map();
+        this._lastSettlementProgressSignature = '';
         this._sessionAnchor = null;
         this._lastWheatRecordAt = 0;
         // the obsession (ovens / bread / fire): its own cooldown map so a stalled
@@ -601,6 +630,11 @@ class MinecraftTool extends EventEmitter {
 
         this.autonomousTimer = null;
         this.lastAutonomousAt = 0;
+        // One cancellation barrier serializes stop -> replacement. Without it,
+        // the late stop can cancel the new task that was just dispatched.
+        this._stopInFlight = null;
+        // Rapid double-clicks on the gamer button share the same transition.
+        this._gamerStartInFlight = null;
     }
 
     log(level, message, data = null) {
@@ -743,6 +777,7 @@ class MinecraftTool extends EventEmitter {
         this.connected = true;
         this.lastBridgeMessageAt = Date.now();
         this._clearFault('bridge_silent');
+        this._clearFault('stop_unconfirmed');
         this.log('info', 'bot bridge connected');
         this.emit('connected');
 
@@ -1021,6 +1056,9 @@ class MinecraftTool extends EventEmitter {
             }
         } catch { /* best-effort */ }
         if (partial.currentTask !== undefined) this.currentTask = partial.currentTask;
+        if (partial.settlementBuild && typeof partial.settlementBuild === 'object') {
+            this._persistSettlementSurvey(partial.settlementBuild);
+        }
         if (freshObservation && Number.isFinite(observedAt) && observedAt > 0) {
             this.lastGameStateAt = observedAt;
             if (Date.now() - observedAt <= MAX_TELEMETRY_AGE_MS) this._clearFault('telemetry_stale');
@@ -1057,6 +1095,9 @@ class MinecraftTool extends EventEmitter {
             // starved precisely when it was needed. it returns true only while an
             // escape is genuinely still closing on land.
             if (this._waterWatchdog()) return;
+            // State is the watchdog clock, so a 20s craft deadline does not wait
+            // for the slower autonomous tick and still applies with self-play off.
+            if (this._recoverStalledGoal()) return;
             if (this._recoverPinnedByMobs()) return;
             this._pushIntentHud();
             this._maybeNarrateToRoom();
@@ -1342,10 +1383,18 @@ class MinecraftTool extends EventEmitter {
     _recordObsessionCompletion(action, params) {
         const target = String(params.target || '').toLowerCase().replace(/^minecraft:/, '');
         try {
-            if (action === 'place' && OVEN_KINDS.includes(target)) {
+            if ((action === 'place' || action === 'install_appliance') && OVEN_KINDS.includes(target)) {
                 // a finished place is a real new unit, so never merge it into a
                 // neighbour just because she didn't move between installs
-                const recorded = this.memory.recordOven(target, this.gameState.position, this.gameState.dimension, params.name || null, { dedupe: false });
+                const exactPosition = [params.x, params.y, params.z].every(Number.isFinite)
+                    ? { x: params.x, y: params.y, z: params.z }
+                    : this.gameState.position;
+                const settlement = params.settlementId
+                    ? this.memory.getSettlement(params.settlementId)
+                    : this.memory.listSettlements(this._worldId()).find((entry) => entry.contains(exactPosition, 3));
+                const recorded = this.memory.recordOven(target, exactPosition, this.gameState.dimension, params.name || null, {
+                    dedupe: false, settlementId: settlement?.id || null
+                });
                 if (recorded?.isNew) {
                     const tally = this.memory.ovenTally();
                     this.recentEvents.record(`installed ${target.replace(/_/g, ' ')} "${recorded.entry.name}" (${tally.total} in the collection)`);
@@ -1515,7 +1564,17 @@ class MinecraftTool extends EventEmitter {
     // game accepts it - the speedrun then tracks + narrates its phases in the
     // background. no-op-friendly: if a speedrun is already live it just marks the
     // mode instead of tripping the busy guard with a second dispatch.
-    async startGamerMode() {
+    startGamerMode() {
+        if (this._gamerStartInFlight) return this._gamerStartInFlight;
+        let tracked;
+        tracked = this._startGamerModeOnce().finally(() => {
+            if (this._gamerStartInFlight === tracked) this._gamerStartInFlight = null;
+        });
+        this._gamerStartInFlight = tracked;
+        return tracked;
+    }
+
+    async _startGamerModeOnce() {
         if (!this.enabled) this.enable();
         if (this.currentAction === 'speedrun' || this.activeGoal?.action === 'speedrun') {
             this.gamerMode = true;
@@ -1570,6 +1629,9 @@ class MinecraftTool extends EventEmitter {
             // botTask = high-level goal + phase, botAction = concrete micro-action
             botTask: this._cleanPhase(this.gameState.botTask),
             botAction: this._cleanPhase(this.gameState.botAction),
+            botTaskPath: Array.isArray(this.gameState.botTaskPath)
+                ? this.gameState.botTaskPath.map((part) => this._cleanPhase(part)).filter(Boolean)
+                : [],
             activeGoal: this.activeGoal ? {
                 action: this.activeGoal.action,
                 target: this.activeGoal.params?.target || null,
@@ -1591,6 +1653,9 @@ class MinecraftTool extends EventEmitter {
             nearbyPlayerNames: Array.isArray(this.gameState.nearbyPlayerNames) ? this.gameState.nearbyPlayerNames.slice(0, 8) : [],
             favorites: this.memory.favoritesContext(this.gameState.position, this.gameState.dimension),
             home: this.memory.getHome()?.name || null,
+            homeProject: this.memory.getHome(this._worldId()) ? this._publicHomeProject() : null,
+            settlements: this.memory.listSettlements(this._worldId()).map((entry) => entry.toJSON()),
+            outposts: this.memory.listOutposts(this._worldId()).map((entry) => entry.toJSON()),
             deathSpot: this.memory.getDeathSpot(),
             knownPlayers: this.knownPlayers(12),
             chatRoom: this.chatRoom(),
@@ -1614,10 +1679,64 @@ class MinecraftTool extends EventEmitter {
 
     // ---- action dispatch -------------------------------------------------
 
+    // AltoClef owns one task runner. Explicit decisions first cross a confirmed
+    // stop barrier, while autonomous menu choices still wait their turn.
+    async executeAction(action, params = {}, opts = {}) {
+        try {
+            const act = String(action || '').trim().toLowerCase();
+            if (act === 'stop') return await this._runStopTransition(opts);
+            if (act && !NON_TASK_ACTIONS.has(act) && this._stopInFlight) {
+                await this._stopInFlight;
+            }
+            const preemption = this._preemptIfWarranted(action, opts);
+            if (preemption) await preemption;
+            return await this._dispatchAction(action, params, opts);
+        } catch (err) {
+            if (err && !err._reported) {
+                err._reported = true;
+                const stopped = /^task stopped$/i.test(String(err.message || '').trim());
+                if (!stopped) {
+                    this.emit('actionFailed', {
+                        id: null, action, params, error: err.message || 'action failed', local: true
+                    });
+                }
+            }
+            throw err;
+        }
+    }
+
+    _runStopTransition(opts = {}) {
+        if (this._stopInFlight) return this._stopInFlight;
+        // An executing ACK means only "accepted". Do not release a replacement
+        // until the game confirms that the old task tree is actually gone.
+        const stop = this._dispatchAction('stop', {}, { ...opts, waitForCompletion: true });
+        let tracked;
+        tracked = stop.finally(() => {
+            if (this._stopInFlight === tracked) this._stopInFlight = null;
+        });
+        this._stopInFlight = tracked;
+        return tracked;
+    }
+
+    _preemptIfWarranted(action, opts = {}) {
+        const act = String(action || '').trim().toLowerCase();
+        if (!act || NON_TASK_ACTIONS.has(act)) return;
+        const source = opts.source || 'agent';
+        if (!PREEMPTING_SOURCES.has(source)) return;
+        const inFlight = [...this.pendingActions.values()].filter((p) => !NON_TASK_ACTIONS.has(p.action));
+        const active = this.activeGoal;
+        const hasTaskState = inFlight.length > 0 || !!active ||
+            (!!this.currentAction && !NON_TASK_ACTIONS.has(this.currentAction)) || !!this.currentTask;
+        if (!hasTaskState) return;
+        const unconditional = ['agent', 'operator', 'mode-switch', 'gamer'].includes(source);
+        const owners = [...inFlight.map((pending) => pending.source), active?.source].filter(Boolean);
+        if (!unconditional && (!owners.length || !owners.every((owner) => REPLACEABLE_SOURCES.has(owner)))) return;
+        this.log('info', `preempting "${this.currentTask || active?.action || inFlight[0]?.action || 'current minecraft task'}" for ${act} (${source})`);
+        return this._runStopTransition({ priority: 'urgent', source: 'preempt', timeoutMs: 30000 });
+    }
+
     // send an action to the bridge and resolve when the bot reports it done.
-    // execute_minecraft() guards connected/enabled before calling, but we
-    // re-check defensively so no caller can hang on a dead socket.
-    executeAction(action, params = {}, opts = {}) {
+    _dispatchAction(action, params = {}, opts = {}) {
         return new Promise((resolve, reject) => {
             if (typeof action !== 'string' || !action.trim()) {
                 reject(new Error('minecraft action must be a non-empty string'));
@@ -1666,6 +1785,31 @@ class MinecraftTool extends EventEmitter {
                     reject(err);
                 }
                 return;
+            }
+            if (action === 'set_outpost') {
+                try {
+                    const entry = this.setOutpostHere(String(params.target || params.name || 'toaster outpost'), params.level || 1);
+                    resolve({ status: 'success', result: { outpost: entry.toJSON() } });
+                } catch (err) { reject(err); }
+                return;
+            }
+            if (action === 'outposts') {
+                resolve({ status: 'success', result: this.memory.listOutposts(this._worldId()).map((entry) => entry.toJSON()) });
+                return;
+            }
+            if (action === 'go_outpost') {
+                const outpost = this._findOutpost(params.target || params.name);
+                if (!outpost) { reject(new Error('no matching toaster outpost is saved')); return; }
+                action = 'move';
+                params = { ...params, ...outpost.anchor, dimension: this._dimForMove(outpost.dimension), target: `outpost (${outpost.name})` };
+                savedPlace = true;
+            }
+            if (action === 'build_outpost') {
+                const outpost = this._findOutpost(params.target || params.name);
+                if (!outpost) { reject(new Error('no matching toaster outpost is saved')); return; }
+                action = 'build_settlement';
+                params = { ...params, role: 'outpost', settlementId: outpost.id, ...outpost.anchor,
+                    width: outpost.width, depth: outpost.depth, height: outpost.height, target: outpost.name };
             }
             if (action === 'go_home') {
                 const home = this.memory.getHome(this._worldId());
@@ -1744,7 +1888,9 @@ class MinecraftTool extends EventEmitter {
             const isTaskAction = !NON_TASK_ACTIONS.has(action);
             const hasPendingTask = [...this.pendingActions.values()]
                 .some((pendingAction) => !NON_TASK_ACTIONS.has(pendingAction.action));
-            if (isTaskAction && hasPendingTask) {
+            const hasLiveTask = hasPendingTask || !!this.activeGoal ||
+                (!!this.currentAction && !NON_TASK_ACTIONS.has(this.currentAction)) || !!this.currentTask;
+            if (isTaskAction && hasLiveTask) {
                 reject(new Error(`minecraft is busy with ${this.currentTask || this.currentAction || 'another task'}`));
                 return;
             }
@@ -1820,6 +1966,23 @@ class MinecraftTool extends EventEmitter {
                     this.activeGoal = null;
                 }
             } else if (action === 'stop') {
+                // Retire the old long-running records at the cancellation
+                // boundary. Otherwise a lost old terminal response can leave a
+                // four-hour "busy" record after stop already cleared the HUD.
+                for (const [pendingId, oldPending] of this.pendingActions) {
+                    if (pendingId === id || NON_TASK_ACTIONS.has(oldPending.action)) continue;
+                    clearTimeout(oldPending.timer);
+                    this.pendingActions.delete(pendingId);
+                    if (!oldPending.settled) {
+                        oldPending.settled = true;
+                        oldPending.reject(new Error('task stopped'));
+                    }
+                    this.emit('actionStopped', {
+                        id: pendingId,
+                        action: oldPending.action,
+                        params: oldPending.params
+                    });
+                }
                 this.currentAction = null;
                 this.currentActionId = null;
                 this.currentTask = null;
@@ -1856,9 +2019,9 @@ class MinecraftTool extends EventEmitter {
             source: pending.source,
             why: pending.why || null,   // her stated reason, for the in-game hud
             persistent,
-            // persistent behaviours (follow/idle/explore) and self-recovering
-            // macros (speedrun) are not auto-killed by the stall/loop watchdog.
-            watchdog: !persistent && !watchdogExempt,
+            // Idle/follow may correctly stand still. Explore is a movement
+            // promise, so persistent explore still receives stall supervision.
+            watchdog: !watchdogExempt && (!persistent || pending.action === 'explore'),
             maxRuntimeMs: persistent
                 ? null
                 : (Object.prototype.hasOwnProperty.call(GOAL_MAX_RUNTIME_MS, pending.action)
@@ -1868,7 +2031,8 @@ class MinecraftTool extends EventEmitter {
             lastProgressAt: now,
             lastInventoryProgressAt: now,
             lastPosition: this._point(this.gameState.position),
-            lastInventorySignature: this._inventorySignature()
+            lastInventorySignature: this._inventorySignature(),
+            lastSettlementSignature: this._settlementProgressSignature(this.gameState.settlementBuild)
         };
         return this.activeGoal;
     }
@@ -1891,6 +2055,13 @@ class MinecraftTool extends EventEmitter {
             if (inventorySignature !== this.activeGoal.lastInventorySignature) {
                 this.activeGoal.lastInventorySignature = inventorySignature;
                 this.activeGoal.lastInventoryProgressAt = now;
+                progressed = true;
+            }
+        }
+        if (Object.prototype.hasOwnProperty.call(partial, 'settlementBuild')) {
+            const signature = this._settlementProgressSignature(partial.settlementBuild);
+            if (signature && signature !== this.activeGoal.lastSettlementSignature) {
+                this.activeGoal.lastSettlementSignature = signature;
                 progressed = true;
             }
         }
@@ -2001,6 +2172,42 @@ class MinecraftTool extends EventEmitter {
         return this.currentTask ? String(this.currentTask) : '';
     }
 
+    _prettyPhase(raw) {
+        const s = String(raw || '').trim();
+        if (!s) return '';
+        const needs = s.match(/getting\s+([a-z0-9_]+)\s*x\s*(\d+)/i);
+        if (needs) return `needs ${needs[1].replace(/_/g, ' ')} x${needs[2]}`;
+        const container = s.match(/\b(crafting_table|furnace|smoker|blast_furnace|campfire)\b[^:]*:\s*\[\[([^\]]+)\]\s*x\s*(\d+)/i);
+        if (container) {
+            const verb = /crafting_table/i.test(container[1]) ? 'crafting' : 'smelting';
+            const item = container[2].split(',')[0].replace(/_/g, ' ').trim();
+            return `${verb} ${item}${Number(container[3]) > 1 ? ` x${container[3]}` : ''}`;
+        }
+        const recipe = s.match(/craft\s+([a-z0-9_]+)\}/i) || s.match(/\bcraft\s+([a-z0-9_]+)\b/i);
+        if (recipe && /recipe|craft/i.test(s)) return `crafting ${recipe[1].replace(/_/g, ' ')}`;
+        const collect = s.match(/mine and collect:\s*\[\[([^\],]+)/i);
+        if (collect) return `mining ${collect[1].replace(/_/g, ' ').trim()}`;
+        const going = s.match(/getting to block blockpos\{x=(-?\d+),\s*y=(-?\d+),\s*z=(-?\d+)/i);
+        if (going) {
+            const lost = /wandering/i.test(s) ? ' (looking for a way)' : '';
+            return `walking to ${going[1]}, ${going[3]}${lost}`;
+        }
+        return s;
+    }
+
+    _liveGoalPhase() {
+        const path = Array.isArray(this.gameState.botTaskPath)
+            ? this.gameState.botTaskPath.map((part) => this._cleanPhase(part)).filter(Boolean)
+            : [];
+        for (let i = path.length - 1; i >= 0; i--) {
+            if (/getting\s+[a-z0-9_]+\s*x\s*\d+/i.test(path[i])) return this._prettyPhase(path[i]);
+        }
+        return this._prettyPhase(this._cleanPhase(this.gameState.botAction))
+            || this._prettyPhase(path.at(-1))
+            || this._prettyPhase(this._cleanPhase(this.gameState.botTask))
+            || '';
+    }
+
     _intentPayload() {
         const trim = (s, n = 88) => {
             const one = String(s || '').replace(/\s+/g, ' ').trim();
@@ -2011,8 +2218,7 @@ class MinecraftTool extends EventEmitter {
         const goal = this.activeGoal;
         // her own `say` if she had a reason; otherwise who wanted this
         const why = goal ? (goal.why || INTENT_SOURCE_WHY[goal.source] || '') : '';
-        const phase = this._cleanPhase(this.gameState.botAction)
-            || this._cleanPhase(this.gameState.botTask) || '';
+        const phase = this._liveGoalPhase();
         return { what, why: trim(why), phase: trim(phase) };
     }
 
@@ -2062,6 +2268,140 @@ class MinecraftTool extends EventEmitter {
         return g.multiplayer === true ? 'multiplayer' : 'singleplayer';
     }
 
+    _home() { return this.memory.getHome(this._worldId()); }
+
+    _homeOvens(kind = null) {
+        const home = this._home();
+        if (!home) return [];
+        const settlement = this.memory.getMainSettlement(this._worldId());
+        return this.memory.listOvens().filter((oven) => {
+            if (kind && oven.kind !== kind) return false;
+            if (!this._dimMatches(oven.dimension, home.dimension)) return false;
+            return settlement ? settlement.contains(oven.position, 3)
+                : Math.hypot(oven.position.x - home.position.x, oven.position.z - home.position.z) <= TOASTER_NEAR_RADIUS;
+        });
+    }
+
+    _settlementProgressSignature(progress) {
+        if (!progress || typeof progress !== 'object') return '';
+        const keys = ['kind', 'role', 'x', 'y', 'z', 'width', 'depth', 'height', 'phase', 'percent',
+            'complete', 'clear', 'floor', 'walls', 'roof', 'toastSlots', 'toastSlotCount',
+            'walkthrough', 'lit', 'smoothStoneRemaining', 'clearRemaining', 'torches', 'torchesRequired'];
+        return JSON.stringify(Object.fromEntries(keys.map((key) => [key, progress[key] ?? null])));
+    }
+
+    _persistSettlementSurvey(progress) {
+        const signature = this._settlementProgressSignature(progress);
+        if (!signature || signature === this._lastSettlementProgressSignature) return;
+        this._lastSettlementProgressSignature = signature;
+        const settlement = this.memory.listSettlements(this._worldId()).find((entry) =>
+            entry.kind === String(progress.kind || '') && entry.anchor.x === Number(progress.x) &&
+            entry.anchor.y === Number(progress.y) && entry.anchor.z === Number(progress.z) &&
+            entry.width === Number(progress.width) && entry.depth === Number(progress.depth) &&
+            entry.height === Number(progress.height));
+        if (!settlement) return;
+        const durable = { ...progress };
+        delete durable.active;
+        delete durable.updatedAt;
+        this.memory.updateSettlementProgress(settlement.id, durable);
+    }
+
+    _ensureMainToaster() {
+        const home = this._home();
+        if (!home) return null;
+        const furnaceTarget = Math.min(TOASTER_FURNACE_TARGET, Math.max(1, this._homeOvens('furnace').length + 1));
+        const dimensions = toasterHomesteadDimensions(furnaceTarget);
+        const existing = this.memory.getMainSettlement(this._worldId());
+        const sameAnchor = existing && this._dimMatches(existing.dimension, home.dimension) &&
+            Math.hypot(existing.anchor.x - home.position.x, existing.anchor.z - home.position.z) <= 3;
+        const sameDimensions = sameAnchor && existing.width === dimensions.width &&
+            existing.depth === dimensions.depth && existing.height === dimensions.height;
+        return this.memory.upsertSettlement(new ToasterHomestead({
+            ...(existing ? existing.toJSON() : {}), name: home.name, anchor: home.position,
+            dimension: home.dimension, world: home.world || this._worldId(), furnaceTarget,
+            progress: sameDimensions ? existing.progress : null,
+            appliances: sameAnchor ? existing.appliances : [], ...dimensions
+        }), { main: true });
+    }
+
+    homeSpec() {
+        const settlement = this._ensureMainToaster();
+        const live = this.gameState.settlementBuild;
+        const matches = live && settlement && live.kind === settlement.kind && Number(live.x) === settlement.anchor.x &&
+            Number(live.y) === settlement.anchor.y && Number(live.z) === settlement.anchor.z &&
+            Number(live.width) === settlement.width && Number(live.depth) === settlement.depth && Number(live.height) === settlement.height;
+        const progress = matches ? live : settlement?.progress;
+        const met = !!progress && progress.complete === true && progress.clear === true && progress.floor === true &&
+            progress.walls === true && progress.roof === true && progress.toastSlots === true &&
+            Number(progress.toastSlotCount) === 2 && progress.walkthrough === true && progress.lit === true;
+        return { settlement, progress, met, percent: Math.round(Number(progress?.percent) || 0),
+            phase: progress?.phase || 'not surveyed', furnaces: this._homeOvens('furnace').length };
+    }
+
+    _publicHomeProject() {
+        const spec = this.homeSpec();
+        const s = spec.settlement;
+        if (!s) return null;
+        const smokerCount = this._homeOvens('smoker').length;
+        const expansionProgress = Math.min(TOASTER_FURNACE_TARGET,
+            spec.furnaces + (s.furnaceTarget > spec.furnaces ? spec.percent / 100 : 0));
+        const completedUnits = expansionProgress + spec.furnaces + Math.min(1, smokerCount);
+        const totalUnits = TOASTER_FURNACE_TARGET * 2 + 1;
+        const nextAppliance = spec.met ? (spec.furnaces === 0 ? 'furnace' :
+            (smokerCount === 0 ? 'smoker' : (spec.furnaces < TOASTER_FURNACE_TARGET ? 'furnace' : null))) : null;
+        return { id: s.id,
+            goal: spec.met ? (nextAppliance ? `install the next ${nextAppliance.replace(/_/g, ' ')}` : 'maintain the completed main toaster')
+                : `expand the main toaster for furnace ${s.furnaceTarget}`,
+            percent: Math.min(100, Math.round(completedUnits / totalUnits * 100)),
+            shellPercent: spec.percent,
+            phase: spec.met ? (nextAppliance ? `waiting_for_${nextAppliance}` : 'core_program_complete') : spec.phase,
+            complete: spec.met && spec.furnaces >= TOASTER_FURNACE_TARGET && smokerCount >= 1,
+            shellComplete: spec.met,
+            furnaceCount: spec.furnaces, furnaceTarget: s.furnaceTarget,
+            smokerCount, nextAppliance,
+            program: { expansions: { complete: Math.floor(expansionProgress), target: TOASTER_FURNACE_TARGET, fractional: expansionProgress },
+                furnaces: { complete: spec.furnaces, target: TOASTER_FURNACE_TARGET },
+                smokers: { complete: Math.min(1, smokerCount), target: 1 }, completedUnits, totalUnits },
+            dimensions: { width: s.width, depth: s.depth, height: s.height },
+            components: spec.progress ? { clear: !!spec.progress.clear, floor: !!spec.progress.floor,
+                walls: !!spec.progress.walls, roof: !!spec.progress.roof, toastSlots: !!spec.progress.toastSlots,
+                walkthrough: !!spec.progress.walkthrough, sideTorches: !!spec.progress.lit } : {},
+            smoothStoneRemaining: Number(spec.progress?.smoothStoneRemaining) || 0,
+            clearRemaining: Number(spec.progress?.clearRemaining) || 0 };
+    }
+
+    setOutpostHere(name = 'toaster outpost', level = 1) {
+        if (!this.gameConnected || this._stateIsStale()) throw new Error('need a live world position to establish an outpost');
+        const main = this._ensureMainToaster();
+        if (!main) throw new Error('establish the main homestead first');
+        const position = this._point(this.gameState.position);
+        if (!position || !this._dimMatches(main.dimension, this.gameState.dimension)) throw new Error('outpost must share the homestead dimension');
+        if (this.memory.listOutposts(this._worldId()).some((entry) => entry.name.toLowerCase() === String(name).trim().toLowerCase())) {
+            throw new Error(`an outpost named "${name}" already exists`);
+        }
+        if (main.distanceTo(position) < OUTPOST_MIN_HOME_DISTANCE) throw new Error(`outposts must be ${OUTPOST_MIN_HOME_DISTANCE} blocks from home`);
+        if (this.gameState.underwater === true || OCEAN_BIOME_RE.test(String(this.gameState.biome || ''))) throw new Error('outpost needs dry land');
+        if (this._isClaimedCell(position.x, position.z)) throw new Error('outpost site is claimed');
+        const outpost = fitOutpostBelowHomestead(new ToasterOutpost({ name, anchor: position,
+            dimension: this.gameState.dimension, world: this._worldId(), level,
+            ...toasterOutpostDimensions(level) }), main);
+        if (!mainIsBiggest(main, [...this.memory.listOutposts(this._worldId()), outpost])) {
+            throw new Error('main homestead must remain bigger than every outpost');
+        }
+        if (this.memory.listSettlements(this._worldId()).some((entry) =>
+            entry.distanceTo(outpost.anchor) < Math.max(entry.width, entry.depth) + Math.max(outpost.width, outpost.depth))) {
+            throw new Error('outpost overlaps an existing settlement');
+        }
+        return this.memory.upsertSettlement(outpost);
+    }
+
+    _findOutpost(name = null) {
+        const entries = this.memory.listOutposts(this._worldId());
+        const wanted = String(name || '').trim().toLowerCase();
+        if (wanted) return entries.find((entry) => entry.name.toLowerCase() === wanted || entry.id.toLowerCase() === wanted) || null;
+        return entries.sort((a, b) => a.distanceTo(this.gameState.position) - b.distanceTo(this.gameState.position))[0] || null;
+    }
+
     // save the spot she's standing on under a name of her choosing
     setFavoriteHere(name, note = null) {
         if (!this.gameConnected || this._stateIsStale()) {
@@ -2095,6 +2435,7 @@ class MinecraftTool extends EventEmitter {
         if (!entry) throw new Error('could not set home');
         this.recentEvents.record(`declared "${entry.name}" home`);
         this.memory.record('home', `made "${entry.name}" home`, { position: entry.position, dimension: entry.dimension });
+        this._ensureMainToaster();
         return entry;
     }
 
@@ -2244,6 +2585,16 @@ class MinecraftTool extends EventEmitter {
             pending.reject(new Error(reason));
         }
         this.emit('actionTimeout', { id, action: pending.action, params: pending.params, error: reason });
+        if (pending.action === 'stop' && this.connected) {
+            // An unconfirmed cancellation is unsafe. Closing the controller link
+            // activates the relay/companion control-loss fail-safes, which issue
+            // their own stop before reconnecting.
+            this._setFault('stop_unconfirmed', reason);
+            try {
+                if (typeof this.client?.terminate === 'function') this.client.terminate();
+                else this.client?.close?.();
+            } catch { /* close handler owns cleanup */ }
+        }
     }
 
     // ---- chat command interpretation -------------------------------------
@@ -3258,6 +3609,10 @@ class MinecraftTool extends EventEmitter {
         // operator/LLM actions made while autonomous self-play is off.
         if (this._recoverStalledGoal()) return;
         if (this._recoverLoopingGoal()) return;
+        // Ownership/lifecycle recovery applies even when autonomous choices are
+        // disabled: a requested persistent task or orphan can still wedge.
+        if (this._recoverPersistentGoal(now)) return;
+        if (this._recoverOrphanTask(now)) return;
         if (!this.autonomous) return;
         // SAFETY IS NOT ALLOWED TO OWN THE LOOP FOREVER. this branch returns
         // before every other behaviour, so if the situation it reacts to cannot
@@ -3285,65 +3640,6 @@ class MinecraftTool extends EventEmitter {
             this._urgentSafetySince = 0;
             this._urgentSafetyYieldUntil = now + URGENT_SAFETY_YIELD_MS;
         }
-        // persistent behaviors (explore/idle/follow) never finish on their own -
-        // without a dwell budget the first autonomous explore (or nightfall idle)
-        // parks the loop permanently: currentTask stays set and the gate below
-        // returns on every tick until chat re-tasks her.
-        //
-        // this used to exempt viewer/llm-issued persistent goals entirely, which
-        // meant one `idle` from her own brain parked her forever: persistent
-        // goals are watchdog-exempt too, so NOTHING could recover it. every
-        // persistent goal is now bounded - a hand-issued one just gets a longer
-        // leash than one the idle menu picked.
-        const dwellGoal = this.activeGoal;
-        if (dwellGoal && dwellGoal.persistent) {
-            const base = dwellGoal.action === 'idle' ? PERSISTENT_IDLE_DWELL_MS : PERSISTENT_DWELL_MS;
-            let dwellMs = dwellGoal.source === 'autonomous' ? base : base * PERSISTENT_REQUESTED_DWELL_MULT;
-            // being hurt ends a parked goal early no matter who asked for it.
-            // she was found standing in the dark on 11 health taking hits.
-            const hurtRecently = Date.now() - (this._lastDamageAt || 0) < PERSISTENT_DANGER_BREAK_MS;
-            if (hurtRecently) dwellMs = Math.min(dwellMs, PERSISTENT_DANGER_BREAK_MS);
-            if (Date.now() - dwellGoal.startedAt >= dwellMs) {
-                const description = this._describeTask(dwellGoal.action, dwellGoal.params);
-                const why = hurtRecently ? 'was taking damage while parked' : `hit its ${Math.round(dwellMs / 60000)}min dwell budget`;
-                this.log('info', `${dwellGoal.source} ${description} ${why}; rotating`);
-                this.memory.record('completed', `${description} (${hurtRecently ? 'broken off - taking hits' : 'dwell budget spent'}, moving on)`, {
-                    action: dwellGoal.action,
-                    target: dwellGoal.params?.target,
-                    position: this.gameState.position,
-                    dimension: this.gameState.dimension
-                });
-                this._avoidAction = dwellGoal.action;
-                this._avoidUntil = Date.now() + LOOP_AVOID_MS;
-                this._applyMinecraftEvent('bored');
-                this.activeGoal = null;
-                this.currentTask = null;
-                this.executeAction('stop', {}, { priority: 'urgent', source: 'dwell-rotation', waitForCompletion: false })
-                    .catch((err) => this.log('warn', `failed to stop ${description}: ${err.message}`));
-                return;
-            }
-        }
-        // ORPHAN GUARD. the gate below refuses to pick anything while currentTask
-        // is set - so a task nobody owns parks her permanently. that happens for
-        // real: altoclef's GetToXZTask only finishes on an EXACT block match and
-        // has no failure state at all, so an unreachable goto runs forever
-        // without ever finishing or erroring, and the goal that started it is
-        // long gone. if nothing burnt-side owns the task, it cannot be supervised
-        // by the stall/loop watchdogs either, so cut it loose.
-        if (this.currentTask && !this.activeGoal && !this.currentAction && this.pendingActions.size === 0) {
-            if (!this._orphanTaskSince) this._orphanTaskSince = Date.now();
-            if (Date.now() - this._orphanTaskSince >= ORPHAN_TASK_LIMIT_MS) {
-                this.log('warn', `no goal owns "${this.currentTask}" - clearing it so she can pick something`);
-                this.recentEvents.record('shook off a task that had stopped going anywhere');
-                this._orphanTaskSince = 0;
-                this.currentTask = null;
-                this.executeAction('stop', {}, { priority: 'urgent', source: 'orphan-recovery', waitForCompletion: false })
-                    .catch((err) => this.log('warn', `orphan stop failed: ${err.message}`));
-                return;
-            }
-        } else {
-            this._orphanTaskSince = 0;
-        }
         // A REAL PERSON ASKED FOR SOMETHING. this used to go nowhere: suggestions
         // were only ever read into her PROMPT, so unless her brain happened to be
         // mid-reply and chose to act, the idle brain just re-picked its own goal
@@ -3352,7 +3648,9 @@ class MinecraftTool extends EventEmitter {
         // now outranks anything the idle menu picked.
         if (this._actOnRequest()) return;
         // don't stack behaviors on top of an active task or a viewer command
-        if (this.currentAction || this.currentTask || this.pendingActions.size > 0) return;
+        const hasPendingTask = [...this.pendingActions.values()]
+            .some((pending) => !NON_TASK_ACTIONS.has(pending.action));
+        if (this.currentAction || this.currentTask || hasPendingTask) return;
         // a task just finished/failed: the outcome is already queued to burnt's
         // brain, which usually picks what's next. hold the fixed menu back so her
         // reasoned choice leads; the menu is only the fallback for real idle time.
@@ -3362,10 +3660,18 @@ class MinecraftTool extends EventEmitter {
         // skeleton with no pickaxe and no food. one prep goal beats one more death.
         const prep = this._survivalPrep();
         if (prep) {
-            this.lastAutonomousAt = Date.now();
             this._survivalPrepCooldowns.set(prep.key, Date.now());
-            this._safeExecute(prep.action, prep.params, prep.say);
-            return;
+            if (this._safeExecute(prep.action, prep.params, prep.say)) {
+                this.lastAutonomousAt = Date.now();
+                return;
+            }
+        }
+        const homestead = this._homesteadBehavior();
+        if (homestead) {
+            if (this._safeExecute(homestead.action, homestead.params || {}, homestead.say)) {
+                this.lastAutonomousAt = Date.now();
+                return;
+            }
         }
         // bread tendency: burnt loves bread. with downtime and wheat on hand she
         // gravitates to baking a loaf (she collects + eats bread). fires ~45% of
@@ -3375,14 +3681,17 @@ class MinecraftTool extends EventEmitter {
         // singleplayer anywhere. hunting wheat lives in the homestead arc.
         if (this._hasWheat() && Math.random() < 0.45 &&
             (this.gameState.multiplayer !== true || this._homeDistance() <= 64)) {
-            this.lastAutonomousAt = Date.now();
-            this._safeExecute('craft', { target: 'bread' }, this._breadLine());
-            return;
+            if (this._safeExecute('craft', { target: 'bread' }, this._breadLine())) {
+                this.lastAutonomousAt = Date.now();
+                return;
+            }
         }
         const behavior = this._pickIdleBehavior();
-        if (!behavior) return;
-        this.lastAutonomousAt = Date.now();
-        this._safeExecute(behavior.action, behavior.params || {}, behavior.say);
+        if (behavior && this._safeExecute(behavior.action, behavior.params || {}, behavior.say)) {
+            this.lastAutonomousAt = Date.now();
+            return;
+        }
+        if (this._avoidAction && Date.now() < (this._avoidUntil || 0)) this._executeAvoidFallback();
     }
 
     // parse the biggest stack count of an item from the compact inventory list
@@ -3405,6 +3714,22 @@ class MinecraftTool extends EventEmitter {
         const p = this.gameState.position;
         if (!home || !p || !this._dimMatches(home.dimension, this.gameState.dimension)) return Infinity;
         return Math.hypot(p.x - home.position.x, p.z - home.position.z);
+    }
+
+    _settlementBuildBehavior(settlement) {
+        if (!settlement) return null;
+        if (!this._dimMatches(settlement.dimension, this.gameState.dimension) || settlement.distanceTo(this.gameState.position) > HOMESTEAD_NEAR_HOME) {
+            return { action: 'go_home', params: {}, say: 'returning home to continue the toaster project' };
+        }
+        return { action: 'build_settlement', params: { role: settlement.role, settlementId: settlement.id,
+            ...settlement.anchor, width: settlement.width, depth: settlement.depth, height: settlement.height,
+            target: settlement.name }, say: 'building the smooth-stone toaster shell and its two top slots' };
+    }
+
+    _installInSettlement(kind, settlement) {
+        const position = settlement.appliancePosition(this._homeOvens().length);
+        return { action: 'install_appliance', params: { target: kind, ...position, settlementId: settlement.id },
+            say: `installing ${kind.replace(/_/g, ' ')} in the center gallery` };
     }
 
     // the homestead arc: settle -> provision -> live. returns an idle behavior
@@ -3461,6 +3786,24 @@ class MinecraftTool extends EventEmitter {
         const inv = this._carrying();
         const has = (frag) => inv.includes(frag);
         const hasExact = (item) => new RegExp(`(^|[^a-z_])${item}([^a-z_]|$)`).test(inv);
+        const spec = this.homeSpec();
+        if (!spec.met) {
+            const next = this._settlementBuildBehavior(spec.settlement);
+            const key = next?.action === 'build_settlement' ? 'build_main_toaster' : 'go_home_for_build';
+            if (next && !onCooldown(key)) { arm(key); return next; }
+            return null;
+        }
+        if (homeDist > HOMESTEAD_NEAR_HOME && !onCooldown('go_home_for_gallery')) {
+            arm('go_home_for_gallery');
+            return { action: 'go_home', params: {}, say: 'returning to the finished toaster shell' };
+        }
+        const missingSmoker = this._homeOvens('smoker').length === 0;
+        const wanted = spec.furnaces === 0 ? 'furnace' : (missingSmoker ? 'smoker' : (spec.furnaces < TOASTER_FURNACE_TARGET ? 'furnace' : null));
+        if (wanted && !onCooldown(`gallery_${wanted}`)) {
+            arm(`gallery_${wanted}`);
+            return hasExact(wanted) ? this._installInSettlement(wanted, spec.settlement)
+                : { action: 'get', params: { target: wanted, amount: 1 }, say: `getting ${wanted} for the toaster gallery` };
+        }
         const steps = [];
         if (!PICKAXE_TIERS.some((t) => has(`${t}_pickaxe`))) {
             steps.push({ key: 'pickaxe', atHome: false, action: 'get', params: { target: 'stone_pickaxe', amount: 1 }, say: 'tools first. a homestead without a pickaxe is a campsite' });
@@ -3747,11 +4090,6 @@ class MinecraftTool extends EventEmitter {
         // the homestead arc is her default way of living - it outranks the mood
         // menu most of the time but never a strong feeling (checks above) and
         // never an operator/viewer/llm goal (autonomy only runs when idle).
-        if (Math.random() < HOMESTEAD_BIAS) {
-            const homestead = this._homesteadBehavior();
-            if (homestead) return homestead;
-        }
-
         // the obsession picks up where the homestead checklist stops. provisioning
         // finishes; keeping the fuel bin full, the collection growing, the pantry
         // stocked and the place lit never does. sampled under the homestead so the
@@ -4055,11 +4393,14 @@ class MinecraftTool extends EventEmitter {
             });
         }
         if (!FOOD_RE.test(hay)) {
+            const canBakeNow = this._hasWheat();
             candidates.push({
                 key: 'food',
-                action: 'craft',
-                params: { target: 'bread' },
-                say: 'zero food on me, which is embarrassing for a bread professional. fixing that first'
+                action: canBakeNow ? 'craft' : 'eat',
+                params: canBakeNow ? { target: 'bread' } : { amount: EAT_GATHER_TARGET },
+                say: canBakeNow
+                    ? 'zero food on me, but i have wheat. making the bread instead of inventing an expedition'
+                    : 'zero food and zero wheat. finding something edible instead of pretending to craft bread'
             });
         }
         // WEAR THE ARMOR. altoclef has EquipArmorTask but nothing ever calls it
@@ -4157,6 +4498,76 @@ class MinecraftTool extends EventEmitter {
         return this._pickFresh('bread', lines);
     }
 
+    _recoverPersistentGoal(now = Date.now()) {
+        const goal = this.activeGoal;
+        if (!goal?.persistent) return false;
+        const base = goal.action === 'idle' ? PERSISTENT_IDLE_DWELL_MS : PERSISTENT_DWELL_MS;
+        let dwellMs = goal.source === 'autonomous' ? base : base * PERSISTENT_REQUESTED_DWELL_MULT;
+        const hurtRecently = now - (this._lastDamageAt || 0) < PERSISTENT_DANGER_BREAK_MS;
+        if (hurtRecently) dwellMs = Math.min(dwellMs, PERSISTENT_DANGER_BREAK_MS);
+        if (now - goal.startedAt < dwellMs) return false;
+
+        const description = this._describeTask(goal.action, goal.params);
+        const why = hurtRecently ? 'was taking damage while parked' : `hit its ${Math.round(dwellMs / 60000)}min dwell budget`;
+        this.log('info', `${goal.source} ${description} ${why}; rotating`);
+        try {
+            this.memory.record('completed', `${description} (${hurtRecently ? 'broken off - taking hits' : 'dwell budget spent'}, moving on)`, {
+                action: goal.action,
+                target: goal.params?.target,
+                position: this.gameState.position,
+                dimension: this.gameState.dimension
+            });
+        } catch { /* optional memory must not defeat recovery */ }
+        this._avoidAction = goal.action;
+        this._avoidUntil = now + LOOP_AVOID_MS;
+        this._applyMinecraftEvent('bored');
+        this.activeGoal = null;
+        this.currentTask = null;
+        this.executeAction('stop', {}, { priority: 'urgent', source: 'dwell-rotation', waitForCompletion: false })
+            .catch((err) => this.log('warn', `failed to stop ${description}: ${err.message}`));
+        return true;
+    }
+
+    _recoverOrphanTask(now = Date.now()) {
+        const hasPendingTask = [...this.pendingActions.values()]
+            .some((pending) => !NON_TASK_ACTIONS.has(pending.action));
+        const orphaned = this.currentTask && !this.activeGoal && !this.currentAction && !hasPendingTask;
+        if (!orphaned) {
+            this._orphanTaskSince = 0;
+            return false;
+        }
+        if (!this._orphanTaskSince) this._orphanTaskSince = now;
+        if (now - this._orphanTaskSince < ORPHAN_TASK_LIMIT_MS) return false;
+
+        this.log('warn', `no goal owns "${this.currentTask}" - clearing it so she can pick something`);
+        this.recentEvents.record('shook off a task that had stopped going anywhere');
+        this._orphanTaskSince = 0;
+        this.currentTask = null;
+        this.executeAction('stop', {}, { priority: 'urgent', source: 'orphan-recovery', waitForCompletion: false })
+            .catch((err) => this.log('warn', `orphan stop failed: ${err.message}`));
+        return true;
+    }
+
+    _executeAvoidFallback() {
+        const candidates = Number(this.gameState.nearbyHostiles) > 0
+            ? [
+                { action: 'defend', params: {}, say: 'that plan wedged. clearing the immediate problem instead' },
+                { action: 'explore', params: {}, say: 'that plan wedged. moving on instead of staring at it' }
+            ]
+            : [
+                { action: 'explore', params: {}, say: 'that plan wedged. moving on instead of staring at it' },
+                { action: 'collect', params: { target: 'oak_log', amount: 4 }, say: 'that plan wedged. doing a small wood run instead' }
+            ];
+        for (const candidate of candidates) {
+            if (candidate.action === this._avoidAction && Date.now() < (this._avoidUntil || 0)) continue;
+            if (this._safeExecute(candidate.action, candidate.params, candidate.say)) {
+                this.lastAutonomousAt = Date.now();
+                return true;
+            }
+        }
+        return false;
+    }
+
     // fire-and-forget executeAction that never rejects into the tick loop.
     // waitForCompletion:false gives idle goals the same background semantics as
     // llm-issued long goals: resolve at ack, completion tracked via the pending
@@ -4172,18 +4583,27 @@ class MinecraftTool extends EventEmitter {
     // it now rides along to the goal so the in-game hud can show WHY, which is the half
     // the mechanical task chain can never tell you.
     _safeExecute(action, params, say, source = 'autonomous') {
+        if (this._avoidAction === action && Date.now() < (this._avoidUntil || 0)) {
+            this.log('debug', `skipping recently stalled autonomous action: ${action}`);
+            return false;
+        }
         if (say) this._pushCommentary(say);
         this.executeAction(action, params, { priority: 'low', source, why: say || null, waitForCompletion: false }).catch((err) => {
             this.log('debug', `autonomous ${action} failed: ${err.message}`);
         });
+        return true;
     }
 
     _recoverStalledGoal() {
         const goal = this.activeGoal;
-        if (!goal || !goal.watchdog || Date.now() - goal.lastProgressAt < AUTONOMOUS_STALL_MS) return false;
+        const now = Date.now();
+        const stallMs = goal ? (ACTION_STALL_MS[goal.action] || AUTONOMOUS_STALL_MS) : AUTONOMOUS_STALL_MS;
+        if (!goal || !goal.watchdog || now - goal.lastProgressAt < stallMs) return false;
         const description = this._describeTask(goal.action, goal.params);
-        this.log('warn', `minecraft goal stalled; stopping ${description}`);
-        this.memory.recordFailure(goal.action, goal.params?.target, 'no movement or inventory progress for two minutes');
+        const stalledFor = Math.max(1, Math.round((now - goal.lastProgressAt) / 1000));
+        const reason = `no movement or inventory progress for ${stalledFor}s`;
+        this.log('warn', `minecraft goal stalled; stopping ${description} (${reason})`);
+        this.memory.recordFailure(goal.action, goal.params?.target, reason);
         this.memory.record('recovery', `abandoned stalled ${description}`, {
             action: goal.action,
             target: goal.params?.target,
@@ -4191,6 +4611,8 @@ class MinecraftTool extends EventEmitter {
             dimension: this.gameState.dimension
         });
         this._applyMinecraftEvent('stalled');
+        this._avoidAction = goal.action;
+        this._avoidUntil = now + LOOP_AVOID_MS;
         this.activeGoal = null;
         this.currentTask = `recovering from stalled ${description}`;
         this._pushCommentary(`i'm stuck on ${description}. aborting and trying something else.`);

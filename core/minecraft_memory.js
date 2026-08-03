@@ -4,6 +4,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import {
+    ToasterHomestead, settlementFromJSON, fitOutpostBelowHomestead
+} from './settlements.js';
 
 const DEFAULT_PATH = path.resolve(process.cwd(), 'data', 'minecraft_memory.json');
 const MAX_JOURNAL = 240;
@@ -12,11 +15,12 @@ const MAX_FAILURES = 80;
 const MAX_FAVORITES = 24;
 const MAX_WHEAT_SPOTS = 12;
 const WHEAT_SPOT_MERGE_DIST = 24;
-const MAX_OVENS = 32;
+const MAX_OVENS = 128;
 // 64-block cells, so ~4000 covers a 500x500-chunk slab of explored world
 const MAX_TERRAIN_CELLS = 4000;
 const MAX_CLAIMED_CELLS = 400;
 const MAX_VISITED_SPOTS = 256;
+const MAX_SETTLEMENTS = 16;
 // merge radius for "i have already looked here". matches the tool's
 // RECENT_DESTINATION_RADIUS so the persisted view and the live view agree.
 const VISITED_MERGE_RADIUS = 140;
@@ -53,8 +57,9 @@ export class MinecraftMemory {
         this.ovenNames = Array.isArray(ovenNames) && ovenNames.length ? ovenNames : DEFAULT_OVEN_NAME_POOL;
         this.filePath = filePath;
         this.data = {
-            version: 1, journal: [], landmarks: [], failures: [], favorites: [], home: null, wheatSpots: [],
+            version: 2, journal: [], landmarks: [], failures: [], favorites: [], home: null, wheatSpots: [],
             ovens: [], tally: { breadBaked: 0, ovensInstalled: 0, fuelRuns: 0 }, deathSpot: null,
+            settlements: [], mainSettlementId: null,
             // coarse map of where she has been wet vs stood: "wet"/"dry" keyed by
             // 64-block cell. without this she re-learns where the ocean is by
             // swimming into it once per restart.
@@ -83,6 +88,10 @@ export class MinecraftMemory {
                 this.data.home = typeof parsed.home === 'string' ? parsed.home : null;
                 this.data.wheatSpots = Array.isArray(parsed.wheatSpots) ? parsed.wheatSpots.slice(-MAX_WHEAT_SPOTS) : [];
                 this.data.ovens = Array.isArray(parsed.ovens) ? parsed.ovens.slice(-MAX_OVENS) : [];
+                this.data.settlements = Array.isArray(parsed.settlements)
+                    ? parsed.settlements.map(settlementFromJSON).filter(Boolean).slice(-MAX_SETTLEMENTS).map((s) => s.toJSON())
+                    : [];
+                this.data.mainSettlementId = typeof parsed.mainSettlementId === 'string' ? parsed.mainSettlementId : null;
                 this.data.terrain = parsed.terrain && typeof parsed.terrain === 'object' && !Array.isArray(parsed.terrain)
                     ? parsed.terrain
                     : {};
@@ -352,7 +361,7 @@ export class MinecraftMemory {
     // even if she placed it without moving - so that path passes dedupe:false.
     // otherwise two units placed from one standing spot merge into one, the count
     // never reaches its target, and she re-places the same oven forever.
-    recordOven(kind, position, dimension = 'overworld', name = null, { dedupe = true } = {}) {
+    recordOven(kind, position, dimension = 'overworld', name = null, { dedupe = true, settlementId = null } = {}) {
         const point = safePoint(position);
         const k = cleanText(kind, 32).toLowerCase().replace(/^minecraft:/, '');
         if (!point || !OVEN_KINDS.includes(k)) return null;
@@ -371,7 +380,8 @@ export class MinecraftMemory {
             kind: k,
             name: cleanText(name || this._nextOvenName(), 40),
             position: point,
-            dimension: dim
+            dimension: dim,
+            settlementId: settlementId ? cleanText(settlementId, 96) : null
         };
         this.data.ovens.push(entry);
         if (this.data.ovens.length > MAX_OVENS) this.data.ovens.shift();
@@ -473,6 +483,75 @@ export class MinecraftMemory {
 
     listFavorites() {
         return this.data.favorites.slice();
+    }
+
+    // ---- homesteads + outposts -------------------------------------------
+    upsertSettlement(value, { main = false } = {}) {
+        let settlement = value instanceof ToasterHomestead ? value : settlementFromJSON(value);
+        if (!settlement) return null;
+        const currentMain = this.getMainSettlement(settlement.world);
+        if (settlement.role === 'outpost' && currentMain) settlement = fitOutpostBelowHomestead(settlement, currentMain);
+        const idx = this.data.settlements.findIndex((entry) => entry.id === settlement.id ||
+            (entry.kind === settlement.kind && entry.world === settlement.world && entry.dimension === settlement.dimension &&
+                entry.anchor?.x === settlement.anchor.x && entry.anchor?.y === settlement.anchor.y && entry.anchor?.z === settlement.anchor.z));
+        const json = settlement.toJSON();
+        const previousMainId = this.data.mainSettlementId;
+        const previous = idx >= 0 ? this.data.settlements[idx] : null;
+        const comparable = (entry) => JSON.stringify(entry
+            ? Object.fromEntries(Object.entries(entry).filter(([key]) => key !== 'updatedAt'))
+            : null);
+        const nextMainId = (main || settlement.role === 'homestead') ? settlement.id : previousMainId;
+        if (previous && comparable(previous) === comparable(json) && nextMainId === previousMainId) {
+            return settlementFromJSON(previous);
+        }
+        if (idx >= 0) this.data.settlements.splice(idx, 1, json); else this.data.settlements.push(json);
+        while (this.data.settlements.length > MAX_SETTLEMENTS) {
+            const removable = this.data.settlements.findIndex((entry) => entry.id !== this.data.mainSettlementId);
+            this.data.settlements.splice(removable >= 0 ? removable : 0, 1);
+        }
+        if (main || settlement.role === 'homestead') this.data.mainSettlementId = settlement.id;
+        this._save();
+        return settlement;
+    }
+
+    listSettlements(world = null) {
+        return this.data.settlements.map(settlementFromJSON).filter((entry) => entry && (!world || !entry.world || entry.world === world));
+    }
+
+    getSettlement(id) { return settlementFromJSON(this.data.settlements.find((entry) => entry.id === id)); }
+
+    getMainSettlement(world = null) {
+        const direct = this.getSettlement(this.data.mainSettlementId);
+        if (direct && (!world || !direct.world || direct.world === world)) return direct;
+        return this.listSettlements(world).find((entry) => entry.role === 'homestead') || null;
+    }
+
+    listOutposts(world = null) { return this.listSettlements(world).filter((entry) => entry.role === 'outpost'); }
+
+    updateSettlementProgress(id, progress) {
+        const settlement = this.getSettlement(id);
+        if (!settlement) return null;
+        settlement.withProgress(progress);
+        return this.upsertSettlement(settlement, { main: settlement.id === this.data.mainSettlementId });
+    }
+
+    removeSettlement(id) {
+        const idx = this.data.settlements.findIndex((entry) => entry.id === id);
+        if (idx < 0) return false;
+        this.data.settlements.splice(idx, 1);
+        if (this.data.mainSettlementId === id) this.data.mainSettlementId = null;
+        this._save();
+        return true;
+    }
+
+    settlementsContext(world = null, max = 8) {
+        const main = this.getMainSettlement(world);
+        const rest = this.listSettlements(world).filter((entry) => !main || entry.id !== main.id);
+        return [main, ...rest].filter(Boolean).slice(0, max).map((entry) => {
+            const p = entry.progress;
+            const progress = p && Number.isFinite(Number(p.percent)) ? ` - ${Math.round(Number(p.percent))}% ${String(p.phase || 'built').replace(/_/g, ' ')}` : '';
+            return `${entry.role === 'homestead' ? 'MAIN ' : ''}${entry.name} (${entry.kind.replace(/_/g, ' ')}) at ${entry.anchor.x},${entry.anchor.y},${entry.anchor.z}, ${entry.width}x${entry.depth}x${entry.height}${progress}`;
+        });
     }
 
     // mark a favorite as home. A POSITION ALWAYS WINS: this used to be
