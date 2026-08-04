@@ -10,6 +10,7 @@
     "./bridge": "./bridge/minecraft_bot_bridge.js"
   },
   "scripts": {
+    "build:mod": "node scripts/build-mod.mjs",
     "bridge": "node bridge/minecraft_bot_bridge.js",
     "example:hello": "node examples/01_hello_bot.mjs",
     "example:chat": "node examples/02_viewer_chat.mjs",

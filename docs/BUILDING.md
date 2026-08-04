@@ -24,22 +24,36 @@ Get it from [Adoptium](https://adoptium.net/temurin/releases/?version=25).
 
 ## Build
 
-Baritone is **jar-in-jar'd inside the AltoClef jar**, so building AltoClef is
-enough and only one jar ever gets deployed.
+Baritone is **jar-in-jar'd inside the AltoClef jar**, so only one jar ever gets
+deployed — but it has to exist before AltoClef compiles. AltoClef resolves
+Baritone's *unoptimized* Fabric jar from `baritone/fabric/build/libs`, and
+`build/` is not in git, so that directory is empty in a fresh clone.
 
 ```bash
-cd altoclef
-./gradlew build          # -> build/libs/altoclef-26.1.2-beta1.jar
+npm run build:mod        # both projects, in order, with a Java 25 check
+```
+
+By hand:
+
+```bash
+cd baritone    && ./gradlew :compileApiJava :compileJava :fabric:build
+cd ../altoclef && ./gradlew build          # -> build/libs/altoclef-26.1.2-beta1.jar
 ```
 
 On Windows use `.\gradlew.bat` (PowerShell needs the `.\` prefix).
 
-To build against a locally modified Baritone:
+The Baritone step must be `:fabric:build`, **not** `:fabric:remapJar`. remapJar
+writes `baritone-fabric-<ver>.jar`; the artifact AltoClef actually embeds is
+`baritone-unoptimized-fabric-<ver>.jar`, written by the ProGuard task's
+determinize step that `build` pulls in through `finalizedBy(createDist)`.
 
-```bash
-cd baritone  && ./gradlew build
-cd ../altoclef && ./gradlew build -Paltoclef.development
-```
+There is no `-Paltoclef.development` flag in this fork. Baritone is always the
+vendored local one, so the sequence above is the only build path.
+
+After editing Baritone sources, rebuild Baritone before AltoClef — otherwise the
+change is silently missing from the deployed jar. Gradle has occasionally
+treated those cross-project outputs as up to date after a source edit; add
+`--rerun-tasks` (`npm run build:mod -- --rerun-tasks`) when you suspect that.
 
 ---
 
@@ -73,6 +87,13 @@ Order does not matter much: the bridge reconnects to both ends on its own.
 ---
 
 ## Troubleshooting
+
+**`Could not find :baritone-unoptimized-fabric:1.18.0`**
+AltoClef was built before Baritone. `baritone/fabric/build/libs` is empty in a
+fresh clone because `build/` is gitignored — that directory looking empty is
+expected, not a bad checkout. Run the Baritone step above (or `npm run
+build:mod`) first. If Baritone did build but the jar is still missing, you ran
+`remapJar` rather than `:fabric:build`.
 
 **`error: release version 25 not supported`**
 Gradle picked up an older JDK. Install Java 25 or point Gradle at it explicitly

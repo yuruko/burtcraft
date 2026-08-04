@@ -8,7 +8,7 @@ ambushed, takes requests from chat, and can tell you what it is doing while it
 does it. It is packaged here so you can bolt it onto *your* VTuber instead.
 
 The hard part of "AI plays Minecraft" is not the AI. It is that Minecraft has no
-API. This repo is the missing plumbing, plus a 4,000-line autonomy brain that
+API. This repo is the missing plumbing, plus a 4,800-line autonomy brain that
 already knows how to survive.
 
 ```
@@ -25,7 +25,7 @@ already knows how to survive.
 | **A wire protocol** | Newline-delimited JSON over localhost. Documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). |
 | **A Node library** | `core/` — ws server, live game state, durable place/settlement memory, and an autonomy loop. No LLM calls, database, HTTP, or dialogue opinions. |
 | **A relay** | `bridge/` — translates actions into real AltoClef commands and back. |
-| **An in-game mod** | `mod/ExternalControlServer.java` — the only piece that runs inside Minecraft. |
+| **An in-game mod** | `altoclef/src/main/java/adris/altoclef/external/ExternalControlServer.java` — the only piece that runs inside Minecraft. `mod/` documents it. |
 | **Two vendored forks** | `altoclef/` and `baritone/`, patched for Minecraft 26.1.2 and for not swimming across oceans. See [NOTICE](NOTICE). |
 | **Five worked examples** | `examples/` — each runs standalone with no game attached. |
 
@@ -86,13 +86,29 @@ off-box.
 
 ## Quick start
 
-**1. Build the mod.** The control server is an additive Fabric `client`
-entrypoint, so a normal build includes it — no extra step.
+**1. Build the mod.** Baritone goes first. AltoClef jar-in-jars Baritone's
+*unoptimized* Fabric jar straight out of `baritone/fabric/build/libs`, and
+`build/` is not in git — so a fresh clone has nothing to link against yet.
 
 ```bash
-cd altoclef
-./gradlew build      # -> build/libs/altoclef-26.1.2-beta1.jar
+npm run build:mod    # baritone, then altoclef, with a Java 25 check
 ```
+
+By hand, if you prefer:
+
+```bash
+cd baritone    && ./gradlew :compileApiJava :compileJava :fabric:build
+cd ../altoclef && ./gradlew build      # -> build/libs/altoclef-26.1.2-beta1.jar
+```
+
+The control server is an additive Fabric `client` entrypoint, so a normal
+AltoClef build includes it — no extra step.
+
+> Building AltoClef on its own fails with `Could not find
+> :baritone-unoptimized-fabric:1.18.0`. The Baritone step has to be
+> `:fabric:build`, not `remapJar` — remapJar writes `baritone-fabric-<ver>.jar`,
+> while the *unoptimized* jar AltoClef embeds is written by the ProGuard task's
+> determinize step, which `build` pulls in via `finalizedBy(createDist)`.
 
 **2. Install it.** Drop that jar plus Fabric API into your Fabric 26.1.2
 profile's `mods/` folder. Use a dedicated game directory if your main
@@ -146,7 +162,7 @@ of trusting inventory or an elapsed timer.
 
 ## Wiring it into your VTuber
 
-There are exactly four seams. You do not need to read the 4,000-line file.
+There are exactly four seams. You do not need to read the 4,800-line file.
 
 ```js
 import { MinecraftTool } from 'burtcraft/core';
@@ -210,7 +226,7 @@ await mc.executeAction('mine', { item: 'diamond', amount: 3 }, {
 ```
 
 Give the LLM the tool schema in `examples/04_llm_tool.mjs` (Anthropic and OpenAI
-shapes, same 37 actions) and this becomes a normal tool call.
+shapes, same 43 actions) and this becomes a normal tool call.
 
 ---
 
@@ -316,6 +332,8 @@ core/       the node library (persona-free)
 bridge/     the relay process
 mod/        notes on the in-game control server (source lives in altoclef/)
 examples/   five runnable examples
+tests/      settlement + reliability tests (npm run check)
+scripts/    build-mod.mjs - builds baritone then altoclef, in that order
 docs/       PROTOCOL.md, INTEGRATING.md, BUILDING.md
 altoclef/   vendored fork (MIT)     - see NOTICE
 baritone/   vendored fork (LGPL-3)  - see NOTICE

@@ -49,7 +49,7 @@ import path from 'path';
 import { MinecraftTool, MinecraftMemory } from '../core/index.js';
 
 // ---------------------------------------------------------------------------
-// the 37 actions, grouped by what they are for
+// the 43 actions, grouped by what they are for
 // ---------------------------------------------------------------------------
 export const MINECRAFT_ACTIONS = [
     // control plane - these never reach the game
@@ -81,7 +81,13 @@ export const MINECRAFT_ACTIONS = [
     'favorite', 'unfavorite', 'favorites', 'set_home', 'go_home',
 
     // building
-    'place'
+    'place',
+
+    // settlements. the geometry and the build progress are surveyed from real
+    // world blocks and kept in local memory, so these resume after a restart
+    // instead of starting over.
+    'set_outpost', 'outposts', 'go_outpost', 'build_outpost',
+    'build_settlement', 'install_appliance'
 ];
 
 // one line each. this is what the model reads to choose, so it is worth the
@@ -102,6 +108,8 @@ const ACTION_NOTES = [
     'chat: target = the message, sent to the minecraft server chat as the bot. compose it yourself, in your own words.',
     'favorite/unfavorite: target = a name for the spot you are standing on. favorites: list them. set_home: mark your base.',
     'place: target = a block you are carrying, put down where you stand.',
+    'set_outpost: target = a name for the spot you are standing on, params.level 1 or more. outposts: list them. go_outpost / build_outpost: target = one of those names.',
+    'build_settlement: params.role "homestead" or "outpost", plus the dimensions and anchor from getStatus().homeProject. install_appliance: target = the appliance, e.g. an oven.',
     'stop: abandon the current goal. always allowed, even while busy.'
 ].join(' ');
 
