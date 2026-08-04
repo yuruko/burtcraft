@@ -1,7 +1,11 @@
 # User-specific stuff
 .idea/
 .vs/
-baritone/
+# an ide-dropped baritone checkout inside this project dir. NEEDS the leading
+# slash - a bare `baritone/` matches any directory of that name at any depth,
+# which silently swallowed src/main/java/adris/altoclef/util/baritone/ (9 goal
+# classes, 21 importers) and made every fresh clone fail to compile.
+/baritone/
 
 *.iml
 *.ipr
