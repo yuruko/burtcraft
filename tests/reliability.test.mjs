@@ -44,7 +44,10 @@ try {
     botTask: 'doing stuff in crafting_table x 1 container: [[bread] x 1]',
     botAction: 'wander for infinity blocks: exploring'
   }, Date.now());
-  assert.deepEqual(recovered, ['stop'], 'fresh telemetry stops a dead craft after 20s');
+  // `hud` is the intent overlay push, not control - it rides along on any tick
+  // that changes what she is doing, so filter it out and assert the control verb.
+  assert.deepEqual(recovered.filter((a) => a !== 'hud'), ['stop'],
+    'fresh telemetry stops a dead craft after 20s');
   assert.equal(stallTool.activeGoal, null);
 
   stallTool.activeGoal = { action: 'craft', params: { target: 'bread' }, source: 'autonomous' };
@@ -63,25 +66,31 @@ try {
   gamerTool.autonomous = true;
   gamerTool.lastGameStateAt = Date.now();
   gamerTool.client = { readyState: 1, send: (wire) => sent.push(JSON.parse(wire)) };
+  // the wire also carries `config` frames (leaving gamer mode hands self-play
+  // back, which re-arms autonomous) and `hud` intent pushes. neither is a control
+  // action, and either can land after the verb under test - so every assertion
+  // below wants the last real ACTION wire, not simply the last thing sent.
+  const lastSent = () => [...sent].reverse()
+    .find((wire) => wire.type === 'action' && wire.action !== 'hud');
 
   const breadCraft = gamerTool.executeAction('craft', { target: 'bread' }, {
     source: 'autonomous', waitForCompletion: false
   });
   await turn();
-  const breadWire = sent.at(-1);
+  const breadWire = lastSent();
   gamerTool._handleResponse({ action_id: breadWire.id, status: 'executing' });
   await breadCraft;
 
   const gamerStart = gamerTool.startGamerMode();
   assert.equal(gamerTool.startGamerMode(), gamerStart, 'double-clicking gamer shares one transition');
   await turn();
-  const gamerStop = sent.at(-1);
+  const gamerStop = lastSent();
   assert.equal(gamerStop.action, 'stop', 'gamer interrupts bread crafting');
   assert.equal(gamerTool.pendingActions.has(breadWire.id), false);
   gamerTool._handleResponse({ action_id: gamerStop.id, status: 'executing' });
   gamerTool._handleResponse({ action_id: gamerStop.id, status: 'success', result: { success: true } });
   await turn();
-  const speedrunWire = sent.at(-1);
+  const speedrunWire = lastSent();
   assert.equal(speedrunWire.action, 'speedrun');
   gamerTool._handleResponse({ action_id: speedrunWire.id, status: 'executing' });
   await gamerStart;
@@ -90,12 +99,12 @@ try {
     source: 'agent', waitForCompletion: false
   });
   await turn();
-  const replacementStop = sent.at(-1);
+  const replacementStop = lastSent();
   assert.equal(replacementStop.action, 'stop', 'agent can interrupt gamer mode');
   gamerTool._handleResponse({ action_id: replacementStop.id, status: 'executing' });
   gamerTool._handleResponse({ action_id: replacementStop.id, status: 'success', result: { success: true } });
   await turn();
-  const collectWire = sent.at(-1);
+  const collectWire = lastSent();
   assert.equal(collectWire.action, 'collect');
   gamerTool._handleResponse({ action_id: collectWire.id, status: 'executing' });
   await replacement;
@@ -103,7 +112,7 @@ try {
   const lostStop = gamerTool.executeAction('stop');
   const lostStopCheck = assert.rejects(lostStop, /not confirmed/);
   await turn();
-  const lostStopWire = sent.at(-1);
+  const lostStopWire = lastSent();
   let terminated = false;
   gamerTool.client.terminate = () => { terminated = true; };
   gamerTool._expirePendingAction(

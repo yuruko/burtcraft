@@ -5,8 +5,10 @@ import adris.altoclef.Debug;
 import adris.altoclef.tasks.AbstractDoToClosestObjectTask;
 import adris.altoclef.tasks.ResourceTask;
 import adris.altoclef.tasks.construction.DestroyBlockTask;
+import adris.altoclef.tasks.movement.GetToYTask;
 import adris.altoclef.tasks.movement.PickupDroppedItemTask;
 import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.Dimension;
 import adris.altoclef.util.ItemTarget;
 import adris.altoclef.util.MiningRequirement;
 import adris.altoclef.util.helpers.StorageHelper;
@@ -16,6 +18,7 @@ import adris.altoclef.util.slots.CursorSlot;
 import adris.altoclef.util.slots.PlayerSlot;
 import adris.altoclef.util.time.TimerGame;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
@@ -152,6 +155,28 @@ public class MineAndCollectTask extends ResourceTask {
 
     private static class MineOrCollectTask extends AbstractDoToClosestObjectTask<Object> {
 
+        // WHERE A BLOCK ACTUALLY LIVES. the inherited "I can't see one" fallback is
+        // baritone exploration, which searches the SURFACE outward - the one search
+        // that cannot work for a block that is under her feet. she spent minutes
+        // wandering for stone while standing on sixty blocks of it (2026-08-05,
+        // "wander for infinity blocks: exploring." under a stone pickaxe goal).
+        // depth is the overworld y where each block is genuinely common in 1.18+
+        // terrain; anything not listed here (wood, dirt, gravel, emerald, mob
+        // drops) is left to explore, because for those the horizon IS the answer.
+        private static int undergroundDepth(Block block) {
+            if (block == Blocks.STONE || block == Blocks.COBBLESTONE || block == Blocks.ANDESITE
+                    || block == Blocks.DIORITE || block == Blocks.GRANITE || block == Blocks.TUFF
+                    || block == Blocks.DEEPSLATE || block == Blocks.COBBLED_DEEPSLATE) return 40;
+            if (block == Blocks.COAL_ORE || block == Blocks.DEEPSLATE_COAL_ORE) return 45;
+            if (block == Blocks.COPPER_ORE || block == Blocks.DEEPSLATE_COPPER_ORE) return 48;
+            if (block == Blocks.IRON_ORE || block == Blocks.DEEPSLATE_IRON_ORE) return 16;
+            if (block == Blocks.GOLD_ORE || block == Blocks.DEEPSLATE_GOLD_ORE) return -16;
+            if (block == Blocks.REDSTONE_ORE || block == Blocks.DEEPSLATE_REDSTONE_ORE
+                    || block == Blocks.LAPIS_ORE || block == Blocks.DEEPSLATE_LAPIS_ORE
+                    || block == Blocks.DIAMOND_ORE || block == Blocks.DEEPSLATE_DIAMOND_ORE) return -52;
+            return Integer.MAX_VALUE;
+        }
+
         private final Block[] _blocks;
         private final ItemTarget[] _targets;
         private final Set<BlockPos> _blacklist = new HashSet<>();
@@ -223,6 +248,36 @@ public class MineAndCollectTask extends ResourceTask {
                 _progressChecker.reset();
             }
             return super.onTick(mod);
+        }
+
+        // NOTHING OF OURS IS IN SIGHT. when every block we want lives underground and
+        // she is still up on the surface, the answer is DOWN, not out: get under the
+        // ground and let the ordinary tracker/mine loop take over the moment stone is
+        // around her. once she is inside the band - or the target is something the
+        // horizon really does hold, like wood - the inherited exploration is correct
+        // again, so this hands back cleanly and cannot loop.
+        @Override
+        protected Task getWanderTask(AltoClef mod) {
+            if (WorldHelper.getCurrentDimension() == Dimension.OVERWORLD && _blocks != null && _blocks.length > 0) {
+                boolean allUnderground = true;
+                int depth = Integer.MIN_VALUE;
+                for (Block block : _blocks) {
+                    int blockDepth = undergroundDepth(block);
+                    if (blockDepth == Integer.MAX_VALUE) {
+                        allUnderground = false;
+                        break;
+                    }
+                    // the SHALLOWEST band satisfies "find any one of these" soonest.
+                    depth = Math.max(depth, blockDepth);
+                }
+                // still meaningfully above the band - below it, digging further is not
+                // a search, and lateral exploring through the caves is the real move.
+                if (allUnderground && mod.getPlayer() != null && mod.getPlayer().getBlockY() > depth + 6) {
+                    setDebugState("Nothing in sight, digging down to y=" + depth);
+                    return new GetToYTask(depth);
+                }
+            }
+            return super.getWanderTask(mod);
         }
 
         @Override

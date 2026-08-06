@@ -17,6 +17,10 @@ const mc = new MinecraftTool({
   names: ['ada', 'ada bot'],        // what she answers to in multiplayer chat
   broadcast: (cue) => overlay(cue), // optional: mirror internal cues to your UI
   memory: null,                     // optional: your own MinecraftMemory instance
+  remember: {                       // optional: your long-term/semantic memory
+    gameplay: (text, { tags }) => store.add(text, tags),  // deaths, diamonds, achievements
+    player:   (player, worldId) => people.upsert(player), // who she plays with
+  },
 });
 
 await mc.initialize({ port: 7431, actionTimeout: 300000, debug: false });
@@ -38,7 +42,7 @@ mc.setAutonomousMode(true);         // optional: idle self-play
 
 ## Events
 
-Subscribe with `mc.on(name, handler)`. All 23:
+Subscribe with `mc.on(name, handler)`. All 24:
 
 ### The ones you actually want
 
@@ -60,7 +64,9 @@ Subscribe with `mc.on(name, handler)`. All 23:
 
 ### Action lifecycle (fine-grained)
 
-`actionSent`, `actionAck`, `actionStarted`, `actionStopped`, `actionTimeout`
+`actionSent`, `actionAck`, `actionStarted`, `actionStopped`, `actionTimeout`,
+`chatSent` (a line of hers actually reached the server — the confirmation that
+she spoke in game, as opposed to merely deciding to)
 
 ---
 
@@ -72,8 +78,21 @@ Subscribe with `mc.on(name, handler)`. All 23:
 await mc.executeAction(action, params, { source, waitForCompletion, priority });
 ```
 
-`source` is `'llm'`, `'viewer'`, or `'autonomy'`. **Always set it** — see
-[arbitration](#arbitration) below.
+**Always set `source`** — see [arbitration](#arbitration) below. The value is not
+free-form: the arbitration tables match on these exact strings, so a made-up one
+silently gets the weakest treatment.
+
+| your caller | use | behaviour |
+|---|---|---|
+| your LLM / brain | `agent` | preempts running work; gated inside the spawn region |
+| a human operator, or a UI button | `operator` | preempts running work |
+| chat / viewer request | `request` | preempts autonomous work; may itself be replaced |
+| the idle self-play loop | `autonomous` | never preempts; always replaceable; spawn-gated |
+| your own speedrun trigger | `gamer` | preempts running work |
+
+Full sets: `PREEMPTING_SOURCES` and `REPLACEABLE_SOURCES` in
+`core/minecraft_tool.js`. Internal recovery paths use their own names
+(`safety`, `recovery`, `pinned`, …) — you do not need to send those.
 
 > **The number one integration trap.** Not every action reaches the game. The
 > bridge's translator knows the game-bound actions; the rest are **control-plane
@@ -81,7 +100,7 @@ await mc.executeAction(action, params, { source, waitForCompletion, priority });
 > memory:
 >
 > `enable` `disable` `status` `autonomous` `gamer` `gamer_stop` `favorite`
-> `unfavorite` `favorites` `set_outpost` `outposts`
+> `unfavorite` `favorites`
 >
 > Hand one of those to `executeAction` and it gets relayed to a bridge that has
 > no translation for it, and you get an error instead of the obvious local
@@ -106,7 +125,7 @@ mc.knownPlayers();         // who she has seen
 ### Chat handling
 
 ```js
-mc.shouldSurfaceChat(sender, text);   // -> {surface, addressed, owner}
+mc.shouldSurfaceChat(sender, text);   // -> {surface, addressed, owner, followUp, toSomeoneElse}
 mc.interpretChatCommand(text, sender); // -> {action, target, params} | null
 mc.addressedToSomeoneElse(text);       // don't answer on another player's behalf
 mc.recordViewerSuggestion(user, text, { inGame });
@@ -120,6 +139,7 @@ mc.setAutonomousMode(bool);
 mc.setMood('excited');       // biases the idle behaviour menu
 mc.setBotNames([...]);       // rename at runtime
 mc.setBroadcast(fn);         // (re)point the UI mirror
+mc.setRemember(sink);        // (re)point long-term memory; null unhooks
 await mc.startGamerMode();   // committed, narrated speedrun
 mc.stopGamerMode();
 ```
@@ -129,7 +149,7 @@ mc.stopGamerMode();
 ```js
 mc.setFavoriteHere('the lava pit');
 mc.setHome('the homestead');
-mc.setOutpostHere('east toaster', 2); // level 1-4; main home stays larger
+mc.setOutpostHere('east toaster', 2); // level is a label; every outpost is 12x7x6
 mc.getStatus().homeProject;           // persistent goal, %, phase, components
 mc.getStatus().settlements;           // exact anchors and dimensions
 await mc.shutdown();
@@ -190,7 +210,10 @@ The same principle runs through the lower layers: `gameState.multiplayer` and
 `server` report what the game actually joined, never what your config intended.
 `gameState.settlementBuild` is likewise a real block survey. A torch in inventory
 does not satisfy `lit`, and a project reaches 100% only when its floor, walls,
-roof, clear interior, two toast slots, walk-through, and side torches all match.
+roof, clear interior, two toast slots, walk-through, wall torches **and its
+10-block yard** all match. The yard is the last 10% and the easiest to forget:
+a house with mobs dropping onto the roof from the high ground next to it is not
+finished, so the clearance is part of the build rather than a nicety.
 
 ---
 
@@ -229,6 +252,12 @@ library's filter (`shouldSurfaceChat`) implements:
   occasionally like a person instead of replying to every line.
 - Command noise (`/ ! . # @` prefixes) never surfaces.
 - Greetings aimed at a named third party are not answered on their behalf.
+- **A conversation is a state, not a keyword.** Once she has actually answered
+  somebody, they stay "talking to her" for 150s (2s per-sender gap inside that
+  window, 600s ceiling) and their follow-ups surface with `followUp: true`.
+  Nobody retypes a name every line — the reply to "do you still have iron on?"
+  used to fall through to the ambient dice, behind a gap her own reply had just
+  reset, so she answered once and went silent for the rest of the exchange.
 
 Outgoing `chat` actions are paced (3s minimum gap, 8/min cap). Addressed lines
 also feed `recordViewerSuggestion`, so players in the world can re-task her the

@@ -50,7 +50,9 @@ import net.minecraft.core.Vec3i;
 import net.minecraft.util.Tuple;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.block.*;
@@ -512,6 +514,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             int max = Baritone.settings().buildRepeatCount.value;
             numRepeats++;
             if (repeat.equals(new Vec3i(0, 0, 0)) || (max != -1 && numRepeats >= max)) {
+                // BURNT: logDirect is IN-GAME CHAT, which is on stream and never
+                // reaches latest.log, so every reason the builder quits has been
+                // invisible to us. The three that matter go to stdout as well.
+                System.out.println("[baritone builder] done building (nothing incorrect left) at origin " + origin);
                 logDirect("Done building");
                 if (Baritone.settings().notificationOnBuildFinished.value) {
                     logNotification("Done building", false);
@@ -571,7 +577,12 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             outer:
             for (BlockState desired : desirableOnHotbar) {
                 for (int i = 0; i < 9; i++) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
+                    // canSupply, not valid: hasAnyItemThatWouldPlace only ever
+                    // scans the hotbar, so a torch that is never recognised as
+                    // the material for a wall torch is never promoted out of the
+                    // backpack, and the exact-state placement test downstream
+                    // never gets a stack to test.
+                    if (canSupply(approxPlaceable.get(i), desired)) {
                         usefulSlots.add(i);
                         continue outer;
                     }
@@ -582,7 +593,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             outer:
             for (int i = 9; i < 36; i++) {
                 for (BlockState desired : noValidHotbarOption) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
+                    if (canSupply(approxPlaceable.get(i), desired)) {
                         if (!baritone.getInventoryBehavior().attemptToPutOnHotbar(i, usefulSlots::contains)) {
                             // awaiting inventory move, so pause
                             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
@@ -602,6 +613,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     layer++;
                     return onTick(calcFailed, isSafeToCancel, recursions + 1);
                 }
+                System.out.println("[baritone builder] cannot assemble a goal: nothing placeable and nothing breakable"
+                        + " (incorrect=" + (incorrectPositions == null ? -1 : incorrectPositions.size())
+                        + ", placeableFromInventory=" + approxPlaceable.size()
+                        + ", layer=" + layer + ", origin=" + origin + ") - pausing");
                 logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
                 paused = true;
                 return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
@@ -777,6 +792,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 protectItemOfMissing(missing);
             }
             if (logMissing && !missing.isEmpty()) {
+                System.out.println("[baritone builder] missing materials for at least: "
+                        + missing.entrySet().stream()
+                        .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
+                        .collect(Collectors.joining(", ")));
                 logDirect("Missing materials for at least:");
                 logDirect(missing.entrySet().stream()
                         .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
@@ -1086,9 +1105,46 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return true;
     }
 
+    /**
+     * BURNT: added, with canSupply() below and its two call sites in assemble().
+     *
+     * Would the item that places {@code have} also be able to place {@code want}?
+     *
+     * One item can place two DIFFERENT blocks depending on the face it is
+     * clicked against: a torch item is minecraft:torch on a floor and
+     * minecraft:wall_torch on a wall. approxPlaceable derives its whole list
+     * from a synthetic Direction.UP context, so it only ever reports the floor
+     * form, and sameBlockstate rejects on block identity before it ever looks
+     * at a property. The result was that a schematic asking for a wall torch
+     * read as "missing materials for at least: 1x wall_torch" forever with a
+     * full stack of torches in the bag - she could not light her own house.
+     *
+     * StandingAndWallBlockItem registers BOTH of its blocks against the same
+     * item, so asItem() is the authority for the entire family (torches, signs,
+     * banners, heads, coral fans) with no hardcoded pairs.
+     *
+     * This may only ever answer "do I have the material". The face that decides
+     * the final state is still picked by possibleToPlace/hasAnyItemThatWouldPlace,
+     * which compare against the exact state a REAL placement context would
+     * produce - so this cannot make her put a floor torch where a wall torch
+     * belongs and call it done.
+     */
+    private static boolean samePlacementItem(BlockState have, BlockState want) {
+        if (have == null || want == null) {
+            return false;
+        }
+        Item item = have.getBlock().asItem();
+        return item != Items.AIR && item == want.getBlock().asItem();
+    }
+
+    /** Is this inventory slot's contents the material {@code desired} is made of? */
+    private static boolean canSupply(BlockState placeable, BlockState desired) {
+        return valid(placeable, desired, true) || samePlacementItem(placeable, desired);
+    }
+
     private static boolean containsBlockState(Collection<BlockState> states, BlockState state) {
         for (BlockState testee : states) {
-            if (sameBlockstate(testee, state)) {
+            if (sameBlockstate(testee, state) || samePlacementItem(testee, state)) {
                 return true;
             }
         }

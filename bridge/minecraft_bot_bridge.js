@@ -32,6 +32,9 @@ import EventEmitter from 'events';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+    toasterHomesteadDimensions, toasterOutpostDimensions
+} from '../core/settlements.js';
 
 const SUPPORTED_ACTIONS = new Set([
     'move', 'get', 'mine', 'collect', 'craft', 'follow', 'stop', 'idle',
@@ -46,6 +49,9 @@ const SUPPORTED_ACTIONS = new Set([
 // 'hud' is text on a screen, not a goal - if it claimed currentTask, every intent
 // update would instantly complete and make a running mine/follow/speedrun read as idle.
 const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'inventory', 'coords', 'look', 'boat', 'hud']);
+// (the table of legal footprints that used to live here is gone on purpose -
+// see the build_settlement case: the relay resolves the size from the floorplan
+// now instead of refusing anything that disagrees with a copy of it.)
 const MAX_COMPANION_BUFFER_BYTES = 1024 * 1024;
 const BRIDGE_LOCK_PATH = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'tmp', 'minecraft_bot_bridge.lock'
@@ -475,9 +481,14 @@ class MinecraftBotBridge extends EventEmitter {
         const amount = (value, fallback) => this._amount(value, fallback);
 
         switch (action) {
-            case 'move':
-                if (p.x !== undefined && p.y !== undefined && p.z !== undefined) {
+            case 'move': {
+                // ONE SPECIFIC BLOCK, only when a caller says so.
+                if (p.precise === true) {
                     const { x, y, z } = this._worldPoint(p, 'move coordinates');
+                    return { command: `goto ${x} ${y} ${z}${dimension ? ' ' + dimension : ''}` };
+                }
+                if (this._isColumn(p)) {
+                    const { x, z } = this._worldColumn(p, 'move coordinates');
                     // TWO args, not three. `goto x y z` is GetToBlockTask, which demands
                     // that EXACT block - and when it cannot be reached (she is in a cave
                     // under it, it is inside terrain, it is occupied) AltoClef never
@@ -487,15 +498,21 @@ class MinecraftBotBridge extends EventEmitter {
                     // column at whatever height the ground happens to be - which is what
                     // "go there" has always meant for travel. it also makes the swimming-y
                     // problem structurally impossible instead of merely corrected.
-                    // pass precise:true when a caller genuinely means one specific block.
-                    const where = p.precise === true ? `${x} ${y} ${z}` : `${x} ${z}`;
-                    return { command: `goto ${where}${dimension ? ' ' + dimension : ''}` };
+                    //
+                    // and because the y is DROPPED here, it was never a required
+                    // parameter - it only read as one. `move {x, z}` (what "go to
+                    // -777, 7777" means, and what every person who has typed
+                    // coordinates at a bot means) fell through this branch and came
+                    // back as '"move" is missing something it needs', for want of a
+                    // number that would have been thrown away one line later.
+                    return { command: `goto ${x} ${z}${dimension ? ' ' + dimension : ''}` };
                 }
                 // Do not concatenate a free-form target into an AltoClef
                 // command. CommandExecutor supports `;` chaining, so only the
                 // structured coordinate form may reach the companion.
-                if (p.target) throw new Error('move requires numeric x, y, and z parameters');
+                if (p.target) throw new Error('move requires numeric x and z parameters (y is optional)');
                 return null;
+            }
 
             case 'get':     // the workhorse - altoclef mines/crafts/smelts recursively
             case 'mine':
@@ -620,20 +637,44 @@ class MinecraftBotBridge extends EventEmitter {
 
             case 'build_settlement': {
                 const role = String(p.role || '').trim().toLowerCase();
-                if (!['homestead', 'outpost'].includes(role)) throw new Error('build_settlement role must be homestead or outpost');
+                if (!['homestead', 'outpost'].includes(role)) {
+                    throw new Error('build_settlement role must be homestead or outpost');
+                }
                 const at = this._worldPoint(p, 'settlement anchor');
-                const dims = ['width', 'depth', 'height'].map((key) => {
-                    const value = Number(p[key]);
-                    if (!Number.isInteger(value) || value < 5 || value > 64) throw new Error(`settlement ${key} must be an integer from 5 to 64`);
-                    return value;
-                });
+                // THE FLOORPLAN IS THE ONLY LEGAL SHAPE, so this RESOLVES the size
+                // instead of validating it.
+                //
+                // It used to hold a table of the 24 footprints the old expanding
+                // shell could take and refuse anything else - a hard gate, in a
+                // relay that restarts on its OWN schedule, on a number produced by
+                // a different process entirely. The night the plan became fixed
+                // that skew cost burnt her whole house: burnt-side sent 14x9x8,
+                // this relay was still running the old table, and every attempt
+                // died here with "14x9x8 is not a known toaster blueprint" without
+                // ever reaching the game, until the goal paused itself. A gate that
+                // can disagree with its own caller about a constant is not
+                // validation, it is a second source of truth.
+                //
+                // There is exactly one homestead footprint and one outpost
+                // footprint now, so asking for a homestead IS asking for that size.
+                const plan = role === 'outpost' ? toasterOutpostDimensions() : toasterHomesteadDimensions();
+                const dims = [plan.width, plan.depth, plan.height];
+                const asked = ['width', 'depth', 'height'].map((key) => Number(p[key]));
+                if (asked.every(Number.isFinite) && asked.join('x') !== dims.join('x')) {
+                    this.log('warn', `build_settlement asked for a ${asked.join('x')} ${role}; `
+                        + `the floorplan is ${dims.join('x')} - building that`);
+                }
                 return { command: `toaster_build ${role} ${at.x} ${at.y} ${at.z} ${dims.join(' ')}` };
             }
 
             case 'install_appliance': {
                 const kind = item(p.target);
-                if (!['furnace', 'blast_furnace', 'smoker', 'campfire', 'soul_campfire'].includes(kind)) {
-                    throw new Error('install_appliance needs a furnace, smoker, blast furnace, or campfire kind');
+                // chest is here because the floorplan stacks three of them by the
+                // door - storage is a planned fixture now, not a "put one down
+                // somewhere" that used to land on a gallery slot.
+                if (!['furnace', 'blast_furnace', 'smoker', 'campfire', 'soul_campfire',
+                    'chest', 'crafting_table'].includes(kind)) {
+                    throw new Error('install_appliance needs a chest, crafting table, furnace, smoker, blast furnace, or campfire kind');
                 }
                 const at = this._worldPoint(p, 'appliance position');
                 return { command: `place_at ${at.x} ${at.y} ${at.z} ${kind}` };
@@ -655,7 +696,10 @@ class MinecraftBotBridge extends EventEmitter {
             // no native altoclef task -> baritone / raw passthrough
             case 'explore': return { chat: '#explore', detached: true };
             case 'chat': {
-                const message = String(p.target || p.message || '').trim();
+                // the words first, the addressee second. target used to win, so a
+                // reply that put the player's name in target and the sentence in
+                // message went out as the bare name - a line of pure "MarDotIO".
+                const message = String(p.message || p.target || '').trim();
                 // Player chat only: @/# are reserved for explicit bridge actions
                 // such as explore, never a model/viewer command escape hatch.
                 if (!message || /^[\/@#]/.test(message) || /[\r\n\u0000]/.test(message)) throw new Error('commands and control characters are not allowed through minecraft chat');
@@ -716,6 +760,22 @@ class MinecraftBotBridge extends EventEmitter {
 
     _isPoint(point) {
         return !!point && Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z);
+    }
+
+    // a destination COLUMN - x and z, no height. travel lands on whatever ground
+    // stands at that column, so this is a complete destination, not half of one.
+    _isColumn(point) {
+        return !!point && Number.isFinite(point.x) && Number.isFinite(point.z);
+    }
+
+    _worldColumn(point, label = 'coordinates') {
+        if (!this._isColumn(point)) throw new Error(`${label} must be finite numbers`);
+        const x = Math.round(point.x);
+        const z = Math.round(point.z);
+        if (Math.abs(x) > 29999984 || Math.abs(z) > 29999984) {
+            throw new Error(`${label} are outside the playable world`);
+        }
+        return { x, z };
     }
 
     _worldPoint(point, label = 'coordinates') {

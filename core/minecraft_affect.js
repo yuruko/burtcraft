@@ -65,6 +65,13 @@ export function appraiseMinecraftState(gameState = {}) {
     const immediateHazard = gameState.inLava ? 1 : (gameState.underwater && air < 0.35 ? 0.65 : 0);
     const nearby = gameState.nearby && typeof gameState.nearby === 'object' ? gameState.nearby : {};
     const rareOreNearby = /diamond|emerald|ancient_debris/.test(String(nearby.nearestOre || ''));
+    // standing out in it, not just "the sky is doing something somewhere". the
+    // companion's rainingHere is roof- and biome-aware; the string is not.
+    const sheltered = gameState.skyVisible === false;
+    const rainedOn = typeof gameState.rainingHere === 'boolean'
+        ? gameState.rainingHere
+        : (/rain|thunder/.test(String(gameState.weather || '')) && !sheltered);
+    const stormedOn = rainedOn && String(gameState.weather || '') === 'thunder';
 
     const confidence = clamp(
         25 + health * 27 + gear * 31 + Math.min(8, finite(gameState.xpLevel, 0) * 0.35)
@@ -80,11 +87,15 @@ export function appraiseMinecraftState(gameState = {}) {
         + (nearby.bed !== undefined ? 5 : 0)
         + (finite(gameState.nearbyPlayers, 0) > 0 ? 4 : 0)
         - hostiles * 5 - (isNight ? 7 : 0)
+        // rain is not damage, but it is dark, loud, and it spawns things in the
+        // open. being under a roof in it should FEEL different from being out in it.
+        - (rainedOn ? 5 : 0) - (stormedOn ? 4 : 0)
         - (dangerousDimension ? 7 : 0) - immediateHazard * 42
     );
     const fun = clamp(
         52 + (rareOreNearby ? 9 : 0) + (dangerousDimension ? 5 : 0)
         - (health < 0.35 ? 15 : 0) - (hunger < 0.25 ? 9 : 0)
+        - (rainedOn ? 7 : 0)
         - immediateHazard * 10
     );
 
@@ -144,6 +155,13 @@ export class MinecraftAffect {
             hostiles_nearby: { confidence: -Math.min(8, count), fear: 5 + count * 2.2, security: -(4 + count * 1.7), fun: count >= 4 ? -4 : 1 },
             low_hunger: { confidence: -4, fear: 6, security: -13, fun: -7 },
             nightfall: { confidence: -2, fear: 8, security: -8, fun: 2 },
+            // the sky turning over is a mood event either way: rain that lands on
+            // her is a small sag, and it clearing up is a small lift. observe()
+            // already carries the standing weather term, so these are only the
+            // kick at the moment it changes.
+            weather_changed: (data.rainingHere === true || (!data.skyVisible && /rain|thunder/.test(String(data.weather || ''))))
+                ? { confidence: -1, fear: 3, security: -6, fun: -6 }
+                : { confidence: 1, fear: -2, security: 4, fun: 5 },
             dimension_changed: { confidence: 2, fear: 8, security: -8, fun: 10 },
             diamond_found: { confidence: 13, fear: -4, security: 3, fun: 22 },
             rare_find: { confidence: 8, fear: -2, security: 2, fun: 14 },

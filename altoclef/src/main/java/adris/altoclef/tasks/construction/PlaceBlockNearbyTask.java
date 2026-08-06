@@ -19,7 +19,9 @@ import baritone.api.utils.input.Input;
 import baritone.pathing.movement.MovementHelper;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.InteractionHand;
@@ -69,7 +71,7 @@ public class PlaceBlockNearbyTask extends Task {
 
         // Check for blocks being placed
         _onBlockPlaced = EventBus.subscribe(BlockPlaceEvent.class, evt -> {
-            if (ArrayUtils.contains(_toPlace, evt.blockState.getBlock())) {
+            if (placedWhatWeWanted(evt.blockState.getBlock())) {
                 stopPlacing(_mod);
             }
         });
@@ -179,7 +181,40 @@ public class PlaceBlockNearbyTask extends Task {
 
     @Override
     public boolean isFinished(AltoClef mod) {
-        return _justPlaced != null && ArrayUtils.contains(_toPlace, mod.getWorld().getBlockState(_justPlaced).getBlock());
+        return _justPlaced != null && placedWhatWeWanted(mod.getWorld().getBlockState(_justPlaced).getBlock());
+    }
+
+    /**
+     * Did this block come out of the item we asked for?
+     *
+     * One item can land as two DIFFERENT blocks depending on the face it hit:
+     * a torch item is minecraft:torch on a floor and minecraft:wall_torch on a
+     * wall. A straight identity test against _toPlace misses half the outcomes,
+     * so "@place torch" next to any wall placed the torch and then never
+     * finished - isFinished was hunting a block that was never going to be
+     * there, and the BlockPlaceEvent hook never released sneak either.
+     *
+     * asItem() is the authority: a StandingAndWallBlockItem registers BOTH of
+     * its blocks against itself, so this covers signs, banners, heads and coral
+     * fans too with no hardcoded pairs.
+     */
+    private boolean placedWhatWeWanted(Block placed) {
+        if (placed == null) {
+            return false;
+        }
+        if (ArrayUtils.contains(_toPlace, placed)) {
+            return true;
+        }
+        Item item = placed.asItem();
+        if (item == Items.AIR) {
+            return false;
+        }
+        for (Block wanted : _toPlace) {
+            if (wanted != null && wanted.asItem() == item) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public BlockPos getPlaced() {

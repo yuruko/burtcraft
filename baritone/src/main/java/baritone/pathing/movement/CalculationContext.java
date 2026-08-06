@@ -80,7 +80,7 @@ public class CalculationContext {
     public int maxFallHeightNoWater;
     public final int maxFallHeightBucket;
     public final double waterWalkSpeed;
-    /** BURNT: true when this path may not enter water at all (she is currently dry). */
+    /** BURNT: true when dry water entries require the bounded crossing check. */
     public final boolean waterForbidden;
     public final double breakBlockAdditionalCost;
     public double backtrackCostFavoringCoefficient;
@@ -153,19 +153,14 @@ public class CalculationContext {
                 }
             }
         }
-        // BURNT: water is never content. Vanilla prices a swum block at roughly
-        // twice a walked one, so a straight ocean crossing genuinely wins on cost
-        // and the bot spends half an hour swimming. waterWalkSpeed is the single
-        // choke point every swimming movement reads (MovementTraverse walk +
-        // bridge, MovementDiagonal), so pricing it here covers all of them.
-        // The dry/wet split is what keeps this safe: while she is dry, entering
-        // water is impossible; once she is already in it the multiplier applies
-        // instead, so the cheapest path is always the shortest way back to land.
+        // Keep swimming slower than land, but no longer make every dry entry
+        // impossible. MovementTraverse and MovementDiagonal call
+        // canCrossSmallWater before using this cost, which admits narrow crossings
+        // and rejects open water. Once she is wet the restriction is disabled so a
+        // fresh path calculation can always take the shortest route back to shore.
         double baseWaterWalkSpeed = ActionCosts.WALK_ONE_IN_WATER_COST * (1 - waterSpeedMultiplier) + ActionCosts.WALK_ONE_BLOCK_COST * waterSpeedMultiplier;
         this.waterForbidden = Baritone.settings().avoidWaterWhileDry.value && !player.isInWater() && !player.isSwimming();
-        this.waterWalkSpeed = this.waterForbidden
-                ? ActionCosts.COST_INF
-                : baseWaterWalkSpeed * Math.max(1.0D, Baritone.settings().swimCostMultiplier.value);
+        this.waterWalkSpeed = baseWaterWalkSpeed * Math.max(1.0D, Baritone.settings().swimCostMultiplier.value);
         this.breakBlockAdditionalCost = Baritone.settings().blockBreakAdditionalPenalty.value;
         this.backtrackCostFavoringCoefficient = Baritone.settings().backtrackCostFavoringCoefficient.value;
         this.jumpPenalty = Baritone.settings().jumpPenalty.value;
@@ -179,6 +174,45 @@ public class CalculationContext {
 
     public final IBaritone getBaritone() {
         return baritone;
+    }
+
+    /**
+     * Allows a dry path to enter water only when continuing in this movement's
+     * direction reaches a usable shore within a small, fixed number of blocks.
+     * The directional scan is cheap enough to run during path expansion and stops
+     * paths from following a shoreline in the water to bypass the size limit.
+     */
+    public boolean canCrossSmallWater(int fromX, int y, int fromZ, int destX, int destZ) {
+        if (!waterForbidden) return true;
+
+        BlockState destFeet = get(destX, y, destZ);
+        BlockState destHead = get(destX, y + 1, destZ);
+        if (!MovementHelper.isWater(destFeet) && !MovementHelper.isWater(destHead)) {
+            return true; // leaving water is always safe
+        }
+
+        int stepX = Integer.signum(destX - fromX);
+        int stepZ = Integer.signum(destZ - fromZ);
+        if (stepX == 0 && stepZ == 0) return false;
+
+        int maxWater = Math.max(0, Baritone.settings().smallWaterCrossingMaxLength.value);
+        for (int i = 0; i <= maxWater; i++) {
+            int x = destX + stepX * i;
+            int z = destZ + stepZ * i;
+            BlockState feet = get(x, y, z);
+            BlockState head = get(x, y + 1, z);
+            if (MovementHelper.isWater(feet) || MovementHelper.isWater(head)) {
+                continue;
+            }
+            boolean levelShore = MovementHelper.canWalkThrough(this, x, y, z, feet)
+                    && MovementHelper.canWalkThrough(this, x, y + 1, z, head)
+                    && MovementHelper.canWalkOn(this, x, y - 1, z);
+            boolean raisedShore = MovementHelper.canWalkThrough(this, x, y + 1, z, head)
+                    && MovementHelper.canWalkThrough(this, x, y + 2, z)
+                    && MovementHelper.canWalkOn(this, x, y, z, feet);
+            return levelShore || raisedShore;
+        }
+        return false;
     }
 
     public BlockState get(int x, int y, int z) {

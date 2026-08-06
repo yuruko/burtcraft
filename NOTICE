@@ -19,6 +19,10 @@ License:   MIT -- see altoclef/LICENSE
 
 This copy is a fork tracking Minecraft 26.1.2 / Fabric / Java 25.
 
+The significant modifications are listed below. This list is a courtesy rather
+than a license requirement (MIT asks only that the copyright notice be kept),
+and it is not exhaustive -- `git log altoclef/` is the complete record.
+
 Modifications made for burtcraft:
 
   ADDED    src/main/java/adris/altoclef/external/ExternalControlServer.java
@@ -48,6 +52,14 @@ Modifications made for burtcraft:
            TaskRunner enabled long enough for FoodChain to eat: see the
            TaskRunner note below for why that is necessary at all.
 
+  ADDED    src/main/java/adris/altoclef/tasks/construction/ToasterBuildTask.java
+           src/main/java/adris/altoclef/tasks/construction/settlement/*.java
+           The settlement builder: one fixed ASCII floorplan (never a generated
+           or growing one), laid bottom course first, with its own survey,
+           restock and hand-placement recovery. ToasterGeometry holds the plan;
+           the Node side holds a byte-identical copy so both agree on every
+           block.
+
   MODIFIED src/main/java/adris/altoclef/commandsystem/CommandExecutor.java
            Added a public getMod() accessor so the control server can read the
            live task chain (used for the "what am I doing right now" readout).
@@ -63,11 +75,38 @@ Modifications made for burtcraft:
            and is therefore stale whenever the runner is idle.
 
   MODIFIED src/main/java/adris/altoclef/tasksystem/TaskRunner.java
+           src/main/java/adris/altoclef/tasksystem/TaskChain.java
            Added isActive(). tick() returns immediately while inactive, so NO
            chain runs -- not food, not defense -- and the runner is inactive
            whenever no user task is running. Anything poking a chain from
            outside the tick loop has to be able to ask whether that poke will
            ever be read.
+           Added TaskChain.runsWhileIdle() (default false) and idle reflex
+           ticking, so the survival chains keep running between user tasks.
+           Finishing a job used to disable every chain, which left the bot with
+           no defense, no eating and nothing to press respawn. setReflexesAllowed
+           (false) is what makes F1 manual control inert again.
+
+  MODIFIED src/main/java/adris/altoclef/chains/MobDefenseChain.java
+           src/main/java/adris/altoclef/tasks/movement/RunAwayFrom*.java
+           Commitment and anti-oscillation in the flee/fight decision: running
+           away and the task that walks back could each undo the other at ~3s
+           period, because the escape distance and the disengage distance close
+           the loop outside the chain's own hysteresis. After repeated fresh
+           escapes inside a window the bot fights instead -- except where
+           fighting is genuinely wrong (creeper, warden-class, outnumbered, or
+           low health). Water is never entered to escape.
+
+  MODIFIED src/main/java/adris/altoclef/chains/*.java
+           src/main/java/adris/altoclef/tasks/**, trackers/, util/helpers/
+           Survivability and observability work across the task tree: stall and
+           wedge recovery, smelting and mining fixes, protected-block handling,
+           and debug states on tasks that previously reported nothing at all (a
+           task with no setDebugState is invisible by construction).
+
+  MODIFIED src/main/java/adris/altoclef/Debug.java
+           The Debug.log* helpers were commented-out no-ops upstream, so their
+           silence meant nothing. They log again.
 
   MODIFIED src/main/java/adris/altoclef/Settings.java
            `showTaskChains` now defaults to false. Upstream's task-tree dump is
@@ -104,10 +143,14 @@ this directory itself.
 Modifications made for burtcraft:
 
   MODIFIED src/api/java/baritone/api/Settings.java
-           - Added `avoidWaterWhileDry`: while the player is dry, refuse to
-             path into water at all.
-           - Added `waterWalkCostMultiplier`: scales the cost of every swimming
-             movement once already wet.
+           - Added `avoidWaterWhileDry`: while the player is dry, entering water
+             is restricted to the bounded crossing check described below.
+           - Added `smallWaterCrossingMaxLength` (default 6): the longest run of
+             water a dry path may cross. Ponds and rivers stay pathable; an
+             ocean does not become a shortcut.
+           - Added `swimCostMultiplier` (default 2): scales the cost of every
+             swimming movement. Vanilla prices a swum block at roughly twice a
+             walked one, which is why long ocean crossings used to win on cost.
            - Changed the default of the debug render settings (renderPath,
              renderPathAsLine, renderGoal, renderGoalAnimated,
              renderGoalXZBeacon, renderSelectionBoxes) from enabled to
@@ -127,23 +170,50 @@ Modifications made for burtcraft:
            diagnosis. Nothing else in the tree writes to chat directly.
 
   MODIFIED src/main/java/baritone/process/BuilderProcess.java
-           approxPlaceable(): when getStateForPlacement returns null, fall back
-           to the block's default state instead of recording AIR. That call is
-           made against a synthetic BlockPlaceContext (the player's own feet,
-           Direction.UP), so blocks with real placement constraints -- a chest,
-           which inspects its neighbours to decide single vs double -- fail it
-           routinely and were silently deleted from the placeable list.
+           - approxPlaceable(): when getStateForPlacement returns null, fall back
+             to the block's default state instead of recording AIR. That call is
+             made against a synthetic BlockPlaceContext (the player's own feet,
+             Direction.UP), so blocks with real placement constraints -- a chest,
+             which inspects its neighbours to decide single vs double -- fail it
+             routinely and were silently deleted from the placeable list.
+           - Added samePlacementItem()/canSupply(), used by assemble(). One ITEM
+             can place two different BLOCKS depending on the face it is clicked
+             against (a torch is minecraft:torch on a floor, minecraft:wall_torch
+             on a wall). Because approxPlaceable only ever reports the floor form,
+             a schematic asking for a wall torch reported "missing materials" with
+             a full stack of torches in the bag. This answers only "do I have the
+             material"; the exact state is still chosen by the existing placement
+             test, so it cannot place a floor torch where a wall torch belongs.
+           - Three quit reasons also print to stdout. logDirect is in-game chat,
+             which never reaches latest.log, so every reason the builder gave up
+             was invisible in the logs.
 
   MODIFIED src/main/java/baritone/pathing/movement/CalculationContext.java
-           Added the `waterForbidden` field and the water pricing that backs
-           the two settings above: water costs COST_INF while dry, and the
-           multiplier applies once wet. Vanilla prices a swum block low enough
-           that a long swim looks cheaper than walking around, which made the
-           bot cross oceans instead of going around them.
+           Added the `waterForbidden` field and canCrossSmallWater(), the bounded
+           crossing check backing the settings above: while dry, a movement may
+           enter water only if continuing in its direction reaches shore within
+           `smallWaterCrossingMaxLength` blocks. The scan is directional so a path
+           cannot follow a shoreline through the water to defeat the limit. Once
+           already wet the restriction lifts, so the route back to land is never
+           cut off. Vanilla prices a swum block low enough that a long swim looks
+           cheaper than walking around, which made the bot cross oceans.
+
+  MODIFIED src/main/java/baritone/pathing/movement/movements/MovementTraverse.java
+           src/main/java/baritone/pathing/movement/movements/MovementDiagonal.java
+           Call canCrossSmallWater() before costing a water movement, on every
+           branch that can enter water. Pricing alone was not enough: these are
+           the movements that actually decide to swim.
 
   MODIFIED src/main/java/baritone/pathing/movement/movements/MovementDescend.java
            Do not break a fall by dropping into water -- that is still getting
            in the water, which the settings above exist to prevent.
+
+  MODIFIED src/api/java/baritone/api/utils/BlockOptionalMeta.java
+           The block-drop lookup swallows its exception instead of calling
+           e.printStackTrace(). Fabric's loot hook wants a real MinecraftServer,
+           which this lightweight client-side level deliberately does not have,
+           so the throw is expected -- and one full stack trace per tracked block
+           can stall the client during a rescan.
 
   REMOVED  dist/
            Prebuilt jars for Minecraft 1.18.0 and 1.20.4 (~12 MB) that are not

@@ -15,8 +15,17 @@ const MAX_FAILURES = 80;
 const MAX_FAVORITES = 24;
 const MAX_WHEAT_SPOTS = 12;
 const WHEAT_SPOT_MERGE_DIST = 24;
+// the named collection. must exceed the sum of OVEN_TARGETS with headroom: evicting
+// a record does not remove the block from the world, it just makes her forget she
+// named it - and makes the tally re-open a target she already filled.
 const MAX_OVENS = 128;
 // 64-block cells, so ~4000 covers a 500x500-chunk slab of explored world
+// the people roster. big enough to hold a small server's regulars across sessions;
+// eviction is by how much they actually mattered, never by pure recency, so one busy
+// evening of strangers cannot push out someone she has played beside for weeks.
+const MAX_PLAYERS = 48;
+const MAX_PLAYER_REQUESTS = 4;                  // the last few things one person asked of her
+const MAX_PLAYER_NOTES = 3;
 const MAX_TERRAIN_CELLS = 4000;
 const MAX_CLAIMED_CELLS = 400;
 const MAX_VISITED_SPOTS = 256;
@@ -46,6 +55,19 @@ function cleanText(value, max = 120) {
     return String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
+// entries that are protocol chatter rather than anything she lived. `hud` is the 30s
+// in-game intent overlay; `status`/`inventory`/`coords` are read-only queries. a journal
+// is what she DID, and a ring buffer full of heartbeats is a journal of nothing.
+const JOURNAL_NOISE_ACTIONS = new Set(['hud', 'status', 'inventory', 'coords', 'look']);
+function isJournalNoise(entry) {
+    if (!entry || typeof entry !== 'object') return true;
+    if (entry.kind !== 'completed') return false;
+    const action = String(entry.action || '').trim().toLowerCase();
+    if (action) return JOURNAL_NOISE_ACTIONS.has(action);
+    // older entries predate the `action` field - fall back to the bare label
+    return JOURNAL_NOISE_ACTIONS.has(String(entry.label || '').trim().toLowerCase());
+}
+
 function safePoint(position) {
     if (!position || ![position.x, position.y, position.z].every(Number.isFinite)) return null;
     return { x: Math.round(position.x), y: Math.round(position.y), z: Math.round(position.z) };
@@ -66,9 +88,21 @@ export class MinecraftMemory {
             terrain: {},
             // every long-distance destination she has actually committed to, as
             // {x,z,at}. this used to live ONLY in ram, so "where have i already
-            // looked" died with every process restart and she re-checked the same
-            // ground forever. persisted here so a restart costs her nothing.
-            visited: []
+            // looked" died with every burnt restart and she re-checked the same
+            // ground forever - exactly the "it doesn't remember previously checked
+            // areas" complaint. persisted here so a restart costs her nothing.
+            visited: [],
+            // the people she plays with. everything about a person used to be RAM-only
+            // (a last-seen timestamp and a name roster), so every restart she met the
+            // whole server for the first time again - no idea who she had talked to for
+            // weeks, what they said, what they asked her to do, or who she gave bread to.
+            players: [],
+            // the standing record of "am i actually able to get home". one departure
+            // that fails is nothing; the same walk failing all afternoon means the
+            // home is unreachable and she should build somewhere else. this MUST be
+            // persisted - the go-home loop survived several burnt restarts precisely
+            // because the attempt count lived in ram and reset to zero every time.
+            homeCampaign: null
         };
         this._dirty = false;
         this._saveTimer = null;
@@ -81,7 +115,13 @@ export class MinecraftMemory {
         try {
             const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
             if (parsed && typeof parsed === 'object') {
-                this.data.journal = Array.isArray(parsed.journal) ? parsed.journal.slice(-MAX_JOURNAL) : [];
+                // drop the cosmetic-heartbeat entries a previous build wrote as real
+                // completions. they had taken 208 of 240 slots and evicted her actual
+                // history, so filtering BEFORE the slice is what gives the surviving
+                // memories their places back. harmless once the writer is fixed.
+                this.data.journal = Array.isArray(parsed.journal)
+                    ? parsed.journal.filter((e) => !isJournalNoise(e)).slice(-MAX_JOURNAL)
+                    : [];
                 this.data.landmarks = Array.isArray(parsed.landmarks) ? parsed.landmarks.slice(-MAX_LANDMARKS) : [];
                 this.data.failures = Array.isArray(parsed.failures) ? parsed.failures.slice(-MAX_FAILURES) : [];
                 this.data.favorites = Array.isArray(parsed.favorites) ? parsed.favorites.slice(-MAX_FAVORITES) : [];
@@ -98,6 +138,9 @@ export class MinecraftMemory {
                 this.data.deathSpot = parsed.deathSpot && typeof parsed.deathSpot === 'object' && parsed.deathSpot.position
                     ? parsed.deathSpot
                     : null;
+                this.data.homeCampaign = parsed.homeCampaign && typeof parsed.homeCampaign === 'object' &&
+                    !Array.isArray(parsed.homeCampaign) ? parsed.homeCampaign : null;
+                this.data.players = Array.isArray(parsed.players) ? parsed.players.slice(-MAX_PLAYERS) : [];
                 // older memory files predate the tally; start it at zero rather
                 // than inventing a history she never lived.
                 const t = parsed.tally && typeof parsed.tally === 'object' ? parsed.tally : {};
@@ -486,17 +529,24 @@ export class MinecraftMemory {
     }
 
     // ---- homesteads + outposts -------------------------------------------
+
     upsertSettlement(value, { main = false } = {}) {
         let settlement = value instanceof ToasterHomestead ? value : settlementFromJSON(value);
         if (!settlement) return null;
         const currentMain = this.getMainSettlement(settlement.world);
-        if (settlement.role === 'outpost' && currentMain) settlement = fitOutpostBelowHomestead(settlement, currentMain);
+        if (settlement.role === 'outpost' && currentMain) {
+            settlement = fitOutpostBelowHomestead(settlement, currentMain);
+        }
         const idx = this.data.settlements.findIndex((entry) => entry.id === settlement.id ||
-            (entry.kind === settlement.kind && entry.world === settlement.world && entry.dimension === settlement.dimension &&
-                entry.anchor?.x === settlement.anchor.x && entry.anchor?.y === settlement.anchor.y && entry.anchor?.z === settlement.anchor.z));
+            (entry.kind === settlement.kind && entry.world === settlement.world &&
+                entry.dimension === settlement.dimension && entry.anchor?.x === settlement.anchor.x &&
+                entry.anchor?.y === settlement.anchor.y && entry.anchor?.z === settlement.anchor.z));
         const json = settlement.toJSON();
         const previousMainId = this.data.mainSettlementId;
         const previous = idx >= 0 ? this.data.settlements[idx] : null;
+        // `updatedAt` is bookkeeping, not a state change. Survey packets arrive
+        // every couple seconds, so ignoring it prevents a permanently complete
+        // house from rewriting the memory file forever.
         const comparable = (entry) => JSON.stringify(entry
             ? Object.fromEntries(Object.entries(entry).filter(([key]) => key !== 'updatedAt'))
             : null);
@@ -504,7 +554,8 @@ export class MinecraftMemory {
         if (previous && comparable(previous) === comparable(json) && nextMainId === previousMainId) {
             return settlementFromJSON(previous);
         }
-        if (idx >= 0) this.data.settlements.splice(idx, 1, json); else this.data.settlements.push(json);
+        if (idx >= 0) this.data.settlements.splice(idx, 1, json);
+        else this.data.settlements.push(json);
         while (this.data.settlements.length > MAX_SETTLEMENTS) {
             const removable = this.data.settlements.findIndex((entry) => entry.id !== this.data.mainSettlementId);
             this.data.settlements.splice(removable >= 0 ? removable : 0, 1);
@@ -515,10 +566,13 @@ export class MinecraftMemory {
     }
 
     listSettlements(world = null) {
-        return this.data.settlements.map(settlementFromJSON).filter((entry) => entry && (!world || !entry.world || entry.world === world));
+        return this.data.settlements.map(settlementFromJSON).filter((entry) => entry &&
+            (!world || !entry.world || entry.world === world));
     }
 
-    getSettlement(id) { return settlementFromJSON(this.data.settlements.find((entry) => entry.id === id)); }
+    getSettlement(id) {
+        return settlementFromJSON(this.data.settlements.find((entry) => entry.id === id));
+    }
 
     getMainSettlement(world = null) {
         const direct = this.getSettlement(this.data.mainSettlementId);
@@ -526,12 +580,30 @@ export class MinecraftMemory {
         return this.listSettlements(world).find((entry) => entry.role === 'homestead') || null;
     }
 
-    listOutposts(world = null) { return this.listSettlements(world).filter((entry) => entry.role === 'outpost'); }
+    listOutposts(world = null) {
+        return this.listSettlements(world).filter((entry) => entry.role === 'outpost');
+    }
 
     updateSettlementProgress(id, progress) {
         const settlement = this.getSettlement(id);
         if (!settlement) return null;
         settlement.withProgress(progress);
+        return this.upsertSettlement(settlement, { main: settlement.id === this.data.mainSettlementId });
+    }
+
+    // which planned slots are already filled. positions, not a count: the
+    // gallery is a fixed map now, so "how many have i installed" is the wrong
+    // question - two installs into the same block is one appliance and a
+    // permanently unfinished plan.
+    recordSettlementAppliance(id, kind, position) {
+        const settlement = this.getSettlement(id);
+        const p = position && [position.x, position.y, position.z].every(Number.isFinite) ? position : null;
+        if (!settlement || !p) return null;
+        const at = { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
+        const key = `${at.x},${at.y},${at.z}`;
+        const existing = settlement.appliances.find((entry) => `${entry.x},${entry.y},${entry.z}` === key);
+        if (existing) return settlement;
+        settlement.appliances.push({ kind: String(kind || 'appliance'), ...at, at: Date.now() });
         return this.upsertSettlement(settlement, { main: settlement.id === this.data.mainSettlementId });
     }
 
@@ -549,8 +621,10 @@ export class MinecraftMemory {
         const rest = this.listSettlements(world).filter((entry) => !main || entry.id !== main.id);
         return [main, ...rest].filter(Boolean).slice(0, max).map((entry) => {
             const p = entry.progress;
-            const progress = p && Number.isFinite(Number(p.percent)) ? ` - ${Math.round(Number(p.percent))}% ${String(p.phase || 'built').replace(/_/g, ' ')}` : '';
-            return `${entry.role === 'homestead' ? 'MAIN ' : ''}${entry.name} (${entry.kind.replace(/_/g, ' ')}) at ${entry.anchor.x},${entry.anchor.y},${entry.anchor.z}, ${entry.width}x${entry.depth}x${entry.height}${progress}`;
+            const progress = p && Number.isFinite(Number(p.percent))
+                ? ` - ${Math.round(Number(p.percent))}% ${String(p.phase || 'built').replace(/_/g, ' ')}` : '';
+            return `${entry.role === 'homestead' ? 'MAIN ' : ''}${entry.name} (${entry.kind.replace(/_/g, ' ')}) at ` +
+                `${entry.anchor.x},${entry.anchor.y},${entry.anchor.z}, ${entry.width}x${entry.depth}x${entry.height}${progress}`;
         });
     }
 
@@ -564,7 +638,12 @@ export class MinecraftMemory {
             ? this.setFavorite(name, position, dimension, note || 'home', world)
             : this.getFavorite(name);
         if (!fav) return null;
+        const moved = this.data.home !== this._favoriteKey(fav.name) || !!position;
         this.data.home = this._favoriteKey(fav.name);
+        // a new house (or the same name at new coordinates) is a clean slate. carrying
+        // the old home's failed-departure count forward would condemn the replacement
+        // before she has walked to it once.
+        if (moved) this.data.homeCampaign = null;
         this._save();
         return fav;
     }
@@ -572,8 +651,278 @@ export class MinecraftMemory {
     clearHome() {
         if (!this.data.home) return false;
         this.data.home = null;
+        this.data.homeCampaign = null;
         this._save();
         return true;
+    }
+
+    // ---- people -------------------------------------------------------------
+    // a username is a person, not a session artifact. these records are what let her
+    // say "you're the one who asked me to build a bridge" instead of greeting a regular
+    // as a stranger every time burnt restarts.
+
+    _playerKey(name) { return cleanText(name, 16).toLowerCase(); }
+
+    _findPlayer(name) {
+        const key = this._playerKey(name);
+        if (!key) return null;
+        return this.data.players.find((p) => p.key === key) || null;
+    }
+
+    // significance, not recency: someone she has traded words with outranks a hundred
+    // people who walked past. used only for eviction.
+    _playerWeight(p) {
+        return (p.chats || 0) * 4 + (p.requests?.length || 0) * 4 + (p.gifts || 0) * 3 + Math.min(p.sightings || 0, 20);
+    }
+
+    _upsertPlayer(name, world = null) {
+        const key = this._playerKey(name);
+        if (!key) return null;
+        let p = this._findPlayer(key);
+        if (!p) {
+            p = {
+                key, name: cleanText(name, 16), firstMet: Date.now(), lastSeen: Date.now(),
+                sightings: 0, chats: 0, gifts: 0, lastSaid: null, lastSaidAt: null,
+                requests: [], notes: [], world: world || null
+            };
+            this.data.players.push(p);
+            if (this.data.players.length > MAX_PLAYERS) {
+                let worstAt = 0;
+                for (let i = 1; i < this.data.players.length; i++) {
+                    const a = this.data.players[i], b = this.data.players[worstAt];
+                    const wa = this._playerWeight(a), wb = this._playerWeight(b);
+                    if (wa < wb || (wa === wb && (a.lastSeen || 0) < (b.lastSeen || 0))) worstAt = i;
+                }
+                this.data.players.splice(worstAt, 1);
+            }
+        }
+        if (world) p.world = world;
+        p.lastSeen = Date.now();
+        return p;
+    }
+
+    recordPlayerSighting(name, world = null) {
+        const p = this._upsertPlayer(name, world);
+        if (!p) return null;
+        p.sightings = (p.sightings || 0) + 1;
+        this._save();
+        return p;
+    }
+
+    // what they actually SAID. the old roster kept names and timestamps with the text
+    // stripped, so she could know someone had spoken and never what about.
+    recordPlayerChat(name, text, world = null) {
+        const p = this._upsertPlayer(name, world);
+        if (!p) return null;
+        const said = cleanText(text, 160);
+        p.chats = (p.chats || 0) + 1;
+        if (said) { p.lastSaid = said; p.lastSaidAt = Date.now(); }
+        this._save();
+        return p;
+    }
+
+    recordPlayerGift(name, item = 'bread', world = null) {
+        const p = this._upsertPlayer(name, world);
+        if (!p) return null;
+        p.gifts = (p.gifts || 0) + 1;
+        p.lastGift = cleanText(item, 32);
+        this._save();
+        return p;
+    }
+
+    // something they asked her to do, and whether she ever did it. requests used to
+    // evaporate after ten minutes, so "you never built that thing i asked for" had no
+    // possible answer.
+    recordPlayerRequest(name, text, action = null, world = null) {
+        const p = this._upsertPlayer(name, world);
+        if (!p) return null;
+        const ask = cleanText(text, 120);
+        if (!ask) return p;
+        if (!Array.isArray(p.requests)) p.requests = [];
+        p.requests.push({ at: Date.now(), text: ask, action: action ? cleanText(action, 32) : null, done: false });
+        while (p.requests.length > MAX_PLAYER_REQUESTS) p.requests.shift();
+        this._save();
+        return p;
+    }
+
+    // mark the most recent matching open request as actually carried out
+    completePlayerRequest(name, action = null) {
+        const p = this._findPlayer(name);
+        if (!p || !Array.isArray(p.requests)) return null;
+        for (let i = p.requests.length - 1; i >= 0; i--) {
+            const r = p.requests[i];
+            if (r.done) continue;
+            if (action && r.action && r.action !== cleanText(action, 32)) continue;
+            r.done = true;
+            this._save();
+            return r;
+        }
+        return null;
+    }
+
+    notePlayer(name, note, world = null) {
+        const p = this._upsertPlayer(name, world);
+        if (!p) return null;
+        const text = cleanText(note, 120);
+        if (!text) return p;
+        if (!Array.isArray(p.notes)) p.notes = [];
+        if (!p.notes.includes(text)) {
+            p.notes.push(text);
+            while (p.notes.length > MAX_PLAYER_NOTES) p.notes.shift();
+            this._save();
+        }
+        return p;
+    }
+
+    getPlayer(name) { return this._findPlayer(name); }
+
+    listPlayers({ max = 10, world = null } = {}) {
+        return this.data.players
+            .filter((p) => !world || !p.world || p.world === world)
+            .slice()
+            .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))
+            .slice(0, max);
+    }
+
+    // one compact prompt block. people standing next to her come first and are marked,
+    // because "who is this" is the question she needs answered fastest.
+    playersContext(nearbyNames = [], max = 6, world = null) {
+        const near = new Set((Array.isArray(nearbyNames) ? nearbyNames : [])
+            .map((n) => this._playerKey(n)).filter(Boolean));
+        const known = this.data.players
+            .filter((p) => !world || !p.world || p.world === world)
+            .slice()
+            .sort((a, b) => {
+                const an = near.has(a.key) ? 1 : 0, bn = near.has(b.key) ? 1 : 0;
+                if (an !== bn) return bn - an;
+                return (b.lastSeen || 0) - (a.lastSeen || 0);
+            })
+            .slice(0, max);
+        if (!known.length) return [];
+        const now = Date.now();
+        const ago = (at) => {
+            const mins = Math.round((now - (at || now)) / 60000);
+            if (mins < 60) return `${Math.max(1, mins)}m ago`;
+            const hrs = Math.round(mins / 60);
+            return hrs < 48 ? `${hrs}h ago` : `${Math.round(hrs / 24)}d ago`;
+        };
+        return known.map((p) => {
+            const bits = [];
+            if (near.has(p.key)) bits.push('HERE NOW');
+            const met = Math.round((now - (p.firstMet || now)) / 86400000);
+            bits.push(met >= 1 ? `known ${met}d` : 'met today');
+            if (p.chats) bits.push(`${p.chats} talk${p.chats === 1 ? '' : 's'}`);
+            if (p.gifts) bits.push(`${p.gifts} loaf${p.gifts === 1 ? '' : 's'} given`);
+            if (!near.has(p.key)) bits.push(`last seen ${ago(p.lastSeen)}`);
+            const open = (p.requests || []).filter((r) => !r.done).slice(-1)[0];
+            if (open) bits.push(`still wants: ${open.text}`);
+            if (p.lastSaid) bits.push(`said "${p.lastSaid}"`);
+            if (p.notes?.length) bits.push(p.notes[p.notes.length - 1]);
+            return `${p.name} - ${bits.join('; ')}`;
+        });
+    }
+
+    // ---- home reachability campaign -----------------------------------------
+    // AltoClef's escalating wander is the only "I cannot get there" the GAME emits,
+    // and it never fires when the walk is being shredded by something else: a
+    // 2600-block ocean route interrupted by drowned every ten seconds re-paths from
+    // scratch forever and never escalates anything. so judge the CAMPAIGN instead -
+    // how many times she set out for home, and whether any departure actually closed
+    // the gap. lives in the memory file because the loop this exists to break has
+    // already survived several restarts on a ram-only counter.
+
+    _campaignKey(name) { return cleanText(name || '', 80).toLowerCase(); }
+
+    getHomeCampaign(world = null, homeName = null, staleMs = 6 * 60 * 60 * 1000) {
+        const c = this.data.homeCampaign;
+        if (!c || typeof c !== 'object') return null;
+        if (world && c.world && c.world !== world) return null;
+        if (homeName && c.home !== this._campaignKey(homeName)) return null;
+        if (Number.isFinite(staleMs) && staleMs > 0 && Date.now() - (c.lastAt || 0) > staleMs) return null;
+        return c;
+    }
+
+    // a departure is one accepted "walk home" goal. distance is measured at the
+    // moment she sets out, so bestDistance can only improve from a real approach.
+    noteHomeDeparture(world, homeName, distance) {
+        const key = this._campaignKey(homeName);
+        if (!key) return null;
+        const d = Number(distance);
+        let c = this.getHomeCampaign(world, homeName);
+        if (!c) {
+            c = {
+                world: world || null, home: key, attempts: 0, startedAt: Date.now(), lastAt: Date.now(),
+                startDistance: Number.isFinite(d) ? d : null,
+                bestDistance: Number.isFinite(d) ? d : null,
+                declaredAt: null
+            };
+        }
+        c.attempts = (c.attempts || 0) + 1;
+        c.lastAt = Date.now();
+        if (Number.isFinite(d)) {
+            if (!Number.isFinite(c.startDistance)) c.startDistance = d;
+            if (!Number.isFinite(c.bestDistance) || d < c.bestDistance) c.bestDistance = d;
+        }
+        this.data.homeCampaign = c;
+        this._homeBestWritten = Number.isFinite(d) ? d : null;   // a departure always writes
+        this._save();
+        return c;
+    }
+
+    // called with the live distance while a home walk is running. the ONLY thing
+    // that proves the route works is the gap actually shrinking.
+    //
+    // meaningful progress REBASES the campaign rather than merely recording a better
+    // number: a walk that got a third of the way home has demonstrably not failed, so
+    // it starts over from where it got to. without this, a long legitimate march would
+    // spend its attempts on the way and get its own home condemned out from under it -
+    // and conversely a bot that crawls forward then stalls forever would be forgiven
+    // permanently by one early gain.
+    noteHomeProgress(world, homeName, distance, progressFraction = 0.35) {
+        const c = this.getHomeCampaign(world, homeName);
+        const d = Number(distance);
+        if (!c || !Number.isFinite(d)) return null;
+        if (Number.isFinite(c.bestDistance) && d >= c.bestDistance) return c;
+
+        const base = Number(c.startDistance);
+        const rebase = Number.isFinite(base) && base > 0 && (base - d) / base >= progressFraction;
+        // persist on a rebase or a real gain only. this is polled every autonomy tick
+        // while she walks, and a full-file sync write per tick is exactly the stall this
+        // file's own debounce comment exists to avoid - the verdict needs "roughly how
+        // close did she get", never sub-block precision. measured against the last value
+        // actually WRITTEN, not the last one seen, so a steady crawl of small gains still
+        // reaches disk instead of drifting forever below the threshold.
+        const watermark = Number.isFinite(this._homeBestWritten) ? this._homeBestWritten : c.bestDistance;
+        const worthWriting = rebase || !Number.isFinite(watermark) || (watermark - d) >= 16;
+        c.bestDistance = d;
+        c.lastAt = Date.now();
+        if (rebase) {
+            c.startDistance = d;
+            c.attempts = 0;
+            c.startedAt = Date.now();
+            c.declaredAt = null;
+        }
+        this.data.homeCampaign = c;
+        if (worthWriting) { this._homeBestWritten = d; this._save(); }
+        return c;
+    }
+
+    // she got there. the home is provably fine - wipe the doubt entirely so one
+    // bad afternoon never counts against a home she uses every day.
+    clearHomeCampaign() {
+        this._homeBestWritten = null;
+        if (!this.data.homeCampaign) return false;
+        this.data.homeCampaign = null;
+        this._save();
+        return true;
+    }
+
+    markHomeCampaignDeclared() {
+        const c = this.data.homeCampaign;
+        if (!c) return null;
+        c.declaredAt = Date.now();
+        this._save();
+        return c;
     }
 
     // `world` scopes home to the server/save it was set on. a home is a PLACE, and

@@ -60,12 +60,28 @@ public class StorageHelper {
     private static Screen showcaseScreen = null;
     private static long showcaseUntil = 0L;
 
+    // DEFAULT OFF. this shipped at 1400ms and froze her for five minutes with a
+    // crafting table open (2026-08-01 23:31:53 -> 23:37 shutdown).
+    //
+    // the hole: closeScreen() ARMS the linger and returns WITHOUT closing, and the
+    // only thing that then closes it is tickScreenShowcase(). when a task is
+    // INTERRUPTED mid-container (every task died "interrupted by null" at once that
+    // night), its onStop calls closeScreen() exactly one final time - arming a linger
+    // that nobody will ever call again - and the tick disowns the screen the moment
+    // mc.screen stops matching the armed reference. an open screen blocks movement,
+    // so she sat there.
+    //
+    // the tick CANNOT simply close whatever container is open instead: it has no way
+    // to tell an orphaned screen from one a task is actively using, and closing a
+    // crafting table mid-craft breaks the task. a cosmetic "you can see her working"
+    // feature does not get to risk that, so it is opt-in until it can distinguish the
+    // two. set BURTCRAFT_CONTAINER_SHOWCASE_MS=1400 to try it again.
     private static long showcaseMillis() {
         try {
             String raw = System.getenv("BURTCRAFT_CONTAINER_SHOWCASE_MS");
             if (raw != null && !raw.isBlank()) return Math.max(0L, Long.parseLong(raw.trim()));
         } catch (Throwable ignored) { }
-        return 1400L;
+        return 0L;
     }
 
     public static void closeScreen() {
@@ -102,10 +118,17 @@ public class StorageHelper {
     public static void tickScreenShowcase() {
         if (SHOWCASE_MS <= 0 || showcaseScreen == null) return;
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.screen != showcaseScreen) { clearShowcase(); return; }
+        if (mc.player == null) { clearShowcase(); return; }
         if (System.currentTimeMillis() < showcaseUntil) return;
+        // DEADLINE REACHED. close whatever container is still open, not only the exact
+        // instance we armed. the old identity check bailed out via clearShowcase() the
+        // moment the reference stopped matching, which is precisely what happens when
+        // the owning task is interrupted - and it left the screen open forever with
+        // nobody holding the responsibility to shut it. we only ever get here because
+        // WE deferred a close that was already asked for, so closing it is honouring
+        // that request late, not cancelling somebody else's work.
         clearShowcase();
-        mc.player.closeContainer();
+        if (mc.screen instanceof AbstractContainerScreen) mc.player.closeContainer();
     }
 
     private static void clearShowcase() {

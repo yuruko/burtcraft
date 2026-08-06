@@ -18,8 +18,30 @@ public class TaskRunner {
         _active = false;
     }
 
+    /**
+     * While false, not even the survival chains get a turn.
+     *
+     * This is the F1 handoff: when the operator takes the keyboard, the bot must be inert,
+     * not merely jobless - a defense chain that keeps fighting for the mouse is
+     * worse than one that sleeps. Everything else that "stops" her is now just
+     * an empty job queue, and reflexes survive it.
+     */
+    private static volatile boolean _reflexesAllowed = true;
+
+    public static void setReflexesAllowed(boolean allowed) { _reflexesAllowed = allowed; }
+
+    public static boolean reflexesAllowed() { return _reflexesAllowed; }
+
+    /** The reflex chain currently holding her, tracked apart from the job. */
+    private TaskChain _cachedIdleChain = null;
+
     public void tick() {
-        if (!_active || !AltoClef.inGame()) return;
+        if (!AltoClef.inGame()) return;
+        if (!_active) {
+            tickReflexes();
+            return;
+        }
+        _cachedIdleChain = null;
         // Get highest priority chain and run
         TaskChain maxChain = null;
         float maxPriority = Float.NEGATIVE_INFINITY;
@@ -38,6 +60,41 @@ public class TaskRunner {
         if (maxChain != null) {
             maxChain.tick(_mod);
         }
+    }
+
+    /**
+     * OFF DUTY IS NOT DEAD.
+     *
+     * A finished job used to switch the whole bot off - `disable()` stops every
+     * chain and `tick()` then returned immediately, so between jobs nothing
+     * defended her, nothing ate, nothing pressed respawn. She was a mannequin
+     * from the moment a task ended until the next command arrived, however long
+     * burnt-side took to think of one, and a spider only needs seven seconds.
+     *
+     * So the reflexes keep their turn. Only chains that say they survive idling
+     * run here, and only the highest-priority one, exactly as when on duty -
+     * this is not a second scheduler, it is the same one with the job removed.
+     */
+    private void tickReflexes() {
+        if (!_reflexesAllowed) {
+            _cachedIdleChain = null;
+            return;
+        }
+        TaskChain maxChain = null;
+        float maxPriority = Float.NEGATIVE_INFINITY;
+        for (TaskChain chain : _chains) {
+            if (!chain.runsWhileIdle() || !chain.isActive()) continue;
+            float priority = chain.getPriority(_mod);
+            if (priority > maxPriority) {
+                maxPriority = priority;
+                maxChain = chain;
+            }
+        }
+        if (_cachedIdleChain != null && maxChain != _cachedIdleChain) {
+            _cachedIdleChain.onInterrupt(_mod, maxChain);
+        }
+        _cachedIdleChain = maxChain;
+        if (maxChain != null) maxChain.tick(_mod);
     }
 
     public void addTaskChain(TaskChain chain) {

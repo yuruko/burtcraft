@@ -236,8 +236,12 @@ public final class BlockOptionalMeta {
                         .withParameter(LootContextParams.BLOCK_STATE, b.defaultBlockState())
                         .withParameter(LootContextParams.TOOL, new ItemStack(Items.NETHERITE_PICKAXE, 1));
                     getDrops(block, lv5).stream().map(ItemStack::getItem).forEach(items::add);
-                } catch (Throwable e) {
-                    e.printStackTrace();
+                } catch (Throwable ignored) {
+                    // BURNT: swallow instead of e.printStackTrace().
+                    // Fabric's loot hook requires a real MinecraftServer, which this
+                    // lightweight client-side level intentionally does not have.
+                    // Missing item hashes are safe; printing one full stack trace per
+                    // tracked block can stall the client during a rescan.
                 }
                 return items;
             }

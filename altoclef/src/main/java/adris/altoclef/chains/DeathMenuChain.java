@@ -148,6 +148,14 @@ public class DeathMenuChain extends TaskChain {
     }
 
     @Override
+    public boolean runsWhileIdle() {
+        // THE ONE THAT COST HER 28 SECONDS ON SCREEN. she died with no job
+        // running, so nothing was ticking to press respawn, and she lay on the
+        // death screen until burnt-side happened to send an unrelated command.
+        return true;
+    }
+
+    @Override
     public String getName() {
         return "Death Menu Respawn Handling";
     }

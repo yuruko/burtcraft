@@ -162,27 +162,27 @@ public final class Settings {
     public final Setting<Boolean> assumeWalkOnWater = new Setting<>(false);
 
     /**
-     * BURNT: while the player is dry, refuse to path into water at all - swimming
-     * movements cost {@link baritone.api.pathing.movement.ActionCosts#COST_INF}.
-     * <p>
-     * This is a hard rule, not a preference: a bot that can enter an ocean will
-     * eventually spend half an hour crossing one, because a straight swim often
-     * genuinely is the cheapest route. The check is made once per path
-     * calculation against the player's current state, so it only ever forbids
-     * ENTERING water - once she is already wet {@link #swimCostMultiplier}
-     * applies instead and the way back to shore stays pathable.
+     * BURNT: while dry, only enter water when the movement points across a body
+     * narrow enough for {@link #smallWaterCrossingMaxLength}. Once already wet,
+     * unrestricted water movement remains available so the route back to shore
+     * can never be cut off.
      */
     public final Setting<Boolean> avoidWaterWhileDry = new Setting<>(true);
 
     /**
+     * BURNT: maximum number of consecutive water blocks a dry path may cross.
+     * This permits ponds and rivers without making an ocean a valid shortcut.
+     */
+    public final Setting<Integer> smallWaterCrossingMaxLength = new Setting<>(6);
+
+    /**
      * BURNT: multiplies the cost of every swimming movement (applied in
      * CalculationContext, so traverse and diagonal both see it). Vanilla prices a
-     * swum block at only about twice a walked one, which is why long ocean
-     * crossings win on cost. At 12 a land detour can be an order of magnitude
-     * longer and still be preferred, and while swimming it points the shortest
-     * way out.
+     * swum block at only about twice a walked one. The bounded crossing check
+     * prevents ocean routes, so this only needs to make land preferable when the
+     * two routes are otherwise similar.
      */
-    public final Setting<Double> swimCostMultiplier = new Setting<>(12D);
+    public final Setting<Double> swimCostMultiplier = new Setting<>(2D);
 
     /**
      * If you have Fire Resistance and Jesus then I guess you could turn this on lol

@@ -65,7 +65,7 @@ public class BlockTracker extends Tracker {
     private final Semaphore _endOfFrameMutex = new Semaphore(1);
     //private Block _currentlyTracking = null;
     private final AltoClef _mod;
-    private boolean _scanning = false;
+    private volatile boolean _scanning = false;
 
     public BlockTracker(AltoClef mod, TrackerManager manager) {
         super(manager);
@@ -304,16 +304,30 @@ public class BlockTracker extends Tracker {
         CalculationContext ctx = new CalculationContext(_mod.getClientBaritone(), _config.scanAsynchronously);
         if (_config.scanAsynchronously) {
             if (_scanning && _asyncForceResetScanFlag.elapsed()) {
-                Debug.logMessage("SCANNING TOOK TOO LONG! Will assume it ended mid way. Hopefully this won't break anything...");
-                _scanning = false;
+                // The worker may still be alive. Clearing this flag would launch a
+                // second full scan on top of it and compound the freeze.
+                Debug.logMessage("SCANNING TOOK TOO LONG! Waiting for the active scan to finish...");
+                _asyncForceResetScanFlag.reset();
             }
             if (!_scanning) {
-                Baritone.getExecutor().execute(() -> {
-                    _scanning = true;
-                    _asyncForceResetScanFlag.reset();
-                    rescanWorld(ctx, true);
+                // Claim the slot before submitting. Setting this inside the worker
+                // allowed several updates to queue duplicate scans while it was busy.
+                _scanning = true;
+                _asyncForceResetScanFlag.reset();
+                try {
+                    Baritone.getExecutor().execute(() -> {
+                        try {
+                            rescanWorld(ctx, true);
+                        } catch (Throwable t) {
+                            Debug.logWarning("Block scan failed: " + t.getMessage());
+                        } finally {
+                            _scanning = false;
+                        }
+                    });
+                } catch (Throwable t) {
                     _scanning = false;
-                });
+                    Debug.logWarning("Could not start block scan: " + t.getMessage());
+                }
             }
         } else {
             // Synchronous scanning.

@@ -36,7 +36,9 @@ import { RecentEvents } from './recent_events.js';
 import { MinecraftMemory, OVEN_KINDS } from './minecraft_memory.js';
 import {
     ToasterHomestead, ToasterOutpost, toasterHomesteadDimensions,
-    toasterOutpostDimensions, fitOutpostBelowHomestead, mainIsBiggest
+    toasterOutpostDimensions, fitOutpostBelowHomestead, mainIsBiggest, toasterBlueprint,
+    toasterFixtureTarget, toasterOpenFloor, toasterBedPositions, TOASTER_STACK_HEIGHT,
+    TOASTER_YARD_MARGIN, toasterYardSeparation
 } from './settlements.js';
 import { MinecraftAffect } from './minecraft_affect.js';
 
@@ -51,15 +53,6 @@ const DEFAULT_ACTION_TIMEOUT = 90000;
 // autonomous idle cadence - how often to consider doing something unprompted.
 const DEFAULT_AUTONOMOUS_TICK_MS = 25000;
 
-// Explicit decisions may replace the single AltoClef task already running.
-// Autonomous menu picks deliberately remain non-preempting so they cannot
-// thrash each other. A viewer request may replace only viewer/autonomous work.
-const PREEMPTING_SOURCES = new Set(['agent', 'operator', 'request', 'mode-switch', 'gamer']);
-const REPLACEABLE_SOURCES = new Set([
-    'autonomous', 'request', 'safety', 'recovery', 'loop-recovery',
-    'dwell-rotation', 'orphan-recovery', 'water-escape', 'protection', 'pinned'
-]);
-
 // min gap between reactions of the same kind, so chat can't farm spam and a
 // stream of damage events doesn't flood commentary.
 const REACTION_COOLDOWN_MS = 8000;
@@ -70,9 +63,27 @@ const REACTION_COOLDOWN_OVERRIDES = {
     low_hunger: 90 * 1000,
     nightfall: 120 * 1000,
     damage_taken: 25 * 1000,
-    hostiles_nearby: 45 * 1000
+    hostiles_nearby: 45 * 1000,
+    weather_changed: 90 * 1000
 };
+// once she has decided to get out of the rain, let her get there. re-deciding it
+// every idle tick is how a pull turns into the loop with better narration.
+const RAIN_SHELTER_COOLDOWN_MS = 5 * 60 * 1000;
+// far enough to be worth walking home for, near enough that she isn't crossing
+// the map because a cloud showed up.
+const RAIN_SHELTER_MAX_DIST = 700;
 const VIEWER_SUGGESTION_COOLDOWN_MS = 10000;
+// who is allowed to INTERRUPT work already in flight. 'agent' is her own brain calling
+// the minecraft tool - the case that was impossible before, so she could not change her
+// own mind once a goal was running. the idle menu ('autonomous') is deliberately absent:
+// idle picks interrupting each other is exactly the thrash the busy guard prevents.
+const PREEMPTING_SOURCES = new Set(['agent', 'operator', 'request', 'mode-switch', 'gamer']);
+// work a NON-operator interrupt may replace: her own idle choices and automation.
+// keeps one viewer from cancelling an operator's instruction.
+const REPLACEABLE_SOURCES = new Set([
+    'autonomous', 'request', 'dwell-rotation', 'recovery', 'loop-recovery',
+    'orphan-recovery', 'homestead', 'water-escape', 'pinned', 'protection', 'unreachable'
+]);
 const MAX_VIEWER_SUGGESTIONS = 12;
 const MAX_TELEMETRY_AGE_MS = 15000;
 // The relay heartbeats every 30s. If it goes silent for more than two beats,
@@ -82,14 +93,45 @@ const MAX_TELEMETRY_AGE_MS = 15000;
 // the in-game task before it reconnects.
 const BRIDGE_SILENCE_MS = 75000;
 const TELEMETRY_FAULT_MS = 45000;
-// Finite work may not look alive while producing no movement or inventory
-// change indefinitely. Crafting is tighter because missing ingredients can
-// otherwise leave AltoClef wandering/rescanning while the HUD says "crafting".
+// No finite job gets to look alive while producing absolutely no movement or
+// inventory change for 45 seconds. Crafting is especially tight: when a recipe
+// chain is parked on an absent ingredient, AltoClef otherwise sits in an infinite
+// wander/rescan loop while the HUD confidently says "crafting".
 const AUTONOMOUS_STALL_MS = 45000;
+// how many distinct inventory states count as "recently visited" when deciding
+// whether a change is real progress or a task tree swinging between two states.
+// the observed craft-oscillation cycles through ~6-8 states at ~1.4Hz while state
+// packets arrive every ~2s, so this holds several full cycles.
+const INVENTORY_HISTORY_MAX = 24;
+const INVENTORY_OSCILLATION_WARN_AT = 3;
 const ACTION_STALL_MS = Object.freeze({
     craft: 20000,
-    speedrun: 90000
+    // A speedrun may legitimately spend longer than a normal goal calculating
+    // or fighting in one area, but it may not be a statue indefinitely. The
+    // macro has no wall-clock ceiling, so this is its only external liveness
+    // bound when an internal task silently wedges.
+    speedrun: 90000,
+    // building is LEGITIMATELY stationary - she stands on one wall placing smooth
+    // stone for minutes at a time, which is the exact shape the 45s default reads
+    // as a stall. that blacklisted build_settlement for two minutes and handed the
+    // tick to the wander menu, so the toaster lost ground every time she worked on
+    // it. for THIS action the survey is the ONLY progress signal that counts (see
+    // _observeGoalProgress) - position and inventory are ignored, because a wedged
+    // build that still gets jostled by mobs or nudges one block kept refreshing the
+    // clock forever and the 6 minutes never once elapsed.
+    build_settlement: 6 * 60 * 1000,
+    install_appliance: 90000
 });
+// Build phases where the task has handed off to a resource subtask and is
+// legitimately away from the site: there movement and inventory ARE the
+// progress signal. Every other phase claims she is laying blocks, and only the
+// survey can vouch for that.
+const BUILD_SUBTASK_PHASES = new Set(['gathering_stone', 'crafting_side_torches', 'walking_to_quarry']);
+// The in-game builder parks on this exact string once baritone has refused the
+// site outright (ToasterBuildTask.BLOCKED_PHASE). It is a definite answer, not a
+// guess, so it does not have to serve out the full build budget.
+const BUILD_BLOCKED_PHASE = 'blocked_baritone_cannot_build';
+const BUILD_BLOCKED_GRACE_MS = 45000;
 // loop detection: she can "make progress" (position keeps changing) while going nowhere -
 // orbiting one patch, or grinding a goal that never resolves. catch both.
 const LOOP_CONFINE_RADIUS = 24;            // blocks (horizontal): orbiting within this = "same spot"
@@ -99,6 +141,9 @@ const GOAL_MAX_RUNTIME_MS = {
     // A full speedrun is intentionally long-lived. Movement/confinement and
     // no-progress checks still apply, but there is no arbitrary wall-clock stop.
     speedrun: null,
+    // A large smooth-stone toaster is a multi-session construction project.
+    // Progress is supervised from settlementBuild telemetry, not an arbitrary
+    // fifteen-minute wall clock.
     build_settlement: null
 };
 const LOOP_AVOID_MS = 2 * 60 * 1000;       // after a break, don't re-pick the same action for this long
@@ -118,7 +163,18 @@ const LOOP_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 // after a real task finishes/fails the outcome is queued to burnt's brain, which
 // usually picks the next goal. hold the fixed idle menu back this long so her own
 // reasoned choice leads instead of a dice roll stealing the task slot first.
-const LLM_GOAL_GRACE_MS = 20000;
+// How long the fixed idle menu waits after a task ends so her own reasoned
+// choice can lead instead.
+//
+// It was 20 seconds, and it was only CHECKED on the 25-second autonomous tick,
+// so the real wait was 20-50 depending on where the task happened to land -
+// observed at 44 seconds of a motionless bot on stream, twice. Two things fix
+// that: `_noteTaskOutcome` now wakes the loop exactly when the grace expires,
+// and the grace itself is short. It can afford to be: her brain outranks the
+// menu (`agent` is an unconditional preempting source), so a goal that arrives
+// late still wins - it replaces the menu's pick instead of waiting for silence.
+// Deciding out loud and changing her mind is in character. Standing still is not.
+const LLM_GOAL_GRACE_MS = 6000;
 const SAFETY_ACTIONS = new Set(['stop', 'eat', 'defend', 'cover_lava']);
 // `@food <n>` targets how much food she ENDS UP HOLDING, so these are stock
 // levels, not bites. small on purpose - see _foodTarget.
@@ -134,7 +190,7 @@ const EAT_RETRY_GAP_MS = 60 * 1000;
 // AND exempt from the f1 guard below, which is deliberate - when the operator takes the
 // keyboard the hud should still be able to say so rather than freeze on a stale line.
 // 'set_home' is a memory write, not a goal - and it stays allowed under f1 so the operator can
-// walk the bot somewhere good and say "this is home" while holding the keyboard.
+// walk her somewhere good and say "this is home" while holding the keyboard.
 const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'status', 'inventory', 'coords', 'enable', 'disable', 'autonomous', 'look', 'boat', 'hud', 'set_home', 'set_outpost', 'outposts']);
 
 // the in-game intent line: "<what she's doing>" / "<why>" / "<live altoclef phase>".
@@ -145,7 +201,8 @@ const INTENT_VERBS = {
     move: 'heading to', follow: 'following', explore: 'exploring', idle: 'killing time',
     defend: 'fighting back', attack: 'going after', eat: 'eating', hunt: 'hunting',
     equip: 'gearing up', deposit: 'stashing loot', stash: 'stashing loot',
-    place: 'placing', install_appliance: 'installing', build_settlement: 'building', speedrun: 'speedrunning', locate: 'searching for',
+    place: 'placing', install_appliance: 'installing', build_settlement: 'building',
+    speedrun: 'speedrunning', locate: 'searching for',
     give: 'handing over', cover_lava: 'capping lava', boat: 'sorting out a boat'
 };
 // fallback WHY when a goal carries no `say` of its own - keyed on who wanted it.
@@ -159,6 +216,7 @@ const INTENT_SOURCE_WHY = {
     recovery: 'recovering from a stall', autonomous: ''
 };
 const INTENT_PUSH_MIN_GAP_MS = 900;   // state lands ~2s apart; this only guards bursts
+const INTENT_HEARTBEAT_MS = 30000;    // refresh before the companion's 90s ttl expires
 // multiplayer chat manners: what reaches her brain and how fast she may type.
 // addressed lines (her name / the owner) always surface (per-sender gap only);
 // ambient server chatter is sampled so she joins in occasionally like a person
@@ -167,6 +225,8 @@ const INTENT_PUSH_MIN_GAP_MS = 900;   // state lands ~2s apart; this only guards
 // as addressed to her and always surfaces to your brain (ambient chatter is
 // sampled instead). set BOT_NAMES="ada,ada bot" in the env, pass
 // `new MinecraftTool({ names: [...] })`, or call setBotNames([...]) at runtime.
+// include the misspellings your chat actually types - the same list decides
+// whether a named line counts as an instruction (see _looksAddressed below).
 function buildAddressedRe(names) {
     const alt = (Array.isArray(names) ? names : [])
         .map((n) => String(n).trim())
@@ -190,8 +250,23 @@ const CHAT_GREETING_RE = /\b(hi|hey|hello|yo|sup|hiya|heya|morning|welcome|wb|gm
 const CHAT_SENDER_GAP_MS = 8000;
 const CHAT_AMBIENT_GAP_MS = 75000;
 const CHAT_AMBIENT_SAMPLE = 0.5;
+// a conversation is a STATE, not a keyword. once she has actually answered
+// somebody in game chat they are in an exchange with her, and no human re-types
+// her name every line - the follow-up is just "do you still have iron armor on?".
+// without a window that follow-up fell through to the ambient path (50% dice
+// behind a 75s gap her OWN reply had just reset), so she answered the one line
+// carrying "melba" and went silent on every one after it. these keep an answered
+// person addressed while the back-and-forth is genuinely alive.
+const CHAT_EXCHANGE_MS = 150000;      // how long an answered person stays "talking to her"
+const CHAT_EXCHANGE_MAX_MS = 600000;  // ceiling: a window can be extended, never forever
+const CHAT_EXCHANGE_GAP_MS = 2000;    // in-exchange per-sender gap (two quick lines both land)
+const CHAT_ADDRESSER_RECENT_MS = 120000; // how recently they must have addressed her to be answered
 const CHAT_OUT_MIN_GAP_MS = 3000;
 const CHAT_OUT_PER_MIN = 8;
+// a destination-less move refused twice inside this window is a loop, not a typo.
+// wide enough to span the turn boundary: the observed repeats were 1.4s apart
+// inside one turn and 48s apart across two.
+const NOWHERE_MOVE_REPEAT_MS = 90000;
 // one server line can reach us more than once (see _recentChatText). duplicates
 // arrive within milliseconds of each other, so the window only has to be wide
 // enough to cover delivery jitter.
@@ -209,12 +284,22 @@ const ROOM_DEAD_MS = 10 * 60 * 1000;   // nobody has said anything for this long
 // a bot narrating its own inventory at strangers.
 const ROOM_NARRATE_GAP_MS = 6 * 60 * 1000;
 const ROOM_NARRATE_SAMPLE = 0.5;
+// SOMEBODY WALKED UP. how often she may react to an arrival at all, how long before
+// the SAME person is a fresh event again (walking in and out of render distance must
+// not re-trigger), and how often an arrival gets a reaction rather than being
+// ignored. she is not a greeter bot; most people who wander past get nothing.
+const ARRIVAL_GAP_MS = 60 * 1000;
+const ARRIVAL_PER_PLAYER_GAP_MS = 12 * 60 * 1000;
+const ARRIVAL_SAMPLE = 0.6;
+// of the arrivals she DOES react to, how often the reaction is bread rather than
+// just talking. bread is the point, but a bot that force-feeds every passer-by is a
+// nuisance, so a real share of them are only a hello.
+const ARRIVAL_BREAD_SHARE = 0.65;
 const PERSISTENT_ACTIONS = new Set(['follow', 'idle', 'explore']);
-// long-lived macro goals that manage their OWN recovery. the @gamer speedrun runs
-// for the whole game and legitimately camps one area for a while (farming a blaze
-// spawner, digging out a stronghold, boating an ocean), so burnt's external
-// stall/loop killer must NOT abort it - the task has its own timeout/wander
-// recovery. these stay finite (they do finish), just exempt from the watchdog.
+// Keep this explicit for a genuinely self-supervising macro, but default to no
+// exemptions. A claimed internal recovery path is not enough: if the macro is
+// producing no movement or inventory progress, Burnt still needs a finite way
+// out. Speedrun therefore uses a generous action-specific stall budget above.
 const WATCHDOG_EXEMPT_ACTIONS = new Set();
 // autonomous-sourced persistent behaviors never emit a finish, so the tick loop
 // rotates them out after a bounded dwell instead of parking on them forever.
@@ -250,7 +335,44 @@ const GENERIC_ARMOR_WORDS = new Set([
 // the current 25s tick and still honours it, short enough that she isn't acting
 // on something someone said ten minutes ago.
 const REQUEST_ACT_WINDOW_MS = 90 * 1000;
-const REQUEST_SHAPE_RE =/(\b(can|could|would|will|wanna|want to|plz|pls|please|help|come|bring|make|build|get|find|follow|show|give|let'?s|lets)\b)|(\?\s*$)/i;
+// what counts as somebody asking her for something. deliberately LOOSE: a false
+// positive is one ignorable prompt line, a false negative is a real person being
+// ignored to their face.
+// the polite forms ("can you", "would you") were the whole list, which missed the way
+// people ACTUALLY direct someone standing next to them - bare imperatives. real lines
+// that were silently dropped: "burnt go to town , i got one for you", "burnt stand
+// still", "stand still burnt". none of them registered as a request at all, so nothing
+// downstream ever had a chance to act on them.
+const REQUEST_SHAPE_RE = new RegExp([
+    // polite / offered
+    '\\b(can|could|would|will|wanna|want to|plz|pls|please|lets|let\'?s)\\b',
+    // bare imperatives - how directions are actually given
+    '\\b(help|come|bring|make|build|get|find|follow|show|give|go|head|meet|wait|hold|stand|stay|stop|mine|dig|craft|place|put|drop|take|open|break|attack|kill|defend|guard|protect|look|turn|jump|run|walk|climb|jump|trade|sell|buy)\\b',
+    // deictic directions ("over here", "this way", "up there")
+    '\\b(over|this|that|up|down|back)\\s+(here|there|way)\\b',
+    // a question
+    '\\?\\s*$'
+].join('|'), 'i');
+// on a server her NAME is the strongest signal a line is aimed at her, and a named
+// line that is not just a greeting is nearly always an instruction. same configured
+// name list as the chat-manners test above (see buildAddressedRe / setBotNames).
+const GREETING_ONLY_RE = /^\W*(hi|hey|hello|yo|sup|wb|welcome back|gm|gn|o7|hru|lol|lmao)\b[\s\S]{0,12}$/i;
+// "go to -777, 7777" - somebody handing her a destination.
+// TWO numbers is the form people actually type, and it means x and z: nobody
+// quotes a y when they mean "walk over there", which is why baritone's own
+// command takes `goto x z` as well as `goto x y z`. the old rule demanded three
+// numbers, so every real two-number ask parsed to nothing at all.
+// decimals are what the f3 screen hands you, so they parse too (rounded here).
+const COORD_NUM = String.raw`[-+]?\d+(?:\.\d+)?`;
+const TRAVEL_COORD_RE = new RegExp(
+    String.raw`\b(?:go(?:to)?|move|walk|head|run|travel|come)\s+(?:(?:over\s+)?to\s+|over\s+)?` +
+    // the middle label is y in a three-number ask and z in a two-number one
+    String.raw`(?:x\s*[:=]?\s*)?(${COORD_NUM})\s*[, ]\s*(?:[yz]\s*[:=]?\s*)?(${COORD_NUM})` +
+    String.raw`(?:\s*[, ]\s*(?:z\s*[:=]?\s*)?(${COORD_NUM}))?`,
+    'i'
+);
+// the edge of the world, same bound the bridge enforces before a goto is built
+const WORLD_EDGE = 29999984;
 export const FOOD_RE = /(bread|apple|carrot|potato|beef|porkchop|mutton|chicken|cod|salmon|rabbit|stew|melon|berries|cooked_|golden_apple|pumpkin_pie|honey_bottle|dried_kelp)/;
 // how long to leave survival prep alone after an attempt, so a missing-inventory
 // telemetry gap can't turn "craft a pickaxe" into the only thing she ever does.
@@ -317,8 +439,8 @@ const DROWNED_BEARING_CAP = 24;
 // committed long-distance destination is remembered and refused for a while.
 const RECENT_DESTINATION_CAP = 96;
 // "where have i already looked" is a SEARCH memory, not a ping-pong guard. at 30
-// minutes it was forgotten mid-hunt and the same land got re-checked, and a process
-// restart wiped it outright (it was ram-only). hours, persisted, so a long hunt for
+// minutes she forgot mid-hunt and re-checked the same land, and a burnt restart
+// wiped it outright (it was ram-only). hours, persisted, so a night of hunting for
 // unclaimed land actually covers new ground. the relaxed pass in _pickLandingSpot
 // stops a long memory from ever boxing her in.
 const RECENT_DESTINATION_TTL_MS = 6 * 60 * 60 * 1000;
@@ -328,14 +450,136 @@ const RECENT_DESTINATION_RADIUS = 140;        // blocks: wider than a claim, tig
 // back is never caught (she started at A, so A was never a recorded destination), but
 // applying it to short drifts (120-180 blocks) would fight the 140-block radius.
 const LONG_RELOCATION_MIN = 300;
+// AltoClef's own distress signal. an unreachable goto NEVER fails - GetToBlockTask has
+// no failure state, it just falls into TimeoutWanderTask with an escalating radius
+// (5, 10, 15, 20, 25, 30...) and retries forever, which on stream looks exactly like
+// walking back and forth between two spots. watching that ladder climb is the only
+// honest "this target cannot be reached" the game ever gives us.
+const WANDER_ESCALATION_LIMIT = 3;
+// ...except the radius only climbs while ONE TimeoutWanderTask instance survives.
+// When the parent task tree is rebuilt instead, AltoClef constructs a fresh
+// TimeoutWanderTask(5, true) and the radius restarts at 5 - so the ladder never
+// climbs and an escalation-only detector is blind to it. That is the COMMON shape,
+// not the rare one: measured 33 wanders in 311s and 21 in 327s across the game
+// logs, every single one "wander for 5.0 blocks", with nothing to end them but the
+// 5-minute loop detector. So also count wander EPISODES in a window - a goal that
+// has to re-unstick itself this often is not travelling, whatever the radius says.
+const WANDER_STORM_WINDOW_MS = 75 * 1000;
+const WANDER_STORM_LIMIT = 3;
+// Actions that legitimately shimmy in place while working a site: PlaceBlockTask,
+// PlaceBlockNearbyTask and CraftInTableTask each own a finite TimeoutWanderTask, so
+// a burst of short wanders there is normal work, not a wedge. They already have
+// their own budgets (ACTION_STALL_MS / survey telemetry). The storm rule is for
+// travel and for goals that are supposed to be getting somewhere.
+const WANDER_STORM_EXEMPT = new Set(['build_settlement', 'install_appliance', 'place', 'craft']);
+// WEDGED IN ONE SPOT. see _noteStallHere: aborts counted BY PLACE rather than by
+// job, because every other recovery here answers "that task failed" and none of
+// them can answer "this ground is the problem". three inside a few blocks is not
+// bad luck with tasks.
+const STUCK_STREAK = 3;
+const STUCK_RADIUS = 6;               // blocks: "the same spot", not "the same area"
+const STUCK_WINDOW_MS = 8 * 60 * 1000;
+// the break-out is a DOOR, not a journey. long destinations are exactly the ones
+// that could not be pathed, so asking for another one is asking for the freeze.
+const STUCK_ESCAPE_MAX = 64;
 const HOMESTEAD_STEP_COOLDOWN_MS = 4 * 60 * 1000;
-const HOMESTEAD_BIAS = 0.75;                       // chance the arc outranks the mood menu
-const HOMESTEAD_SETTLE_DIST_MP = 450;              // min blocks from session anchor (multiplayer)
-const HOMESTEAD_SETTLE_DIST_SP = 120;              // min blocks (singleplayer)
+const HOMESTEAD_SETTLE_DIST_MP = 1100;             // min blocks from session anchor (multiplayer)
+const HOMESTEAD_SETTLE_DIST_SP = 350;              // min blocks (singleplayer)
+// How far one "get out of the settled ring" hop reaches. Was 500-900 on a
+// server: far enough to leave spawn, nowhere near far enough to leave the part
+// of the map people actually live on, so every site she surfaced at was already
+// somebody's. Each hop is still clamped by BLIND_WANDER_MAX when the route
+// ahead is unknown, so this is a direction of travel, not one blind leap.
+const VENTURE_MIN_MP = 1200;
+const VENTURE_SPAN_MP = 1400;
+const VENTURE_MIN_SP = 400;
+const VENTURE_SPAN_SP = 400;
 const HOMESTEAD_NEAR_HOME = 32;                    // "at home" radius for placement steps
-const TOASTER_FURNACE_TARGET = 24;
-const TOASTER_NEAR_RADIUS = 40;
-const OUTPOST_MIN_HOME_DISTANCE = 180;
+const HOME_RELOCATION_MIN_DISTANCE = 1200;         // beyond this, one proven-bad home route may become a move
+const HOME_SEARCH_STEP_COOLDOWN_MS = 45 * 1000;
+const HOME_SEARCH_MIN_DISTANCE = 48;
+const HOME_SEARCH_MAX_DISTANCE = 160;
+const HOME_SEARCH_MAX_ATTEMPTS = 6;
+const HOME_SEARCH_MAX_ORIGIN_RADIUS = 360;
+const HOME_RELOCATION_BACKOFF_MS = 15 * 60 * 1000;
+// THE SPAWN REGION. On a community server the land around world spawn is one
+// enormous block she can never own - spawn protection, warps, and the ring of
+// plots everyone claimed on day one. Both of her existing memories are the wrong
+// SHAPE to describe it: a protection refusal marks 64-block cells spread one cell
+// either way (192 blocks across), and the nearby-home hunt never reaches further
+// than HOME_SEARCH_MAX_ORIGIN_RADIUS from where it began. So when she respawned
+// at spawn with an unreachable home she searched, was refused, gave up, backed
+// off and searched again forever, every single candidate inside the same unusable
+// box - the live "heading to a better nearby home site" loop. Modelled as a
+// CUBOID because that is the shape server region plugins actually use, and only
+// ever applied on multiplayer: her own singleplayer world is all hers.
+const SPAWN_EXCLUSION_RADIUS = Math.max(0, parseInt(process.env.MINECRAFT_SPAWN_EXCLUSION || '1000', 10) || 0);
+const SPAWN_EXCLUSION_CENTER = (() => {
+    const raw = String(process.env.MINECRAFT_SPAWN_CENTER || '0,0').split(',').map(Number);
+    return { x: Number.isFinite(raw[0]) ? raw[0] : 0, z: Number.isFinite(raw[1]) ? raw[1] : 0 };
+})();
+// leaving is a MARCH, not one leap - an unknown route is still clipped to
+// BLIND_WANDER_MAX, so she crosses the region a hop at a time and each hop only
+// has to earn ground outward. below this gain a "way out" is just shuffling.
+const SPAWN_ESCAPE_MIN_GAIN = 60;
+// INSIDE THE REGION HER OWN AUTONOMY MAY ONLY MOVE AND STAY ALIVE. refusing to
+// SETTLE there was not enough by half: survival prep chops wood and mines stone,
+// the homestead arc quarries, the idle menu collects, and the last-resort branch
+// does a "small wood run" - so she stood in the server's front garden felling
+// its trees while technically declining to live there. the rule has to bind
+// every world-touching action she chooses for herself, not just the home site.
+// the operator, chat and the safety chain are all still free to ask for anything.
+const SPAWN_REGION_ALLOWED_ACTIONS = new Set([
+    'move', 'go_home', 'follow', 'explore',                     // getting out, or getting to someone
+    'eat', 'defend', 'attack', 'cover_lava', 'boat', 'equip'    // staying alive on the way
+]);
+// her own choices, as opposed to a person's instruction or the safety chain
+const SPAWN_REGION_GATED_SOURCES = new Set(['autonomous', 'agent']);
+// stop a little PAST the edge: standing exactly on the boundary means the first
+// site she assesses forty blocks the wrong way is inside again.
+const SPAWN_ESCAPE_MARGIN = 240;
+// short: a completed hop wakes the loop ~6s later, and a 30s gate meant she then
+// waited for the NEXT 25s tick - half the march was standing at the roadside.
+const SPAWN_ESCAPE_COOLDOWN_MS = 10 * 1000;
+// Enough open air for the toaster's fixed 14x9 footprint plus elbow room. It
+// was 21, sized for a shell that started at 19 wide and GREW - a rule the fixed
+// floorplan retired, and one that now turns down sites the house fits in easily.
+// How many surveyed columns may show somebody's blockwork before the ground
+// counts as occupied. Not zero: one fence post from a ruin or a stray village
+// path 48 blocks out should not condemn a whole valley. Anything that is
+// actually a base or a village lights up dozens of columns at once.
+const BUILT_GROUND_TOLERANCE = 3;
+// Verdicts that are about the GROUND and will still be true tomorrow. Hostiles
+// and passing players are not - they must never condemn a site permanently.
+const SITE_GROUND_REASONS = /not enough open room|uneven footing|terrain too steep|water|no open sky|awkward elevation|lava|not in the overworld/;
+const REJECTED_CELL_CAP = 4000;
+const HOME_SITE_MIN_CLEAR_EDGE = 17;
+// the site-standard ladder in _homeSiteAssessment only defines rungs 0-3 (rung 3
+// waives the open-sky rule). anything past 3 is not "less fussy", it is no
+// standard at all, so relax is clamped here.
+const HOME_SITE_MAX_RELAX = 3;
+// THE GO-HOME LOOP. observed live: home 2620 blocks away across ocean on a server,
+// the homestead arc re-issuing go_home every 4 minutes for FIVE HOURS, each walk
+// shredded by drowned inside ten seconds. every existing guard missed it - the wander
+// ladder never climbed (baritone kept finding fresh paths), _avoidAction compared
+// against 'move' because go_home is rewritten before the goal record is built, and
+// relocation demanded goal.source === 'autonomous' plus 1200 blocks. so give her the
+// judgement a person has: if setting out for home keeps failing and the gap never
+// closes, that home is unreachable - go build somewhere else.
+const HOME_UNREACHABLE_ATTEMPTS = 4;                // failed departures before the home is suspect
+const HOME_UNREACHABLE_CAMPAIGN_MS = 25 * 60 * 1000; // ...or this long trying, whichever lands first
+const HOME_PROGRESS_FRACTION = 0.35;                // closed this much of the gap = the route works, keep walking
+const HOME_CAMPAIGN_STALE_MS = 6 * 60 * 60 * 1000;  // no departure this long = the doubt has expired
+const HOME_UNREACHABLE_MIN_DISTANCE = 96;           // never abandon a home she is basically standing in
+const HOME_INSTINCT_COOLDOWN_MS = 6 * 60 * 1000;    // the night pull is a pull, not a metronome
+// the relocation search itself suppresses the idle menu (a bounded nearby hunt must not
+// be dragged 500 blocks by boredom), so it MUST be wall-clock bounded too. a search that
+// can never find a candidate would otherwise be a brand new way to stand still forever -
+// the exact failure this whole change exists to remove.
+const HOME_RELOCATION_MAX_MS = 20 * 60 * 1000;
+// people rows are upserted in place, so re-writing one is cheap but pointless churn.
+// significant contact (they spoke, asked for something, took bread) bypasses this.
+const PLAYER_RAG_THROTTLE_MS = 5 * 60 * 1000;
 // THE OBSESSION: furnaces, smokers, bread, fire. the homestead arc provisions the
 // first of each once; this is the part that never finishes. a person with a
 // fixation doesn't tick it off a list - she keeps the fuel bin full, keeps adding
@@ -349,12 +593,51 @@ const FUEL_FLOOR = 8;                              // below this she goes and ge
 const FUEL_COMFORT = 24;                           // a fuel bin she's happy with
 const BREAD_FLOOR = 4;                             // below this the bread pipeline runs
 const BREAD_COMFORT = 8;
-// how many units of each kind the collection wants before she stops adding.
-// the plain furnace is the one she hoards - it's the toaster.
-const OVEN_TARGETS = { furnace: 3, smoker: 2, campfire: 2, blast_furnace: 1 };
+// what she'd LIKE to be carrying, as opposed to what survival needs. bread is the
+// whole personality: she wants a stupid amount of it on her at all times, partly to
+// eat and mostly so she always has some to hand to whoever turns up. kept as a
+// separate, LOWER-priority step than BREAD_COMFORT for the same reason the oven
+// hoard is separate from OVEN_TARGETS - one big number would outrank tools, fire and
+// shelter, and she'd stand in a field baking while a creeper walked up.
+const BREAD_HOARD = 32;
+// she will hand out bread down to this, never past it. giving away her last loaf is
+// generosity that ends with her starving on stream.
+const BREAD_KEEP_BACK = 3;
+// Specialty targets. Plain furnaces and the first smoker are managed by the
+// deterministic floorplan gallery instead of this secondary collection.
+const OVEN_TARGETS = { furnace: 3, smoker: 2, campfire: 2, blast_furnace: 1, soul_campfire: 1 };
+// How many of each appliance the floorplan holds, counting all three courses of
+// every stack. Read off the map rather than typed here, so redrawing the plan
+// moves the target with it instead of leaving a stale 24 behind.
+const TOASTER_FURNACE_TARGET = toasterFixtureTarget('homestead', 'furnace');
+const TOASTER_SMOKER_TARGET = toasterFixtureTarget('homestead', 'smoker');
+const TOASTER_CHEST_TARGET = toasterFixtureTarget('homestead', 'chest');
+const TOASTER_NEAR_RADIUS = 40;
+// How stale the in-game survey may get during the gallery phase before she
+// walks the house again. The build task is the ONLY thing that ever looks at
+// the toaster, and it stops the moment the shell is finished - so without this
+// nothing re-reads the world for the entire time she is filling it, and the
+// world can never correct a booking it cannot see.
+const GALLERY_RESURVEY_MS = 15 * 60 * 1000;
+// How long a yard that REFUSED TO SHRINK is left alone.
+//
+// The yard is the one homestead step whose size the plan cannot know, so it is
+// also the one that can turn out to be impossible - a block inside a cliff she
+// cannot path to, a stump under someone's protected fence. The normal 4-minute
+// step cooldown would then walk her out to swing at the same unreachable block
+// every four minutes for the rest of the stream, which is not a freeze but is
+// indistinguishable from one to watch. One retry an hour is enough to pick the
+// job back up if the world changes, and rare enough to stop being the show.
+const YARD_STUCK_BACKOFF_MS = 60 * 60 * 1000;
+const OUTPOST_MIN_HOME_DISTANCE = 180;
 // what she needs before an oven kind is even craftable, so the drive never asks
 // for a blast furnace with no iron and burns a cooldown on a doomed goal.
-const OVEN_PREREQ = { blast_furnace: /iron_ingot|iron_block/ };
+const OVEN_PREREQ = {
+    blast_furnace: /iron_ingot|iron_block/,
+    // a soul campfire is nether shopping. without this she wants one she cannot make
+    // and burns the collection's cooldown on a doomed craft every five minutes.
+    soul_campfire: /soul_sand|soul_soil/
+};
 const MAX_LAVA_PILGRIMAGES = 1;                    // per home; a shrine, not a hobby
 const SAFETY_INTERVENTION_COOLDOWN_MS = 12 * 1000;
 // how long the "too hurt, do nothing" answer may hold her before it gives up and
@@ -363,11 +646,11 @@ const SAFETY_INTERVENTION_COOLDOWN_MS = 12 * 1000;
 // the park is exactly the condition that keeps it true.
 const LOW_HEALTH_PARK_MAX_MS = 45 * 1000;
 // the urgent-safety branch returns before EVERY other behaviour, so a safety
-// answer that never resolves is not caution - it is a hang. found live: the game
-// refused every eat ("nothing edible in the inventory") while she was carrying
-// bread, so the low-health branch re-issued `eat` on every tick and nothing else
-// ever ran. the goal showed on screen and absolutely nothing happened, until the
-// world was closed. safety gets a ceiling and then has to share.
+// answer that never resolves is not caution - it is a hang. found live
+// 2026-08-01: the game refused every eat ("nothing edible in the inventory")
+// while she was carrying bread, so the 8hp branch re-issued `eat` on every tick
+// and nothing else ever ran. goal "eat" on screen, absolutely nothing happening,
+// until the world was closed. safety gets a ceiling and then has to share.
 const URGENT_SAFETY_MAX_MS = 90 * 1000;    // how long safety may own the loop
 const URGENT_SAFETY_YIELD_MS = 60 * 1000;  // then the rest of the brain gets a turn
 // consecutive failed eats after which eating is treated as unavailable instead
@@ -401,6 +684,12 @@ function defaultGameState() {
         nearbyPlayers: 0,
         biome: 'unknown',
         weather: 'clear',
+        // the sky's mood vs HER weather. `weather` is global (a desert, a cave
+        // and the nether all report rain); `rainingHere` is the companion's
+        // isRainingAt, which is biome-, sky- and roof-aware, so it is the only
+        // one that means "she is getting wet right now".
+        rainingHere: false,
+        skyVisible: true,
         xpLevel: 0,
         selectedItem: 'empty',
         offhandItem: 'empty',
@@ -410,6 +699,7 @@ function defaultGameState() {
         inLava: false,
         inWater: false,
         underwater: false,
+        overWater: false,
         isInCombat: false,
         currentTask: null,
         settlementBuild: null,
@@ -448,7 +738,7 @@ function mcCompletionLabel(action, params) {
         case 'give': return t ? `handed over ${t}` : 'gave items';
         case 'locate': return t ? `found the ${t}` : 'located a structure';
         case 'place': return t ? `placed ${t.replace(/_/g, ' ')} at the spot` : 'placed a block';
-        case 'install_appliance': return t ? `installed ${t.replace(/_/g, ' ')} in the toaster gallery` : 'installed an appliance';
+        case 'install_appliance': return t ? `installed ${t.replace(/_/g, ' ')} in its slot in the toaster` : 'installed an appliance';
         case 'build_settlement': return `finished the ${String(params.role || 'toaster').replace(/_/g, ' ')}`;
         case 'build': return 'built something';
         default: return null; // status/coords/inventory/idle/stop/etc - not accomplishments
@@ -456,13 +746,18 @@ function mcCompletionLabel(action, params) {
 }
 
 class MinecraftTool extends EventEmitter {
-    constructor({ memory = null, registerMemoryExitHook = true, names = null, broadcast = null } = {}) {
+    constructor({ memory = null, registerMemoryExitHook = true, names = null, broadcast = null, remember = null } = {}) {
         super();
 
         // names she answers to on a public server (see buildAddressedRe above).
         if (names) setBotNames(names);
         // optional sink for internal commentary cues, mirrored to your UI.
         this.broadcast = broadcast;
+        // optional long-term-memory sink. this library has no database of its
+        // own; if your brain keeps one, pass { player, gameplay } callbacks and
+        // the milestones worth recalling tomorrow get handed over. see
+        // _rememberMilestone / _bridgePlayerToMemory below.
+        this.remember = remember;
 
         this.config = {
             port: DEFAULT_PORT,
@@ -545,6 +840,9 @@ class MinecraftTool extends EventEmitter {
         this._lastCompletionAt = 0;
         // when a real task last finished OR failed - gates the idle menu grace
         this._lastTaskOutcomeAt = 0;
+        // one-shot wake so the post-outcome grace ends on its own schedule
+        // instead of whenever the 25s tick next happens to look
+        this._idleWakeTimer = null;
         // Per-step cooldowns keep a failed prep goal from looping without making
         // her wait four minutes between acquiring a pickaxe, food, and a sword.
         this._survivalPrepCooldowns = new Map();
@@ -559,6 +857,13 @@ class MinecraftTool extends EventEmitter {
         this._chatSenderLastAt = new Map();
         this._lastAmbientChatAt = 0;
         this._chatSendTimes = [];
+        // last time a move was refused for having nowhere to go (see the rejection
+        // site) - a second one in quick succession gets a different answer
+        this._lastNowhereMoveAt = 0;
+        // open exchanges: who she is currently in a back-and-forth with, so their
+        // follow-ups reach her without her name in them (see CHAT_EXCHANGE_MS)
+        this._chatExchanges = new Map();  // senderKey -> { until, since, name }
+        this._recentAddressers = [];      // who addressed her lately, awaiting her reply
         // "just standing there" guards: when she last took a hit, and how long a
         // task has been running with no burnt-side goal behind it
         this._lastDamageAt = 0;
@@ -568,7 +873,6 @@ class MinecraftTool extends EventEmitter {
         this._lastEatAttemptAt = 0;
         this._lastEatFailureAt = 0;
         this._eatFailStreak = 0;
-        this._lowHealthParkedAt = 0;
         // how long the urgent-safety branch has continuously owned the tick
         this._urgentSafetySince = 0;
         this._urgentSafetyYieldUntil = 0;
@@ -585,8 +889,11 @@ class MinecraftTool extends EventEmitter {
         this.manualControl = false;
         // homestead drive state
         this._homesteadCooldowns = new Map();
+        this._homesteadArmed = null;      // cooldown armed by the last pass, released if refused
         this._lastSettlementProgressSignature = '';
         this._sessionAnchor = null;
+        this._homeRelocation = null;
+        this._homeRelocationBackoffUntil = 0;
         this._lastWheatRecordAt = 0;
         // the obsession (ovens / bread / fire): its own cooldown map so a stalled
         // homestead step can't starve the drive that never finishes, and vice versa
@@ -621,19 +928,24 @@ class MinecraftTool extends EventEmitter {
         // swam; a bearing records the whole arc of sea behind it.
         this._drownedBearings = [];
         this._claimedCells = new Set();      // ground the server refused her, persisted
+        // ground she walked out to, assessed, and turned down. session-scoped:
+        // terrain never improves, but a fresh run deserves a fresh look in case
+        // the standards themselves changed.
+        this._rejectedCells = new Set();
         this._recentDestinations = [];       // where she has just been sent (anti-ping-pong)
         // server protection denials ("you are not allowed to interact...") -
         // repeated hits mean claimed land: abort the goal and relocate far
         this._protectionDenials = [];
+        this._stallAnchor = null;      // wedged-in-one-spot detector (see _noteStallHere)
         this._lastProtectionEscapeAt = 0;
         this._escapingProtection = false;
 
         this.autonomousTimer = null;
         this.lastAutonomousAt = 0;
-        // One cancellation barrier serializes stop -> replacement. Without it,
-        // the late stop can cancel the new task that was just dispatched.
+        // Singular cancellation barrier. A replacement task waits for the
+        // currently dispatched stop to be confirmed instead of racing it onto
+        // the wire and being immediately cancelled by the older transition.
         this._stopInFlight = null;
-        // Rapid double-clicks on the gamer button share the same transition.
         this._gamerStartInFlight = null;
     }
 
@@ -896,6 +1208,8 @@ class MinecraftTool extends EventEmitter {
         this.manualControl = false;
         this._protectionDenials = [];
         this._sessionAnchor = null;
+        this._stallAnchor = null;
+        this._homeRelocation = null;
         this._lavaPilgrimages = 0;
         // forget what the hud was last told, so a reconnect re-pushes instead of
         // trusting a line that only exists in the old game's memory
@@ -937,8 +1251,8 @@ class MinecraftTool extends EventEmitter {
             this.emit('actionAck', { id: msg.action_id, action: pending.action });
             // Tool-initiated finite jobs return as soon as the game accepts
             // them, so they need the same stall/loop supervision as autonomous
-            // jobs. Persistent behaviours (follow/explore/idle) remain visible
-            // in status but are deliberately not auto-stopped by the watchdog.
+            // jobs. Idle/follow remain visible but may legitimately stand;
+            // explore is persistent yet still receives movement supervision.
             if (!NON_TASK_ACTIONS.has(pending.action) &&
                 (pending.source === 'autonomous' || !pending.waitForCompletion)) {
                 this._trackActiveGoal(pending, msg.action_id);
@@ -983,27 +1297,61 @@ class MinecraftTool extends EventEmitter {
         }
         this.stats.actionsRun++;
         // a terminal speedrun outcome (finished, failed, or superseded by a stop)
-        // ends gamer mode; the run is no longer live to narrate.
-        if (pending.action === 'speedrun') {
-            this.gamerMode = false;
-            this._lastBotTaskPhase = '';
-        }
+        // ends gamer mode; the run is no longer live to narrate. this is the exit
+        // that fires when a viewer/llm goal PREEMPTS the run, so it has to hand
+        // self-play back too - otherwise "burnt, build your house instead" ends
+        // the speedrun and silently ends idle play with it.
+        this._noteTaskEnded(pending.action);
 
         if (pending.action === 'eat') this._noteEatOutcome(msg.status === 'success');
+
+        // a goal WE aborted is not a goal she finished (see _markPendingAborted).
+        // the game cannot tell us apart - it reports a cancelled task exactly like
+        // a completed one - so the only place that knows is here, where our own
+        // stop is still remembered against this action id. treat it as the
+        // interruption it was: no completion memory, no "finished the toaster",
+        // no arc step ticked off, and no cooldown earned by a house that isn't up.
+        if (msg.status === 'success' && pending.abortedByRecovery) {
+            this.log('warn', `${pending.action} came back finished after we stopped it (${pending.abortedByRecovery}) - recording an abort, not a build`);
+            if (!pending.settled) {
+                pending.settled = true;
+                pending.reject(new Error(`stopped: ${pending.abortedByRecovery}`));
+            }
+            // deliberately silent: the watchdog that issued the stop has already
+            // recorded the failure and put the words in her mouth. emitting
+            // actionFailed here would hand the same abort to burnt.js's fault
+            // voice as well, and she would complain about it twice.
+            return;
+        }
 
         if (msg.status === 'success') {
             if (msg.result?.persistent) {
                 this.emit('actionStarted', { id: msg.action_id, action: pending.action, params: pending.params, result: msg.result });
             } else {
-                if (!NON_TASK_ACTIONS.has(pending.action)) this._lastTaskOutcomeAt = Date.now();
-                if (!NON_TASK_ACTIONS.has(pending.action)) this._applyMinecraftOutcome(true, pending.action);
+                const notable = !NON_TASK_ACTIONS.has(pending.action);
+                if (notable) this._noteTaskOutcome();
+                if (notable) this._applyMinecraftOutcome(true, pending.action);
                 this._recordCompletion(pending.action, pending.params);
-                this.memory.record('completed', this._describeTask(pending.action, pending.params || {}), {
-                    action: pending.action,
-                    target: pending.params?.target,
-                    position: this.gameState.position,
-                    dimension: this.gameState.dimension
-                });
+                // the two lines above already filter NON_TASK_ACTIONS; this one did not,
+                // so the cosmetic 30s `hud` heartbeat was written to the durable journal
+                // as a completed task. it filled 208 of 240 slots and evicted every real
+                // memory - her "game memory:" prompt line was six copies of the word hud.
+                // chat is exempted too: her own outgoing lines were being stored with no
+                // addressee and no prompting message, which is not a memory of anything.
+                if (notable) {
+                    this.memory.record('completed', this._describeTask(pending.action, pending.params || {}), {
+                        action: pending.action,
+                        target: pending.params?.target,
+                        position: this.gameState.position,
+                        dimension: this.gameState.dimension
+                    });
+                    // somebody asked for this and she actually did it. closing the
+                    // request is what turns her people memory from a list of demands
+                    // into a record of what she followed through on.
+                    if (pending.requestedBy) {
+                        try { this.memory.completePlayerRequest(pending.requestedBy, pending.action); } catch { /* best-effort */ }
+                    }
+                }
                 this.emit('actionComplete', { id: msg.action_id, action: pending.action, params: pending.params, result: msg.result });
             }
             if (!pending.settled) {
@@ -1019,7 +1367,7 @@ class MinecraftTool extends EventEmitter {
             // burnt announce a failure that never happened.
             const wasStopped = /^task stopped$/i.test((error.message || '').trim());
             if (!NON_TASK_ACTIONS.has(pending.action)) {
-                this._lastTaskOutcomeAt = Date.now();
+                this._noteTaskOutcome();
                 if (!wasStopped) this.memory.recordFailure(pending.action, pending.params?.target, error.message);
             }
             if (this.activeGoal?.id === msg.action_id) this.activeGoal = null;
@@ -1029,6 +1377,9 @@ class MinecraftTool extends EventEmitter {
                 this.emit('actionStopped', { id: msg.action_id, action: pending.action, params: pending.params });
             } else {
                 if (!NON_TASK_ACTIONS.has(pending.action)) this._applyMinecraftOutcome(false, pending.action);
+                // mark it so executeAction's catch does not report the same failure a
+                // second time when this rejection surfaces there.
+                error._reported = true;
                 this.emit('actionFailed', { id: msg.action_id, action: pending.action, params: pending.params, error: error.message });
             }
             if (!pending.settled) {
@@ -1087,20 +1438,28 @@ class MinecraftTool extends EventEmitter {
         // State arrives about every two seconds; water recovery must not wait for
         // the slower autonomous-choice cadence. It also protects operator/LLM
         // goals when self-play is disabled.
+        if (freshObservation && this.connected && this.gameConnected) {
+            // Cosmetic state belongs to the live game connection, not autonomy.
+            // Keep affects visible while Burnt is enabled but idle/manual, too.
+            this._pushIntentHud();
+        }
         if (freshObservation && this.enabled && this.connected && this.gameConnected) {
-            // WATER GOES FIRST. it used to run after _recoverPinnedByMobs, which
-            // `return`s when it fires - so any tick where she was pinned by mobs
-            // skipped the water check entirely. that is exactly the state that
-            // strands her in the sea, so the one watchdog with a hard deadline was
-            // starved precisely when it was needed. it returns true only while an
-            // escape is genuinely still closing on land.
+            // WATER GOES FIRST. it used to run third, behind two recoveries that
+            // `return` when they fire - so any tick where she was pinned by mobs or
+            // chasing an unreachable target skipped the water check entirely. those
+            // are exactly the states that strand her in the sea, so the one watchdog
+            // with a hard deadline was starved precisely when it was needed. it
+            // returns true only while an escape is genuinely still closing on land,
+            // and that legitimately outranks both of the others.
             if (this._waterWatchdog()) return;
-            // State is the watchdog clock, so a 20s craft deadline does not wait
-            // for the slower autonomous tick and still applies with self-play off.
+            // State arrives every ~2s, so use it as the progress watchdog clock.
+            // Waiting for the 25s autonomy tick made even a 20s craft deadline land
+            // anywhere from 25-50s later, and did nothing when self-play was off.
             if (this._recoverStalledGoal()) return;
             if (this._recoverPinnedByMobs()) return;
-            this._pushIntentHud();
+            if (this._observeUnreachableTarget()) return;
             this._maybeNarrateToRoom();
+            this._maybeGreetArrival();
         }
     }
 
@@ -1109,6 +1468,70 @@ class MinecraftTool extends EventEmitter {
     // nudge her brain to volunteer a line in game - a CUE, never a written line,
     // so the words are hers (see the no-canned-responses rule). rare and sampled:
     // company, not a commentary track.
+    // SOMEBODY WALKED UP TO HER.
+    //
+    // bread is the whole personality, so an arrival is an opportunity: throw them a
+    // loaf, offer them one, or just say something. WHICH of those happens is decided
+    // here; WHAT SHE SAYS is never decided here - the gesture goes out as an event
+    // and her brain writes the words (see the no-canned-responses rule). the throw
+    // is a real `@give <player> bread 1`, so the loaf genuinely leaves her inventory
+    // and lands at their feet.
+    //
+    // deliberately restrained: sampled, rate-limited globally AND per person, and it
+    // never interrupts work she is already doing. a bot that greets every passer-by
+    // every time is a nuisance, and one that drops its task to do it is broken.
+    _maybeGreetArrival(now = Date.now()) {
+        const g = this.gameState;
+        if (!this.enabled || this.manualControl) return false;
+        if (g.multiplayer !== true || !this.gameConnected) return false;
+        // never yank her out of something to hand out bread
+        if (this.currentAction || this.activeGoal || this.pendingActions?.size) return false;
+
+        const nearby = (Array.isArray(g.nearbyPlayerNames) ? g.nearbyPlayerNames : [])
+            .map((n) => String(n || '').trim())
+            .filter((n) => n && /^[A-Za-z0-9_]{1,16}$/.test(n)
+                && n.toLowerCase() !== String(this.gameUsername || '').toLowerCase());
+
+        if (!this._seenNearby) this._seenNearby = new Map();
+        // ARRIVALS ONLY: someone already standing there is not an event. a name that
+        // dropped out and came back inside the per-player window is not one either -
+        // people drift across render distance constantly and that is not "walking up".
+        const arrivals = nearby.filter((n) => now - (this._seenNearby.get(n) || 0) > ARRIVAL_PER_PLAYER_GAP_MS);
+        for (const n of nearby) this._seenNearby.set(n, now);
+        // forget people who left long ago so the map cannot grow forever
+        if (this._seenNearby.size > 64) {
+            for (const [k, at] of this._seenNearby) {
+                if (now - at > ARRIVAL_PER_PLAYER_GAP_MS * 2) this._seenNearby.delete(k);
+            }
+        }
+        if (!arrivals.length) return false;
+        if (now - (this._lastArrivalAt || 0) < ARRIVAL_GAP_MS) return false;
+        if (Math.random() > ARRIVAL_SAMPLE) return false;
+
+        const who = arrivals[Math.floor(Math.random() * arrivals.length)];
+        const loaves = this._breadCount();
+        const canSpare = loaves > BREAD_KEEP_BACK;
+        // with bread to spare she usually makes it about bread; otherwise she just
+        // talks. offering rather than throwing keeps it from being a vending machine.
+        let gesture = 'talk';
+        if (canSpare && Math.random() < ARRIVAL_BREAD_SHARE) {
+            gesture = Math.random() < 0.6 ? 'give' : 'offer';
+        }
+        this._lastArrivalAt = now;
+
+        if (gesture === 'give') {
+            // a real throw - the loaf leaves her inventory and lands at their feet
+            this._safeExecute('give', { player: who, item: 'bread', amount: 1 }, null);
+        }
+        this._rememberPlayerDurably('sighting', who);
+        if (gesture === 'give') this._rememberPlayerDurably('gift', who, 'bread');
+        this.recentEvents.record(`${who} walked up${gesture === 'give' ? ' and got a loaf' : ''}`);
+        this.emit('gameEvent', 'player_approached', {
+            player: who, gesture, loaves, alsoNearby: nearby.filter((n) => n !== who).slice(0, 4)
+        });
+        return true;
+    }
+
     _maybeNarrateToRoom(now = Date.now()) {
         if (this.manualControl) return;
         const room = this.chatRoom(now);
@@ -1261,6 +1684,10 @@ class MinecraftTool extends EventEmitter {
                 break;
             case 'weather_changed':
                 if (data.weather) this.gameState.weather = data.weather;
+                // the reaction below decides whether to walk home, so it needs
+                // "is it on ME" before the next 2s state packet, not after.
+                if (typeof data.rainingHere === 'boolean') this.gameState.rainingHere = data.rainingHere;
+                if (typeof data.skyVisible === 'boolean') this.gameState.skyVisible = data.skyVisible;
                 break;
             case 'hostiles_nearby':
                 if (typeof data.count === 'number') this.gameState.nearbyHostiles = data.count;
@@ -1383,7 +1810,19 @@ class MinecraftTool extends EventEmitter {
     _recordObsessionCompletion(action, params) {
         const target = String(params.target || '').toLowerCase().replace(/^minecraft:/, '');
         try {
-            if ((action === 'place' || action === 'install_appliance') && OVEN_KINDS.includes(target)) {
+            const furnishing = action === 'place' || action === 'install_appliance';
+            if (furnishing && (OVEN_KINDS.includes(target) || target === 'chest' || target === 'crafting_table')) {
+                // the companion cannot tell us "cancelled" - UserTaskChain.cancel runs
+                // the same onFinish path as a real completion, so an F1 takeover or a
+                // stop mid-place arrives here as a SUCCESS. minting an oven from that
+                // invents a furnace that does not exist, and phantom furnaces are
+                // expensive: the count drives furnaceTarget, which regrows the shell and
+                // wipes the survey, so she rebuilds forever for appliances she never
+                // placed. when we know a cancellation was in flight, believe that instead.
+                if (this.manualControl || this._stopInFlight) {
+                    this.log('debug', `not recording ${target} - the place was cancelled, not completed`);
+                    return;
+                }
                 // a finished place is a real new unit, so never merge it into a
                 // neighbour just because she didn't move between installs
                 const exactPosition = [params.x, params.y, params.z].every(Number.isFinite)
@@ -1392,8 +1831,20 @@ class MinecraftTool extends EventEmitter {
                 const settlement = params.settlementId
                     ? this.memory.getSettlement(params.settlementId)
                     : this.memory.listSettlements(this._worldId()).find((entry) => entry.contains(exactPosition, 3));
+                // THE PLAN'S LEDGER: which block of the floorplan is now full,
+                // whatever went into it. Only an exact-coordinate install counts
+                // - a "place one somewhere" has no square to tick off, and
+                // guessing one would retire a slot she never filled.
+                if (settlement && action === 'install_appliance'
+                    && [params.x, params.y, params.z].every(Number.isFinite)) {
+                    this.memory.recordSettlementAppliance(settlement.id, target, exactPosition);
+                }
+                // a chest is furniture, not a unit in the collection - it gets a
+                // block in the plan, never a name and a place in the tally.
+                if (!OVEN_KINDS.includes(target)) return;
                 const recorded = this.memory.recordOven(target, exactPosition, this.gameState.dimension, params.name || null, {
-                    dedupe: false, settlementId: settlement?.id || null
+                    dedupe: false,
+                    settlementId: settlement?.id || null
                 });
                 if (recorded?.isNew) {
                     const tally = this.memory.ovenTally();
@@ -1451,6 +1902,82 @@ class MinecraftTool extends EventEmitter {
         if (event === 'death' || event === 'respawn' || event === 'achievement' || event === 'diamond_found') {
             this.memory.recordLandmark(label || event, { position: data.position || this.gameState.position, dimension: this.gameState.dimension });
         }
+        this._rememberMilestone(event, data, label);
+    }
+
+    // the handful of game events worth carrying between sessions. everything else she
+    // does is already visible as live state; these are the ones a person would still
+    // be telling you about tomorrow, so they are handed to YOUR long-term memory,
+    // where your chat brain can retrieve them long after the journal ring has
+    // rolled over. no sink injected -> these are simply not recorded; this library
+    // owns no database of its own. see the `remember` constructor option.
+    _rememberMilestone(event, data = {}, label = null) {
+        if (typeof this.remember?.gameplay !== 'function') return;
+        const p = this.gameState.position;
+        const where = p && [p.x, p.z].every(Number.isFinite)
+            ? ` at ${Math.round(p.x)},${Math.round(p.z)}` : '';
+        const dim = this.gameState.dimension && this.gameState.dimension !== 'overworld'
+            ? ` in the ${String(this.gameState.dimension).replace(/_/g, ' ')}` : '';
+        const server = this.gameState.multiplayer === true && this.gameState.server
+            ? ` on ${this.gameState.server}` : '';
+        // the in-game username, so the stored line names whoever is actually
+        // playing rather than a hardcoded character.
+        const who = this.gameUsername || 'the bot';
+        let line = null;
+        if (event === 'death') {
+            const cause = data.cause || data.killer || label || 'something';
+            line = `${who} died in minecraft to ${cause}${where}${dim}${server}`;
+        } else if (event === 'diamond_found') {
+            line = `${who} found diamonds in minecraft${where}${dim}${server}`;
+        } else if (event === 'achievement') {
+            line = `${who} unlocked "${data.achievement || label}" in minecraft${server}`;
+        }
+        if (!line) return;
+        try {
+            this.remember.gameplay(line, { tags: [event, String(data.cause || data.killer || '')] });
+        } catch { /* enhancement only */ }
+    }
+
+    // people are upserted, so this can run often - but a row rewrite per sighting is
+    // pointless churn. anything SIGNIFICANT (they spoke, asked, or got bread) writes
+    // immediately; a bare walk-past waits out the throttle.
+    _bridgePlayerToMemory(name, { immediate = false } = {}) {
+        if (typeof this.remember?.player !== 'function') return;
+        const who = String(name || '').trim();
+        if (!who) return;
+        if (!this._rememberPlayerAt) this._rememberPlayerAt = new Map();
+        const key = who.toLowerCase();
+        const now = Date.now();
+        if (!immediate && now - (this._rememberPlayerAt.get(key) || 0) < PLAYER_RAG_THROTTLE_MS) return;
+        this._rememberPlayerAt.set(key, now);
+        if (this._rememberPlayerAt.size > 128) {
+            for (const [k, at] of this._rememberPlayerAt) {
+                if (now - at > PLAYER_RAG_THROTTLE_MS * 4) this._rememberPlayerAt.delete(k);
+            }
+        }
+        try {
+            const player = this.memory.getPlayer(who);
+            if (player) this.remember.player(player, this._worldId());
+        } catch { /* enhancement only */ }
+    }
+
+    // point your long-term memory at the bot after construction. pass null to
+    // unhook. shape: { player(playerRecord, worldId), gameplay(text, { tags }) }
+    setRemember(sink) {
+        this.remember = sink && typeof sink === 'object' ? sink : null;
+        return this.remember;
+    }
+
+    // point internal commentary cues at your UI / overlay. pass null to unhook.
+    setBroadcast(fn) {
+        this.broadcast = typeof fn === 'function' ? fn : null;
+        return this.broadcast;
+    }
+
+    // rename the bot at runtime (which names count as "addressed to her" in
+    // multiplayer chat). same as the `names` constructor option.
+    setBotNames(names) {
+        return setBotNames(names);
     }
 
     // ---- outbound --------------------------------------------------------
@@ -1499,6 +2026,8 @@ class MinecraftTool extends EventEmitter {
         this.enabled = false;
         this.autonomous = false;
         this.gamerMode = false;
+        // a hard off cancels the gamer-mode loan too - nothing to hand back
+        this._autonomyDisarmedByGamer = false;
         this.send({ type: 'config', enabled: false, autonomous: false });
         this.emit('disabled');
         return this.enabled;
@@ -1506,21 +2035,15 @@ class MinecraftTool extends EventEmitter {
 
     setAutonomousMode(on) {
         this.autonomous = !!on;
+        // an explicit set is the new truth: it cancels any pending "gamer mode
+        // borrowed the bot and owes it back" restore. this is what keeps the ■
+        // stop button (modes.js gameControl('stop') -> setAutonomousMode(false))
+        // from being undone a moment later when the speedrun's terminal packet
+        // lands and gamer mode exits.
+        this._autonomyDisarmedByGamer = false;
         this.send({ type: 'config', autonomous: this.autonomous });
         this.log('info', `autonomous mode ${this.autonomous ? 'on' : 'off'}`);
         return this.autonomous;
-    }
-
-    // point internal commentary cues at your UI / overlay. pass null to unhook.
-    setBroadcast(fn) {
-        this.broadcast = typeof fn === 'function' ? fn : null;
-        return this.broadcast;
-    }
-
-    // rename the bot at runtime (which names count as "addressed to her" in
-    // multiplayer chat). same as the `names` constructor option.
-    setBotNames(names) {
-        return setBotNames(names);
     }
 
     setMood(mood) {
@@ -1581,25 +2104,60 @@ class MinecraftTool extends EventEmitter {
             return { started: true, alreadyRunning: true, task: 'speedrun (.gamer)' };
         }
         this.gamerMode = true;
-        this.setAutonomousMode(false); // the speedrun owns the bot; no idle interference
+        // the speedrun owns the bot while it runs, so idle play stands down - but
+        // it is BORROWED, not surrendered. remember whether self-play was on so
+        // _exitGamerMode can hand it back. (set after the call: setAutonomousMode
+        // clears this flag by design.)
+        const hadAutonomy = this.autonomous;
+        this.setAutonomousMode(false);
+        this._autonomyDisarmedByGamer = hadAutonomy;
         this._lastBotTaskPhase = '';
         try {
             const result = await this.executeAction('speedrun', {}, { source: 'gamer', waitForCompletion: false });
             this.emit('gamerMode', { on: true });
             return result;
         } catch (err) {
-            // dispatch failed (offline / stale / busy) - don't leave the flag set
-            this.gamerMode = false;
+            // dispatch failed (offline / stale / busy) - don't leave the flag set,
+            // and give self-play back: the run never started, so nothing borrowed it
+            this._exitGamerMode();
             throw err;
         }
     }
 
-    // leave gamer mode: stop the speedrun and clear the flag. autonomous stays
-    // off (it was disarmed on entry) - the operator/brain re-arms self-play if
-    // they want idle play again.
-    stopGamerMode() {
+    // the one way out of gamer mode. clears the flag and RETURNS self-play if
+    // gamer mode is what took it away.
+    //
+    // this used to be three separate `this.gamerMode = false` sites that all left
+    // `autonomous` off, and nothing anywhere turned it back on. so a single
+    // .gamer speedrun permanently disarmed idle play: _autonomousTick returns at
+    // `if (!this.autonomous) return;` before the homestead arc, the bread run and
+    // the whole idle menu, and she just stood there for the rest of the session
+    // waiting for a human to type "autonomous on". observed 2026-08-05: gamer at
+    // 02:56 -> `autonomous mode off` -> never re-armed -> idle all night.
+    _exitGamerMode() {
         this.gamerMode = false;
         this._lastBotTaskPhase = '';
+        if (this._autonomyDisarmedByGamer) {
+            // setAutonomousMode clears the flag itself
+            this.setAutonomousMode(true);
+            this.log('info', 'gamer mode ended - self-play handed back');
+        }
+    }
+
+    // a speedrun has more than one way to die and only ONE of them was a terminal
+    // response packet. the live case was a preemption: an agent goal dispatches a
+    // stop, and the stop path cancels every other pending record locally
+    // (_dispatchAction's `action === 'stop'` branch) - the speedrun just vanishes
+    // from pendingActions without ever reaching the terminal handler. it can also
+    // time out (_expirePendingAction) or go down with the socket (_failAllPending).
+    // route all of them through here so gamer mode cannot survive its own run.
+    _noteTaskEnded(action) {
+        if (action === 'speedrun' && this.gamerMode) this._exitGamerMode();
+    }
+
+    // leave gamer mode: stop the speedrun and clear the flag.
+    stopGamerMode() {
+        this._exitGamerMode();
         this.emit('gamerMode', { on: false });
         return this.executeAction('stop', {}, { priority: 'urgent', source: 'gamer', waitForCompletion: false });
     }
@@ -1629,16 +2187,17 @@ class MinecraftTool extends EventEmitter {
             // botTask = high-level goal + phase, botAction = concrete micro-action
             botTask: this._cleanPhase(this.gameState.botTask),
             botAction: this._cleanPhase(this.gameState.botAction),
-            botTaskPath: Array.isArray(this.gameState.botTaskPath)
-                ? this.gameState.botTaskPath.map((part) => this._cleanPhase(part)).filter(Boolean)
-                : [],
             activeGoal: this.activeGoal ? {
                 action: this.activeGoal.action,
                 target: this.activeGoal.params?.target || null,
                 source: this.activeGoal.source,
                 runningForMs: Date.now() - this.activeGoal.startedAt,
                 lastProgressAgeMs: Date.now() - this.activeGoal.lastProgressAt,
-                confinedMs: this.activeGoal.anchorAt ? Date.now() - this.activeGoal.anchorAt : 0
+                confinedMs: this.activeGoal.anchorAt ? Date.now() - this.activeGoal.anchorAt : 0,
+                percent: this.activeGoal.action === 'build_settlement'
+                    ? (Number(this.gameState.settlementBuild?.percent) || 0) : null,
+                phase: this.activeGoal.action === 'build_settlement'
+                    ? (this.gameState.settlementBuild?.phase || null) : null
             } : null,
             queued: this.pendingActions.size,
             stats: { ...this.stats },
@@ -1652,12 +2211,22 @@ class MinecraftTool extends EventEmitter {
             server: this.gameState.server || null,
             nearbyPlayerNames: Array.isArray(this.gameState.nearbyPlayerNames) ? this.gameState.nearbyPlayerNames.slice(0, 8) : [],
             favorites: this.memory.favoritesContext(this.gameState.position, this.gameState.dimension),
-            home: this.memory.getHome()?.name || null,
-            homeProject: this.memory.getHome(this._worldId()) ? this._publicHomeProject() : null,
+            home: this._home()?.name || null,
+            homeSpec: this._home() ? this.homeSpecLine() : null,
+            homeProject: this._home() ? this._publicHomeProject() : null,
             settlements: this.memory.listSettlements(this._worldId()).map((entry) => entry.toJSON()),
-            outposts: this.memory.listOutposts(this._worldId()).map((entry) => entry.toJSON()),
+            outposts: this.memory.listOutposts(this._worldId()).map((entry) => ({
+                ...entry.toJSON(), blueprint: toasterBlueprint(entry)
+            })),
             deathSpot: this.memory.getDeathSpot(),
             knownPlayers: this.knownPlayers(12),
+            // knownPlayers above is a RAM roster of who has spoken recently. this is the
+            // durable half: people she actually knows, with what they said, what they
+            // asked for, and whether she ever did it - across restarts.
+            people: this.memory.playersContext(
+                Array.isArray(this.gameState.nearbyPlayerNames) ? this.gameState.nearbyPlayerNames : [],
+                6, this._worldId()
+            ),
             chatRoom: this.chatRoom(),
             wheatSpots: this.memory.wheatSpotsContext(this.gameState.position),
             // the obsession, as live state she can actually speak from: the named
@@ -1679,8 +2248,15 @@ class MinecraftTool extends EventEmitter {
 
     // ---- action dispatch -------------------------------------------------
 
-    // AltoClef owns one task runner. Explicit decisions first cross a confirmed
-    // stop barrier, while autonomous menu choices still wait their turn.
+    // send an action to the bridge and resolve when the bot reports it done.
+    // execute_minecraft() guards connected/enabled before calling, but we
+    // re-check defensively so no caller can hang on a dead socket.
+    // AltoClef owns ONE task runner, so a second goal silently replaces the first -
+    // that is what the busy guard in _dispatchAction exists to prevent. but it had no
+    // notion of WHO was asking, so her own brain calling the minecraft tool got
+    // "minecraft is busy with move home (home)" and she stood there for a minute
+    // unable to change her own mind. a deliberate decision must be able to interrupt
+    // idle work; idle picks still must not stomp each other.
     async executeAction(action, params = {}, opts = {}) {
         try {
             const act = String(action || '').trim().toLowerCase();
@@ -1688,10 +2264,27 @@ class MinecraftTool extends EventEmitter {
             if (act && !NON_TASK_ACTIONS.has(act) && this._stopInFlight) {
                 await this._stopInFlight;
             }
+            // BEFORE ANYTHING ELSE: is she standing in the server's spawn region?
+            // Then nothing she picked for herself may touch the world here. This
+            // sits at the top of the ONE door every action goes through, so it
+            // holds for her brain's tool calls as well as the idle menu - the
+            // menu-level gate alone left "collect oak_log" a live option.
+            const refusal = this._spawnRegionRefusal(act, opts.source, params);
+            if (refusal) {
+                this.log('info', `refused ${act} inside the spawn region`);
+                throw new Error(refusal);
+            }
             const preemption = this._preemptIfWarranted(action, opts);
             if (preemption) await preemption;
             return await this._dispatchAction(action, params, opts);
         } catch (err) {
+            // SURFACE EVERY FAILURE, not just the ones the game reports back.
+            // failures raised HERE - "minecraft is busy with X", a missing required
+            // param, no armour to put on, an unsupported action - rejected straight
+            // out of _dispatchAction and never emitted actionFailed, so they only
+            // ever reached a console.error. the operator could not tell a broken bot from an
+            // idle one. the companion-reported path already emits (and marks the
+            // error), so this only covers the gap and never double-reports.
             if (err && !err._reported) {
                 err._reported = true;
                 const stopped = /^task stopped$/i.test(String(err.message || '').trim());
@@ -1707,8 +2300,9 @@ class MinecraftTool extends EventEmitter {
 
     _runStopTransition(opts = {}) {
         if (this._stopInFlight) return this._stopInFlight;
-        // An executing ACK means only "accepted". Do not release a replacement
-        // until the game confirms that the old task tree is actually gone.
+        // Cancellation is a barrier: an executing ACK only says the command was
+        // accepted, not that the old AltoClef tree is gone. Always wait for the
+        // terminal stop response before releasing a replacement task.
         const stop = this._dispatchAction('stop', {}, { ...opts, waitForCompletion: true });
         let tracked;
         tracked = stop.finally(() => {
@@ -1720,22 +2314,30 @@ class MinecraftTool extends EventEmitter {
 
     _preemptIfWarranted(action, opts = {}) {
         const act = String(action || '').trim().toLowerCase();
-        if (!act || NON_TASK_ACTIONS.has(act)) return;
+        if (!act || NON_TASK_ACTIONS.has(act)) return;      // chat/stop/hud never queue
         const source = opts.source || 'agent';
-        if (!PREEMPTING_SOURCES.has(source)) return;
+        if (!PREEMPTING_SOURCES.has(source)) return;        // the idle menu waits its turn
         const inFlight = [...this.pendingActions.values()].filter((p) => !NON_TASK_ACTIONS.has(p.action));
         const active = this.activeGoal;
         const hasTaskState = inFlight.length > 0 || !!active ||
             (!!this.currentAction && !NON_TASK_ACTIONS.has(this.currentAction)) || !!this.currentTask;
         if (!hasTaskState) return;
+        // her own brain may replace anything, including its own earlier goal - changing
+        // your mind is not a conflict. The gamer button is an operator mode switch,
+        // so it has the same authority. A person in chat may only replace idle work,
+        // so one viewer cannot cancel an operator's instruction.
         const unconditional = ['agent', 'operator', 'mode-switch', 'gamer'].includes(source);
-        const owners = [...inFlight.map((pending) => pending.source), active?.source].filter(Boolean);
+        const owners = [
+            ...inFlight.map((pending) => pending.source),
+            active?.source
+        ].filter(Boolean);
         if (!unconditional && (!owners.length || !owners.every((owner) => REPLACEABLE_SOURCES.has(owner)))) return;
         this.log('info', `preempting "${this.currentTask || active?.action || inFlight[0]?.action || 'current minecraft task'}" for ${act} (${source})`);
-        return this._runStopTransition({ priority: 'urgent', source: 'preempt', timeoutMs: 30000 });
+        return this._runStopTransition({
+            priority: 'urgent', source: 'preempt', timeoutMs: 30000
+        });
     }
 
-    // send an action to the bridge and resolve when the bot reports it done.
     _dispatchAction(action, params = {}, opts = {}) {
         return new Promise((resolve, reject) => {
             if (typeof action !== 'string' || !action.trim()) {
@@ -1747,18 +2349,18 @@ class MinecraftTool extends EventEmitter {
 
             // "put your armor on" names no item, and altoclef's @equip needs one - so
             // the bridge translated a target-less equip to null and answered "no
-            // built-in task for equip", i.e. the bot stood there. an instruction to
-            // gear up is about the SLOTS, not a named item: resolve it from what she
-            // is actually carrying. also covers the llm asking for the generic
-            // "armor", which is not an item id either.
+            // built-in task for equip", i.e. she stood there while chat watched. an
+            // instruction to gear up is about the SLOTS, not a named item: resolve it
+            // from what she is actually carrying. also covers the llm asking for the
+            // generic "armor", which is not an item id either.
             if (action === 'equip') {
                 const named = String(params.target || '').trim().toLowerCase();
                 const generic = !named || GENERIC_ARMOR_WORDS.has(named.replace(/\s+/g, '_'));
                 if (generic && !Array.isArray(params.items)) {
                     const picks = this._allArmorToWear();
-                    // the bridge's _itemList wants {item} OBJECTS (same ItemList syntax
-                    // `deposit` uses) - a bare string array is silently filtered to
-                    // empty and falls back into the null/"no such task" path.
+                    // the bridge's _itemList wants {item} OBJECTS (it is the same
+                    // ItemList syntax `deposit` uses) - a bare string array is silently
+                    // filtered to empty and falls through to the null/"no such task" path.
                     if (picks.length) params = { ...params, target: undefined, items: picks.map((p) => ({ item: p.item })) };
                     else {
                         reject(new Error(this._armorRefusalReason()));
@@ -1774,6 +2376,13 @@ class MinecraftTool extends EventEmitter {
             // below: terrain cells are 64 blocks wide, so one swim past a coastal
             // home is enough to mark the cell she lives in as ocean.
             let savedPlace = false;
+            // 'go_home' becomes a plain 'move' a few lines down, and every watchdog
+            // downstream then blacklists 'move'. keeping the ASKED-FOR verb means the
+            // two-minute "don't re-pick what just died" suppression finally covers the
+            // home route, which was the single loudest reason she could re-issue a
+            // doomed walk home every four minutes forever.
+            const requestedAction = action;
+            let homeDeparture = null;
             // claiming a home never reaches the game - it is a memory write. handled
             // here rather than only in tools.js so EVERY caller can do it: her own
             // brain, the autonomy tick, and a person in chat saying "make this home".
@@ -1790,31 +2399,65 @@ class MinecraftTool extends EventEmitter {
                 try {
                     const entry = this.setOutpostHere(String(params.target || params.name || 'toaster outpost'), params.level || 1);
                     resolve({ status: 'success', result: { outpost: entry.toJSON() } });
-                } catch (err) { reject(err); }
+                } catch (err) {
+                    reject(err);
+                }
                 return;
             }
             if (action === 'outposts') {
-                resolve({ status: 'success', result: this.memory.listOutposts(this._worldId()).map((entry) => entry.toJSON()) });
+                resolve({
+                    status: 'success',
+                    result: this.memory.listOutposts(this._worldId()).map((entry) => entry.toJSON())
+                });
                 return;
             }
             if (action === 'go_outpost') {
                 const outpost = this._findOutpost(params.target || params.name);
-                if (!outpost) { reject(new Error('no matching toaster outpost is saved')); return; }
+                if (!outpost) {
+                    reject(new Error('no matching toaster outpost is saved'));
+                    return;
+                }
                 action = 'move';
-                params = { ...params, ...outpost.anchor, dimension: this._dimForMove(outpost.dimension), target: `outpost (${outpost.name})` };
+                params = {
+                    ...params, x: outpost.anchor.x, y: outpost.anchor.y, z: outpost.anchor.z,
+                    dimension: this._dimForMove(outpost.dimension), target: `outpost (${outpost.name})`
+                };
                 savedPlace = true;
             }
             if (action === 'build_outpost') {
                 const outpost = this._findOutpost(params.target || params.name);
-                if (!outpost) { reject(new Error('no matching toaster outpost is saved')); return; }
+                if (!outpost) {
+                    reject(new Error('no matching toaster outpost is saved'));
+                    return;
+                }
                 action = 'build_settlement';
-                params = { ...params, role: 'outpost', settlementId: outpost.id, ...outpost.anchor,
-                    width: outpost.width, depth: outpost.depth, height: outpost.height, target: outpost.name };
+                params = {
+                    ...params, role: 'outpost', settlementId: outpost.id,
+                    x: outpost.anchor.x, y: outpost.anchor.y, z: outpost.anchor.z,
+                    width: outpost.width, depth: outpost.depth, height: outpost.height,
+                    target: outpost.name
+                };
+            }
+            if (action === 'build_settlement') {
+                try {
+                    params = this._canonicalSettlementBuildParams(params);
+                } catch (err) {
+                    reject(err);
+                    return;
+                }
             }
             if (action === 'go_home') {
                 const home = this.memory.getHome(this._worldId());
                 if (!home) {
                     reject(new Error('no home set yet - stand somewhere good and use set_home first'));
+                    return;
+                }
+                // the old house has already been judged unreachable and she is out
+                // looking for ground to rebuild on. every source is refused here on
+                // purpose - her own brain and chat included - because the loop was
+                // re-armed just as happily by an LLM go_home as by the homestead arc.
+                if (this._homeRelocation) {
+                    reject(new Error(`${home.name} can't be walked to from here - i've been trying all day. i'm claiming new ground nearby and rebuilding instead`));
                     return;
                 }
                 action = 'move';
@@ -1825,6 +2468,7 @@ class MinecraftTool extends EventEmitter {
                     target: `home (${home.name})`
                 };
                 savedPlace = true;
+                homeDeparture = home;
             } else if (action === 'move' && params.x === undefined && String(params.target || '').trim()) {
                 const fav = this.memory.getFavorite(params.target);
                 if (fav) {
@@ -1838,6 +2482,51 @@ class MinecraftTool extends EventEmitter {
                 }
             }
 
+            // A MOVE WITH NOWHERE TO GO.
+            //
+            // The bridge answers this with `"move" is missing something it needs -
+            // check its parameters`, which names neither the parameter nor the fix.
+            // So her brain cannot correct it: on 2026-08-05 a player asked her a
+            // question in game chat, she answered by trying to walk to a place that
+            // does not exist, got that sentence back, retried the identical empty
+            // call 37 seconds later, and never said one word to the person who
+            // asked. Two turns spent on an error message that could not teach her
+            // anything.
+            //
+            // Fail with the specific thing that is wrong AND what she already
+            // knows, so the next turn can be an answer rather than a repeat.
+            if (action === 'move' && !savedPlace && params.x === undefined) {
+                const named = String(params.target || '').trim();
+                let spots = [];
+                try { spots = (this.memory.listFavorites() || []).map((f) => f.name).filter(Boolean); } catch { /* best-effort */ }
+                const knows = spots.length
+                    ? `places i've saved: ${spots.slice(0, 8).join(', ')}`
+                    : `i haven't saved any places yet - use set_home or favorite to name one`;
+                // THE SECOND ONE IS NOT A SYNTAX PROBLEM.
+                //
+                // Naming the missing field was supposed to be the fix, and it wasn't:
+                // on 2026-08-05 she called an empty `move` twice per turn, four times
+                // across the two turns a player spent waiting on an answer. The first
+                // message teaches the syntax; if she is straight back with the same
+                // empty call then syntax was never what was wrong - she has nowhere to
+                // go and is reaching for the tool anyway. So the list of saved places
+                // is dropped from the repeat: a menu reads as an invitation to pick one
+                // and call move again, and every one of those costs a whole llm round
+                // trip while somebody in the room is waiting. Say so, and point her at
+                // the thing she actually owes.
+                const nowhereAt = Date.now();
+                const repeated = nowhereAt - this._lastNowhereMoveAt < NOWHERE_MOVE_REPEAT_MS;
+                this._lastNowhereMoveAt = nowhereAt;
+                if (repeated) {
+                    reject(new Error('i just tried that exact move and it went nowhere - it is not a syntax slip, i have no destination. stop reaching for move; if someone is waiting on me, answer them with chat instead.'));
+                    return;
+                }
+                reject(new Error(named
+                    ? `i've never saved anywhere called "${named}", so i can't walk to it. ${knows}. for somewhere unsaved give me x and z instead.`
+                    : `move needs somewhere to go - x and z, or the name of a place i've saved. ${knows}.`));
+                return;
+            }
+
             // open water is not a destination. a goto whose target sits in a cell
             // she has personally been wet in is refused before it ever reaches
             // baritone - whoever asked, her own brain included. the escape swim is
@@ -1847,6 +2536,28 @@ class MinecraftTool extends EventEmitter {
                 return;
             }
 
+            // her words have two legal homes - params.message and params.target -
+            // and only target was ever read downstream. answering somebody she put
+            // THEIR NAME in target and the sentence in message, so the server
+            // watched her post a bare "MarDotIO" eight times in six minutes while
+            // every real line was dropped on the floor. the sentence wins whenever
+            // there is one, and a line that is only a username is an address, not
+            // an answer. enforced HERE so her autonomy and a viewer command get the
+            // same guarantee the llm tool call does.
+            if (action === 'chat') {
+                const spoken = String(params.message || '').trim() || String(params.target || '').trim();
+                if (!spoken) {
+                    reject(new Error('that chat line came through empty - the words go in message'));
+                    return;
+                }
+                const named = this._bareRosterName(spoken);
+                if (named) {
+                    reject(new Error(`"${spoken}" is only ${named}'s name, so nothing went out - the words i say to them go in message`));
+                    return;
+                }
+                params = { ...params, target: spoken, message: spoken };
+            }
+
             // outgoing chat pacing: talk like a person, never spam the server.
             // Only a message actually handed to the bridge consumes the budget.
             let chatSendAt = null;
@@ -1854,8 +2565,25 @@ class MinecraftTool extends EventEmitter {
                 const nowChat = Date.now();
                 this._chatSendTimes = this._chatSendTimes.filter((t) => nowChat - t < 60000);
                 const lastSend = this._chatSendTimes[this._chatSendTimes.length - 1] || 0;
-                if (this._chatSendTimes.length >= CHAT_OUT_PER_MIN || nowChat - lastSend < CHAT_OUT_MIN_GAP_MS) {
+                if (this._chatSendTimes.length >= CHAT_OUT_PER_MIN) {
                     reject(new Error('easing off server chat for a few seconds so it doesn\'t read as spam'));
+                    return;
+                }
+                // a line two seconds late is still an answer; a dropped one is
+                // silence, and the person who asked reads it as being ignored.
+                // only the per-minute cap refuses outright now - the 3s gap waits
+                // its turn instead, bounded to a single hop so a burst can't push
+                // her reply back forever.
+                const waitMs = CHAT_OUT_MIN_GAP_MS - (nowChat - lastSend);
+                if (waitMs > 0) {
+                    if (opts._chatGapWaited) {
+                        reject(new Error('easing off server chat for a few seconds so it doesn\'t read as spam'));
+                        return;
+                    }
+                    setTimeout(() => {
+                        this._dispatchAction(action, params, { ...opts, _chatGapWaited: true })
+                            .then(resolve, reject);
+                    }, waitMs + 25);
                     return;
                 }
                 chatSendAt = nowChat;
@@ -1930,11 +2658,13 @@ class MinecraftTool extends EventEmitter {
                 reject,
                 timer,
                 action,
+                requestedAction,
                 params,
                 waitForCompletion,
                 timeoutMs,
                 source: opts.source || 'agent',
                 why: opts.why || null,
+                requestedBy: opts.requestedBy || null,
                 settled: false
             };
             this.pendingActions.set(id, pending);
@@ -1946,7 +2676,26 @@ class MinecraftTool extends EventEmitter {
                 reject(new Error('failed to send action to bridge'));
                 return;
             }
-            if (chatSendAt !== null) this._chatSendTimes.push(chatSendAt);
+            // one real departure for home, counted against the persisted campaign.
+            // deliberately after the dispatch succeeds - a walk the bridge never
+            // carried is a dead socket, not evidence about the route - and measured
+            // as she sets out, so bestDistance can only improve from an approach she
+            // actually made.
+            if (homeDeparture) {
+                try {
+                    this.memory.noteHomeDeparture(this._worldId(), homeDeparture.name, this._homeDistance());
+                } catch { /* memory is an enhancement, never a reason to stop playing */ }
+            }
+            if (chatSendAt !== null) {
+                this._chatSendTimes.push(chatSendAt);
+                // she answered the room: whoever was waiting on her is now in an
+                // open exchange, so their follow-up reaches her without her name.
+                this._openChatExchange();
+                // her line is really on its way to the server. burnt.js listens so
+                // its spoken-reply mirror knows the answer already landed and stays
+                // out of the way (see the in-game reply mirror there).
+                this.emit('chatSent', { text: String(params.message || params.target || '') });
+            }
 
             // Only a task owns the singular action/task slots. Chat, look and
             // boat controls may run while a mine/path is active and must not
@@ -1966,9 +2715,11 @@ class MinecraftTool extends EventEmitter {
                     this.activeGoal = null;
                 }
             } else if (action === 'stop') {
-                // Retire the old long-running records at the cancellation
-                // boundary. Otherwise a lost old terminal response can leave a
-                // four-hour "busy" record after stop already cleared the HUD.
+                // A stop is the local cancellation boundary, not merely a
+                // request whose old task remains "busy" until a second packet
+                // comes back. If that terminal response is lost, a background
+                // goal otherwise leaves a four-hour pending record that blocks
+                // every replacement action even though the HUD was cleared.
                 for (const [pendingId, oldPending] of this.pendingActions) {
                     if (pendingId === id || NON_TASK_ACTIONS.has(oldPending.action)) continue;
                     clearTimeout(oldPending.timer);
@@ -1977,6 +2728,7 @@ class MinecraftTool extends EventEmitter {
                         oldPending.settled = true;
                         oldPending.reject(new Error('task stopped'));
                     }
+                    this._noteTaskEnded(oldPending.action);
                     this.emit('actionStopped', {
                         id: pendingId,
                         action: oldPending.action,
@@ -2015,12 +2767,18 @@ class MinecraftTool extends EventEmitter {
         this.activeGoal = {
             id,
             action: pending.action,
+            // the verb she asked for, before go_home/favorite rewriting flattened it
+            // to 'move'. watchdogs suppress on this so a dead home route is actually
+            // suppressed as a home route.
+            requestedAction: pending.requestedAction || pending.action,
             params: pending.params || {},
             source: pending.source,
             why: pending.why || null,   // her stated reason, for the in-game hud
             persistent,
-            // Idle/follow may correctly stand still. Explore is a movement
-            // promise, so persistent explore still receives stall supervision.
+            // Idle and follow may correctly stand still (idle by definition;
+            // follow while already beside its player). Explore may not: it is a
+            // movement promise, and leaving it watchdog-exempt recreates the
+            // exact infinite-wander statue under a different label.
             watchdog: !watchdogExempt && (!persistent || pending.action === 'explore'),
             maxRuntimeMs: persistent
                 ? null
@@ -2032,6 +2790,11 @@ class MinecraftTool extends EventEmitter {
             lastInventoryProgressAt: now,
             lastPosition: this._point(this.gameState.position),
             lastInventorySignature: this._inventorySignature(),
+            // recently-visited inventory states, newest last. a signature we have
+            // already seen in this goal is not new information - see the revisit
+            // check in _observeGoalProgress.
+            inventoryHistory: [],
+            oscillationHits: 0,
             lastSettlementSignature: this._settlementProgressSignature(this.gameState.settlementBuild)
         };
         return this.activeGoal;
@@ -2041,27 +2804,72 @@ class MinecraftTool extends EventEmitter {
         if (!this.activeGoal) return;
         const now = Date.now();
         let progressed = false;
+        // While she is actually laying blocks, the settlement survey is the only
+        // thing that proves anything happened. Letting position or inventory
+        // vouch for it is what made the 6-minute build budget unreachable - a
+        // builder wedged for seven silent minutes still drifts a block and still
+        // has its hotbar shuffled, and either one reset the clock.
+        //
+        // Gathering and crafting are the exception, and the phase is what tells
+        // them apart: there the build task has handed off to a resource subtask
+        // that legitimately spends minutes away from the site without touching a
+        // single block of it, so inventory and movement are the real signal.
+        const buildPhase = partial.settlementBuild?.phase
+            || this.gameState.settlementBuild?.phase || null;
+        const surveyOnly = this.activeGoal.action === 'build_settlement'
+            && !BUILD_SUBTASK_PHASES.has(buildPhase);
         const point = this._point(this.gameState.position);
         const previous = this.activeGoal.lastPosition;
+        let moved = false;
         if (point && (!previous || Math.hypot(point.x - previous.x, point.y - previous.y, point.z - previous.z) >= 1)) {
             this.activeGoal.lastPosition = point;
-            progressed = true;
+            moved = true;
+            if (!surveyOnly) progressed = true;
         }
         // Mining, crafting, and smelting can make real progress without moving
         // a full block. Treat a changed inventory snapshot as progress too, so
         // the stall watchdog does not cancel a productive stationary task.
+        //
+        // ...but "changed" is not "advanced". A CHANGING signature was enough to
+        // hold the watchdog off forever, and AltoClef has a failure mode that
+        // produces exactly that: a task tree that oscillates between two states
+        // shuffles the inventory on every swing. Observed 2026-08-05 - crafting a
+        // furnace wants a crafting_table item, crafting that wants 4 planks, the
+        // planks need the 2x2 inventory grid, which forces the container shut and
+        // interrupts the furnace task, which reopens it: ~1.4 full cycles/sec for
+        // 3+ minutes (1203 task events), every cycle moving items between the grid
+        // and the inventory. Position never changed, so the inventory vote was the
+        // ONLY thing feeding lastProgressAt - and it never stopped voting.
+        //
+        // Real work is monotonic: logs -> planks -> table never revisits a state.
+        // Churn returns to where it was. So a signature already seen during this
+        // goal is not progress. Only applied while she is standing still; if she
+        // is moving, position already vouches for her.
         if (Object.prototype.hasOwnProperty.call(partial, 'inventory')) {
             const inventorySignature = this._inventorySignature();
             if (inventorySignature !== this.activeGoal.lastInventorySignature) {
                 this.activeGoal.lastInventorySignature = inventorySignature;
-                this.activeGoal.lastInventoryProgressAt = now;
-                progressed = true;
+                const history = this.activeGoal.inventoryHistory || (this.activeGoal.inventoryHistory = []);
+                const revisited = !moved && history.includes(inventorySignature);
+                if (revisited) {
+                    // oscillation: withhold the inventory vote so lastProgressAt can
+                    // finally age out and the stall watchdog does its job.
+                    this.activeGoal.oscillationHits = (this.activeGoal.oscillationHits || 0) + 1;
+                    if (this.activeGoal.oscillationHits === INVENTORY_OSCILLATION_WARN_AT) {
+                        this.log('warn', `inventory is oscillating, not advancing, during ${this.activeGoal.action} - not counting it as progress`);
+                    }
+                } else {
+                    history.push(inventorySignature);
+                    if (history.length > INVENTORY_HISTORY_MAX) history.splice(0, history.length - INVENTORY_HISTORY_MAX);
+                    this.activeGoal.lastInventoryProgressAt = now;
+                    if (!surveyOnly) progressed = true;
+                }
             }
         }
         if (Object.prototype.hasOwnProperty.call(partial, 'settlementBuild')) {
-            const signature = this._settlementProgressSignature(partial.settlementBuild);
-            if (signature && signature !== this.activeGoal.lastSettlementSignature) {
-                this.activeGoal.lastSettlementSignature = signature;
+            const settlementSignature = this._settlementProgressSignature(partial.settlementBuild);
+            if (settlementSignature && settlementSignature !== this.activeGoal.lastSettlementSignature) {
+                this.activeGoal.lastSettlementSignature = settlementSignature;
                 progressed = true;
             }
         }
@@ -2084,6 +2892,92 @@ class MinecraftTool extends EventEmitter {
     // _observeGoalProgress's anchor hangs off activeGoal, re-anchors only past 24 blocks,
     // and does not exist at all when there is no watchdog'd goal - but being held in place
     // by mobs does not care whether she happens to own a goal at the time.
+    // watch AltoClef climb its wander ladder under an active move. three escalations
+    // (5 -> 10 -> 15) is not exploring, it is a goto that cannot land. abandon the
+    // destination rather than let her pace around it until someone notices.
+    _observeUnreachableTarget() {
+        const goal = this.activeGoal;
+        if (!goal || !goal.watchdog || WANDER_STORM_EXEMPT.has(goal.action)) {
+            this._wanderLadder = 0;
+            this._lastWanderRadius = 0;
+            this._wanderGoalId = null;
+            this._wanderEpisodes = [];
+            this._wanderWasActive = false;
+            return false;
+        }
+        if (this._wanderGoalId !== goal.id) {      // a new goal starts a fresh ladder
+            this._wanderGoalId = goal.id;
+            this._wanderLadder = 0;
+            this._lastWanderRadius = 0;
+            this._wanderEpisodes = [];
+            this._wanderWasActive = false;
+        }
+        const now = Date.now();
+        const raw = `${this.gameState.botTask || ''} ${this.gameState.botAction || ''}`;
+        // Only FINITE radii count. "wander for infinity blocks" is
+        // AbstractDoToClosestObjectTask searching for something it has not sighted
+        // yet (ore, a mob, a chest) - that is the task working, not failing, and
+        // counting it would abort every legitimate mining trip. The regex declines
+        // to match "infinity" on its own, which is the behaviour we want.
+        const found = raw.match(/wander for ([\d.]+) blocks/i);
+        const radius = found ? Number(found[1]) : NaN;
+        const wandering = Number.isFinite(radius);
+        // An episode is a fresh unstuck attempt: either she re-entered a wander
+        // after being out of one, or the radius grew inside a continuous wander.
+        // The first covers the rebuilt-task-tree case (5, 5, 5, ...), the second
+        // the surviving-instance case (5, 10, 15, ...). Both mean the same thing.
+        const reentered = wandering && !this._wanderWasActive;
+        const escalated = wandering && radius > (this._lastWanderRadius || 0);
+        if (wandering) this._lastWanderRadius = radius;
+        this._wanderWasActive = wandering;
+        if (!wandering) return false;
+        if (escalated) this._wanderLadder = (this._wanderLadder || 0) + 1;
+        if (!reentered && !escalated) return false;
+
+        const episodes = this._wanderEpisodes || (this._wanderEpisodes = []);
+        episodes.push(now);
+        while (episodes.length && now - episodes[0] > WANDER_STORM_WINDOW_MS) episodes.shift();
+        const stormed = episodes.length >= WANDER_STORM_LIMIT;
+        const laddered = this._wanderLadder >= WANDER_ESCALATION_LIMIT;
+        if (!stormed && !laddered) return false;
+
+        const where = goal.params || {};
+        const label = this._describeTask(goal.action, where);
+        const why = laddered
+            ? `altoclef has escalated its wander to ${radius} blocks`
+            : `altoclef has re-wandered ${episodes.length}x in ${Math.round(WANDER_STORM_WINDOW_MS / 1000)}s at ${radius} blocks`;
+        this.log('warn', `unreachable: ${label} - ${why}, giving up on it`);
+        try {
+            this.memory.recordFailure(goal.action, where.target || null, 'could not be reached (altoclef wander ladder)');
+        } catch { /* best-effort */ }
+        // Only a real destination can be blacklisted or trigger the home search;
+        // for everything else this is just an abort, same shape as a stall.
+        const travelling = goal.action === 'move';
+        const relocatingHome = travelling ? this._beginNearbyHomeSearch(goal) : false;
+        // do not offer this destination again for a while - it is not that the walk
+        // failed, it is that the SPOT cannot be stood on.
+        if (travelling) this._rememberDestination(where);
+        this._markPendingAborted(goal.id, why);
+        this._applyMinecraftEvent('stalled');
+        this._avoidAction = goal.requestedAction || goal.action;
+        this._avoidUntil = now + LOOP_AVOID_MS;
+        this._wanderLadder = 0;
+        this._wanderGoalId = null;
+        this._wanderEpisodes = [];
+        this._wanderWasActive = false;
+        this.activeGoal = null;
+        this.currentTask = null;
+        this._pushCommentary(relocatingHome
+            ? `the old home is ${Math.round(this._homeRelocation.distance)} blocks away and its route is broken. i'm finding better ground near here and moving the toaster project`
+            : travelling
+                ? `whatever is at ${where.target || 'that spot'} cannot actually be walked to. i've been circling it. dropping it`
+                : `i can't get to what ${label} needs - i've just been shuffling in place. dropping it`, 'unreachable');
+        this.emit('gameEvent', 'target_unreachable', { target: where.target || null, radius, relocatingHome });
+        this.executeAction('stop', {}, { priority: 'urgent', source: 'unreachable', waitForCompletion: false })
+            .catch((err) => this.log('warn', `failed to stop unreachable goal: ${err.message}`));
+        return true;
+    }
+
     _observePinned() {
         const point = this._point(this.gameState.position);
         if (!point) return;
@@ -2138,7 +3032,16 @@ class MinecraftTool extends EventEmitter {
             // real distance, not a short hop - a few blocks just re-enters the same mobs'
             // aggro range. _pickLandingSpot keeps the bearing on land (the ocean lesson).
             const p = this.gameState.position || { x: 0, y: 64, z: 0 };
-            const spot = this._pickLandingSpot(p, 120, 260);
+            // RETREAT OUTWARD WHEN THERE IS AN OUTWARD. a pin inside the spawn
+            // region used to break in a random direction, so half of them threw
+            // away the walk she was in the middle of - that is the "goes to the
+            // edge, gets chased back to the middle" half of the loop. getting
+            // away from the mobs is still the point, so this is a preference
+            // with a plain fallback, never a reason to stay pinned.
+            const region = this._standingInSpawnRegion() ? this._spawnRegion() : null;
+            const spot = (region && this._pickLandingSpot(p, 120, 260, {
+                outward: { depth: (x, z) => this._spawnDepth(x, z), here: this._spawnDepth(p.x, p.z), min: 1 }
+            })) || this._pickLandingSpot(p, 120, 260);
             if (!spot) {
                 this.recentEvents.record('pinned down, and no dry way out of it that i know of');
                 return;
@@ -2172,21 +3075,36 @@ class MinecraftTool extends EventEmitter {
         return this.currentTask ? String(this.currentTask) : '';
     }
 
+    // altoclef's raw phase strings are machine spew:
+    //   "doing stuff in crafting_table x 1 container: [[stone_pickaxe] x 1]"
+    //   "collect recipe resources: {recipetarget{_recipe=craftingrecipe{craft
+    //    stone_pickaxe}, _item=minecraft:stone_pickaxe x 1}}: getting cobblestone x 3"
+    // the useful part is WHAT IS IN THE JOB - the item and what it still needs - which
+    // is exactly what you want on screen while she is stood at a bench doing nothing
+    // visible. pull that out and leave everything else alone.
     _prettyPhase(raw) {
         const s = String(raw || '').trim();
         if (!s) return '';
+        // "...: getting cobblestone x 3" -> the outstanding ingredient wins, it is the
+        // reason she is standing there
         const needs = s.match(/getting\s+([a-z0-9_]+)\s*x\s*(\d+)/i);
         if (needs) return `needs ${needs[1].replace(/_/g, ' ')} x${needs[2]}`;
+        // a container job carries its output list: [[stone_pickaxe] x 1]
         const container = s.match(/\b(crafting_table|furnace|smoker|blast_furnace|campfire)\b[^:]*:\s*\[\[([^\]]+)\]\s*x\s*(\d+)/i);
         if (container) {
             const verb = /crafting_table/i.test(container[1]) ? 'crafting' : 'smelting';
             const item = container[2].split(',')[0].replace(/_/g, ' ').trim();
             return `${verb} ${item}${Number(container[3]) > 1 ? ` x${container[3]}` : ''}`;
         }
+        // "craft 2x2 task recipetarget{...craft sticks...}" -> crafting sticks
         const recipe = s.match(/craft\s+([a-z0-9_]+)\}/i) || s.match(/\bcraft\s+([a-z0-9_]+)\b/i);
         if (recipe && /recipe|craft/i.test(s)) return `crafting ${recipe[1].replace(/_/g, ' ')}`;
+        // "mine and collect: [[cobblestone] x 1]"
         const collect = s.match(/mine and collect:\s*\[\[([^\],]+)/i);
         if (collect) return `mining ${collect[1].replace(/_/g, ' ').trim()}`;
+        // "getting to block blockpos{x=-183, y=70, z=334} in dimension overworld:
+        //  wandering..." - the most common line on screen, and the least readable.
+        // the wander suffix matters: it is altoclef saying it cannot find a way.
         const going = s.match(/getting to block blockpos\{x=(-?\d+),\s*y=(-?\d+),\s*z=(-?\d+)/i);
         if (going) {
             const lost = /wandering/i.test(s) ? ' (looking for a way)' : '';
@@ -2199,6 +3117,10 @@ class MinecraftTool extends EventEmitter {
         const path = Array.isArray(this.gameState.botTaskPath)
             ? this.gameState.botTaskPath.map((part) => this._cleanPhase(part)).filter(Boolean)
             : [];
+        // Dependency acquisition is the most honest explanation for a goal
+        // whose headline says "crafting": it distinguishes using a recipe from
+        // roaming the world for an ingredient. The companion now supplies the
+        // whole task path so this useful middle layer is no longer discarded.
         for (let i = path.length - 1; i >= 0; i--) {
             if (/getting\s+[a-z0-9_]+\s*x\s*\d+/i.test(path[i])) return this._prettyPhase(path[i]);
         }
@@ -2214,12 +3136,21 @@ class MinecraftTool extends EventEmitter {
             return one.length > n ? `${one.slice(0, n - 1)}…` : one;
         };
         const what = trim(this._intentWhat());
-        if (!what) return { what: '', why: '', phase: '' };
         const goal = this.activeGoal;
         // her own `say` if she had a reason; otherwise who wanted this
-        const why = goal ? (goal.why || INTENT_SOURCE_WHY[goal.source] || '') : '';
-        const phase = this._liveGoalPhase();
-        return { what, why: trim(why), phase: trim(phase) };
+        const why = what && goal ? (goal.why || INTENT_SOURCE_WHY[goal.source] || '') : '';
+        const phase = what ? this._liveGoalPhase() : '';
+        const mind = this.minecraftState || this.affect.snapshot();
+        const affect = (key) => Math.max(0, Math.min(100, Math.round(Number(mind[key]) || 0)));
+        return {
+            what,
+            why: trim(why),
+            phase: trim(phase),
+            fear: affect('fear'),
+            confidence: affect('confidence'),
+            security: affect('security'),
+            fun: affect('fun')
+        };
     }
 
     // only ever sent when the line actually changes - the hud is cosmetic and must
@@ -2230,13 +3161,14 @@ class MinecraftTool extends EventEmitter {
         const now = Date.now();
         if (now - (this._lastIntentPushAt || 0) < INTENT_PUSH_MIN_GAP_MS) return;
         const payload = this._intentPayload();
-        const signature = `${payload.what}|${payload.why}|${payload.phase}`;
-        if (signature === this._lastIntentSignature) return;
+        const signature = JSON.stringify(payload);
+        // An unchanged payload still needs a heartbeat. The companion expires stale
+        // text after 90s so a dead node cannot leave a lie on screen forever.
+        if (signature === this._lastIntentSignature &&
+            now - this._lastIntentPushAt < INTENT_HEARTBEAT_MS) return;
         this._lastIntentSignature = signature;
         this._lastIntentPushAt = now;
-        const encoded = payload.what
-            ? Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
-            : '';
+        const encoded = Buffer.from(signature, 'utf8').toString('base64');
         this.executeAction('hud', { payload: encoded }, { source: 'hud', waitForCompletion: false })
             .catch(() => { /* cosmetic - an old jar without the verb must not look like a fault */ });
     }
@@ -2262,32 +3194,119 @@ class MinecraftTool extends EventEmitter {
 
     // which server/save she is on. coordinates are meaningless without it - her old
     // server's house is somebody else's dirt here.
+    // ONLY a named server counts as a confident world identity. singleplayer saves are
+    // indistinguishable from in here, and - the dangerous case - a transiently missing
+    // multiplayer flag must never make her home vanish, because a homeless burnt
+    // immediately goes and settles somewhere else. null means "don't filter".
     _worldId() {
         const g = this.gameState;
-        if (g.multiplayer === true && g.server) return String(g.server).slice(0, 80);
-        return g.multiplayer === true ? 'multiplayer' : 'singleplayer';
+        return (g.multiplayer === true && g.server) ? String(g.server).slice(0, 80) : null;
     }
 
-    _home() { return this.memory.getHome(this._worldId()); }
+    // where she lives ON THIS WORLD. every "am i home / how far is home / go home"
+    // question has to be world-scoped, or on a new server she measures against a house
+    // that is somebody else's dirt here.
+    _home() {
+        return this.memory.getHome(this._worldId());
+    }
 
     _homeOvens(kind = null) {
         const home = this._home();
         if (!home) return [];
-        const settlement = this.memory.getMainSettlement(this._worldId());
+        const settlement = this.memory.getMainSettlement?.(this._worldId());
         return this.memory.listOvens().filter((oven) => {
             if (kind && oven.kind !== kind) return false;
             if (!this._dimMatches(oven.dimension, home.dimension)) return false;
-            return settlement ? settlement.contains(oven.position, 3)
-                : Math.hypot(oven.position.x - home.position.x, oven.position.z - home.position.z) <= TOASTER_NEAR_RADIUS;
+            if (settlement?.contains) return settlement.contains(oven.position, 3);
+            return Math.hypot(oven.position.x - home.position.x, oven.position.z - home.position.z) <= TOASTER_NEAR_RADIUS;
         });
+    }
+
+    _homeFurnaceCount() { return this._homeOvens('furnace').length; }
+
+    // a half-built toaster at home is a standing obligation, not a preference: the
+    // idle menu must not march her hundreds of blocks off while a shell is waiting.
+    // NO home yet means nothing to abandon - out there, walking IS the search.
+    _toasterUnfinished() {
+        try {
+            if (!this._home()) return false;
+            return this.homeSpec().met !== true;
+        } catch { return false; }
     }
 
     _settlementProgressSignature(progress) {
         if (!progress || typeof progress !== 'object') return '';
-        const keys = ['kind', 'role', 'x', 'y', 'z', 'width', 'depth', 'height', 'phase', 'percent',
-            'complete', 'clear', 'floor', 'walls', 'roof', 'toastSlots', 'toastSlotCount',
-            'walkthrough', 'lit', 'smoothStoneRemaining', 'clearRemaining', 'torches', 'torchesRequired'];
+        const keys = [
+            'kind', 'role', 'x', 'y', 'z', 'width', 'depth', 'height', 'phase',
+            'percent', 'complete', 'clear', 'floor', 'walls', 'roof', 'toastSlots',
+            'toastSlotCount', 'walkthrough', 'lit', 'smoothStoneRemaining',
+            // felling a yard IS the work during that phase. Without these two the
+            // signature never moves while she clears it, and build_settlement's
+            // six-minute survey-only stall budget condemns a builder that is
+            // visibly chopping down a wood.
+            'housed', 'yardClear', 'yardRemaining',
+            'clearRemaining', 'torches', 'torchesRequired'
+        ];
         return JSON.stringify(Object.fromEntries(keys.map((key) => [key, progress[key] ?? null])));
+    }
+
+    // the nearest saved toaster she could actually walk to, same dimension first.
+    _nearestSettlement(list = []) {
+        if (!Array.isArray(list) || !list.length) return null;
+        const sameDim = list.filter((entry) => this._dimMatches(entry.dimension, this.gameState.dimension));
+        const pool = sameDim.length ? sameDim : list;
+        const here = this.gameState.position;
+        if (!here) return pool[0];
+        try {
+            return pool.slice().sort((a, b) => a.distanceTo(here) - b.distanceTo(here))[0];
+        } catch { return pool[0]; }
+    }
+
+    // RESUME THE SAVED BLUEPRINT. the house is already persisted - id, anchor,
+    // dimensions, progress - so demanding that she echo seven exact values back
+    // was ceremony that could only fail: the home line she actually reads carries
+    // the WxDxH and nothing else, no anchor, no role, no id, so the exact() match
+    // was UNSATISFIABLE for the homestead and every attempt to build her own
+    // house came back "must match a saved toaster blueprint" (2026-08-05, said on
+    // stream as "my own house button rejected me. i am being denied housing by a
+    // toaster blueprint"). her numbers are still never trusted - they are
+    // REPLACED by the saved ones below - but a missing one now RESOLVES instead
+    // of refusing. the only real error left is having no blueprint at all.
+    _canonicalSettlementBuildParams(params = {}) {
+        const world = this._worldId();
+        const saved = this.memory.listSettlements(world);
+        if (!saved.length) {
+            throw new Error('no toaster blueprint is saved on this world yet - stand where the house should go and set_home (or set_outpost) first');
+        }
+        const id = String(params.settlementId || '').trim();
+        const role = String(params.role || '').trim().toLowerCase();
+        const named = String(params.target || params.name || '').trim().toLowerCase();
+        const exact = (entry) => entry.role === role &&
+            entry.anchor.x === Number(params.x) && entry.anchor.y === Number(params.y) &&
+            entry.anchor.z === Number(params.z) && entry.width === Number(params.width) &&
+            entry.depth === Number(params.depth) && entry.height === Number(params.height);
+        const settlement =
+            (id ? saved.find((entry) => entry.id === id) : null) ||
+            saved.find(exact) ||
+            (named ? saved.find((entry) => String(entry.name || '').trim().toLowerCase() === named) : null) ||
+            (role === 'outpost' ? this._nearestSettlement(saved.filter((entry) => entry.role === 'outpost')) : null) ||
+            this.memory.getMainSettlement(world) ||
+            this._nearestSettlement(saved);
+        if (!settlement) {
+            throw new Error('no toaster blueprint is saved on this world yet - stand where the house should go and set_home (or set_outpost) first');
+        }
+        return {
+            ...params,
+            role: settlement.role,
+            settlementId: settlement.id,
+            x: settlement.anchor.x,
+            y: settlement.anchor.y,
+            z: settlement.anchor.z,
+            width: settlement.width,
+            depth: settlement.depth,
+            height: settlement.height,
+            target: settlement.name
+        };
     }
 
     _persistSettlementSurvey(progress) {
@@ -2295,10 +3314,10 @@ class MinecraftTool extends EventEmitter {
         if (!signature || signature === this._lastSettlementProgressSignature) return;
         this._lastSettlementProgressSignature = signature;
         const settlement = this.memory.listSettlements(this._worldId()).find((entry) =>
-            entry.kind === String(progress.kind || '') && entry.anchor.x === Number(progress.x) &&
-            entry.anchor.y === Number(progress.y) && entry.anchor.z === Number(progress.z) &&
-            entry.width === Number(progress.width) && entry.depth === Number(progress.depth) &&
-            entry.height === Number(progress.height));
+            entry.kind === String(progress.kind || '') &&
+            entry.anchor.x === Number(progress.x) && entry.anchor.y === Number(progress.y) &&
+            entry.anchor.z === Number(progress.z) && entry.width === Number(progress.width) &&
+            entry.depth === Number(progress.depth) && entry.height === Number(progress.height));
         if (!settlement) return;
         const durable = { ...progress };
         delete durable.active;
@@ -2306,100 +3325,288 @@ class MinecraftTool extends EventEmitter {
         this.memory.updateSettlementProgress(settlement.id, durable);
     }
 
+    // THE FOOTPRINT NEVER MOVES. The toaster used to grow a block of width per
+    // furnace, up to 43x20x12, and every expansion re-laid the shell and wiped
+    // the survey - twenty-four rebuilds of the same house because the gallery it
+    // was sized around kept needing another row. The floorplan is fixed and its
+    // gallery fits inside it, so this now just keeps the record pointed at home.
     _ensureMainToaster() {
         const home = this._home();
         if (!home) return null;
-        const furnaceTarget = Math.min(TOASTER_FURNACE_TARGET, Math.max(1, this._homeOvens('furnace').length + 1));
-        const dimensions = toasterHomesteadDimensions(furnaceTarget);
-        const existing = this.memory.getMainSettlement(this._worldId());
+        const furnaces = this._homeFurnaceCount();
+        const furnaceTarget = Math.min(TOASTER_FURNACE_TARGET, Math.max(1, furnaces + 1));
+        const dimensions = toasterHomesteadDimensions();
+        const existing = this.memory.getMainSettlement?.(this._worldId());
         const sameAnchor = existing && this._dimMatches(existing.dimension, home.dimension) &&
             Math.hypot(existing.anchor.x - home.position.x, existing.anchor.z - home.position.z) <= 3;
-        const sameDimensions = sameAnchor && existing.width === dimensions.width &&
-            existing.depth === dimensions.depth && existing.height === dimensions.height;
-        return this.memory.upsertSettlement(new ToasterHomestead({
-            ...(existing ? existing.toJSON() : {}), name: home.name, anchor: home.position,
-            dimension: home.dimension, world: home.world || this._worldId(), furnaceTarget,
+        // A SURVEY IS ONLY VALID FOR THE HOUSE IT WAS TAKEN OF, and the survey's
+        // OWN recorded size is the only surviving evidence of that. Comparing
+        // `existing.width` cannot work: rehydrating a settlement runs it through
+        // the ToasterHomestead constructor, which coerces every saved shell to
+        // the floorplan, so both sides of that test read 14 whatever is on disk.
+        // The live save was a 20x13x9 at "90% done, 6 torches required" - kept
+        // against a 14x9x8 house that needs 36, which she would then narrate.
+        const surveyed = existing?.progress;
+        const sameDimensions = sameAnchor && !!surveyed &&
+            Number(surveyed.width) === dimensions.width &&
+            Number(surveyed.depth) === dimensions.depth &&
+            Number(surveyed.height) === dimensions.height;
+        const settlement = new ToasterHomestead({
+            ...(existing ? existing.toJSON() : {}),
+            name: home.name || 'the homestead',
+            anchor: home.position,
+            dimension: home.dimension,
+            world: home.world || this._worldId(),
+            furnaceTarget,
             progress: sameDimensions ? existing.progress : null,
-            appliances: sameAnchor ? existing.appliances : [], ...dimensions
-        }), { main: true });
+            appliances: sameAnchor ? existing.appliances : [],
+            ...dimensions
+        });
+        // OLD-GRID GHOSTS. The ledger carried forward from a settlement built on
+        // the previous 9x3 gallery holds blocks the floorplan has no square for.
+        // Left in, one of them retires a planned slot that was never filled.
+        settlement.appliances = this._planOnlyAppliances(settlement);
+        return this.memory.upsertSettlement(settlement, { main: true });
     }
 
+    /** Ledger entries that land on a block the plan actually uses. */
+    _planOnlyAppliances(settlement) {
+        const at = (p) => `${p.x},${p.y},${p.z}`;
+        const usable = new Set([
+            ...settlement.applianceSlots().map(at),
+            ...toasterOpenFloor(settlement).map(at)
+        ]);
+        return (settlement.appliances || []).filter((entry) =>
+            [entry.x, entry.y, entry.z].every(Number.isFinite) && usable.has(at(entry)));
+    }
+
+    _matchingBuild(settlement) {
+        const live = this.gameState.settlementBuild;
+        if (!live || !settlement) return null;
+        const same = String(live.kind || '') === settlement.kind &&
+            Number(live.x) === settlement.anchor.x && Number(live.y) === settlement.anchor.y &&
+            Number(live.z) === settlement.anchor.z && Number(live.width) === settlement.width &&
+            Number(live.depth) === settlement.depth && Number(live.height) === settlement.height;
+        return same ? live : null;
+    }
+
+    // Exact companion survey, never inventory inference. Torches in her bag do
+    // not light a building; two slots are two verified openings in the roof.
     homeSpec() {
         const settlement = this._ensureMainToaster();
-        const live = this.gameState.settlementBuild;
-        const matches = live && settlement && live.kind === settlement.kind && Number(live.x) === settlement.anchor.x &&
-            Number(live.y) === settlement.anchor.y && Number(live.z) === settlement.anchor.z &&
-            Number(live.width) === settlement.width && Number(live.depth) === settlement.depth && Number(live.height) === settlement.height;
-        const progress = matches ? live : settlement?.progress;
-        const met = !!progress && progress.complete === true && progress.clear === true && progress.floor === true &&
-            progress.walls === true && progress.roof === true && progress.toastSlots === true &&
-            Number(progress.toastSlotCount) === 2 && progress.walkthrough === true && progress.lit === true;
-        return { settlement, progress, met, percent: Math.round(Number(progress?.percent) || 0),
-            phase: progress?.phase || 'not surveyed', furnaces: this._homeOvens('furnace').length };
+        const furnaces = this._homeFurnaceCount();
+        const live = this._matchingBuild(settlement);
+        const progress = live || settlement?.progress || null;
+        const components = progress || {};
+        // THE HOUSE, NOT THE YARD. `complete` now means "house AND ten clear
+        // blocks all round it", and the yard has no fixed size - a wood is
+        // thousands of blocks - so gating the gallery on it would mean one bad
+        // treeline is a toaster that never gets a single furnace in it. `housed`
+        // is the in-game task's answer to "is this habitable", and an older jar
+        // that has never heard of a yard still answers it via `complete`.
+        const housed = components.housed === true ||
+            (components.housed == null && components.complete === true);
+        const met = !!progress && housed && components.clear === true &&
+            components.floor === true && components.walls === true && components.roof === true &&
+            components.toastSlots === true && Number(components.toastSlotCount) === 2 &&
+            components.walkthrough === true && components.lit === true;
+        // undefined on an old jar, which reads as "no yard work known" rather
+        // than "the yard is filthy" - she must never be sent to clear a yard the
+        // game cannot yet measure.
+        const yardClear = components.yardClear !== false;
+        const slots = settlement ? settlement.applianceSlots() : [];
+        const filled = settlement ? this._filledApplianceKeys(settlement) : new Set();
+        return {
+            settlement,
+            furnaces,
+            // the plan's number, the same one _publicHomeProject reports - the
+            // settlement's own `furnaceTarget` is a vestigial expansion ratchet
+            // and having two answers under one name is a trap
+            furnaceTarget: TOASTER_FURNACE_TARGET,
+            // how much of the floorplan's gallery is actually standing
+            slotTotal: slots.length,
+            installed: slots.filter((slot) => filled.has(`${slot.x},${slot.y},${slot.z}`)).length,
+            width: settlement?.width || null,
+            depth: settlement?.depth || null,
+            height: settlement?.height || null,
+            // whatever stone the shell actually went up in - the game reports it
+            material: progress?.material || 'stone',
+            progress,
+            percent: Number.isFinite(Number(progress?.percent)) ? Math.round(Number(progress.percent)) : 0,
+            phase: progress?.phase || 'not surveyed',
+            clear: components.clear === true,
+            floor: components.floor === true,
+            walls: components.walls === true,
+            roof: components.roof === true,
+            toastSlots: components.toastSlots === true && Number(components.toastSlotCount) === 2,
+            walkthrough: components.walkthrough === true,
+            lit: components.lit === true,
+            yardClear,
+            yardRemaining: Number.isFinite(Number(components.yardRemaining))
+                ? Number(components.yardRemaining) : null,
+            met
+        };
+    }
+
+    // the build phase is a snake_case identifier the pipeline passes around, and
+    // SHE QUOTES THE PIPELINE - "gathering_stone" came out of her mouth on stream
+    // more than once. machine-facing consumers keep the identifier; anything she
+    // reads aloud gets english.
+    _buildPhaseLabel(phase) {
+        const raw = String(phase || '').trim();
+        if (!raw) return '';
+        const known = {
+            walking_to_quarry: 'walking back to the mine',
+            gathering_stone: 'out getting stone',
+            crafting_side_torches: 'making torches',
+            clearing_the_yard: 'clearing the yard',
+            surveying: 'sizing the place up',
+            core_program_complete: 'done',
+            not_surveyed: 'not surveyed yet',
+            blocked_baritone_cannot_build: 'the site is refusing to be built on'
+        };
+        if (known[raw]) return known[raw];
+        const waiting = raw.match(/^waiting_for_(.+)$/);
+        if (waiting) return `waiting on a ${waiting[1].replace(/_/g, ' ')}`;
+        return raw.replace(/_/g, ' ');
+    }
+
+    homeSpecLine() {
+        const s = this.homeSpec();
+        if (!s.settlement) return 'no toaster homestead has been claimed yet';
+        const size = `${s.width}x${s.depth}x${s.height}`;
+        const stone = String(s.material || 'stone').replace(/_/g, ' ');
+        // SHE QUOTES THIS LINE. A yard she is visibly out chopping down has to
+        // appear in it, or the readout says "ready" while chat is watching her
+        // fell a wood and she has nothing true to say about what she is doing.
+        const yard = s.yardClear
+            ? `${TOASTER_YARD_MARGIN} clear blocks all round`
+            : (Number(s.yardRemaining) > 0
+                ? `yard still crowded (${s.yardRemaining} blocks in the way)`
+                : 'yard still crowded');
+        if (s.met) return `main toaster is ready: ${size} ${stone}, clear, roof + walls + floor, two top slots, walkthrough, wall torches, ${yard}; ${s.installed}/${s.slotTotal} appliance blocks stacked (${s.percent}%)`;
+        const missing = [];
+        if (!s.clear) missing.push('clear interior');
+        if (!s.floor) missing.push('floor');
+        if (!s.walls) missing.push('walls');
+        if (!s.roof) missing.push('roof');
+        if (!s.toastSlots) missing.push('two toast slots');
+        if (!s.walkthrough) missing.push('walk-through hole');
+        if (!s.lit) missing.push('side torches');
+        if (!s.yardClear) missing.push(`${TOASTER_YARD_MARGIN} clear blocks round the walls`);
+        return `main toaster ${s.percent}% (${this._buildPhaseLabel(s.phase)}): ${size}, ${s.installed}/${s.slotTotal} appliances in; needs ${missing.join(' + ') || 'a fresh survey'}`;
     }
 
     _publicHomeProject() {
         const spec = this.homeSpec();
-        const s = spec.settlement;
-        if (!s) return null;
+        if (!spec.settlement) return null;
         const smokerCount = this._homeOvens('smoker').length;
-        const expansionProgress = Math.min(TOASTER_FURNACE_TARGET,
-            spec.furnaces + (s.furnaceTarget > spec.furnaces ? spec.percent / 100 : 0));
-        const completedUnits = expansionProgress + spec.furnaces + Math.min(1, smokerCount);
-        const totalUnits = TOASTER_FURNACE_TARGET * 2 + 1;
-        const nextAppliance = spec.met ? (spec.furnaces === 0 ? 'furnace' :
-            (smokerCount === 0 ? 'smoker' : (spec.furnaces < TOASTER_FURNACE_TARGET ? 'furnace' : null))) : null;
-        return { id: s.id,
-            goal: spec.met ? (nextAppliance ? `install the next ${nextAppliance.replace(/_/g, ' ')}` : 'maintain the completed main toaster')
-                : `expand the main toaster for furnace ${s.furnaceTarget}`,
+        // the program is the map: a finished shell plus every block of it filled.
+        const slots = spec.settlement.applianceSlots();
+        const filled = this._filledApplianceKeys(spec.settlement);
+        const standing = slots.filter((slot) => filled.has(`${slot.x},${slot.y},${slot.z}`));
+        const installed = standing.length;
+        // counted off the PLAN, not off the oven collection - a campfire on the
+        // floor is a unit in her collection but not a block of the toaster
+        const inPlan = (kind) => standing.filter((slot) => slot.kind === kind).length;
+        const next = this._nextApplianceSlot(spec.settlement);
+        const nextAppliance = spec.met ? (next?.kind || null) : null;
+        const completedUnits = installed + (spec.met ? 1 : spec.percent / 100) * slots.length * 0.25;
+        const totalUnits = slots.length * 1.25;
+        return {
+            id: spec.settlement.id,
+            goal: spec.met
+                ? (next ? `stack the next ${next.kind.replace(/_/g, ' ')} at ${next.x},${next.y},${next.z}` : 'maintain the completed main toaster homestead')
+                : `build the main toaster shell: ${spec.width}x${spec.depth}x${spec.height}`,
             percent: Math.min(100, Math.round(completedUnits / totalUnits * 100)),
             shellPercent: spec.percent,
-            phase: spec.met ? (nextAppliance ? `waiting_for_${nextAppliance}` : 'core_program_complete') : spec.phase,
-            complete: spec.met && spec.furnaces >= TOASTER_FURNACE_TARGET && smokerCount >= 1,
+            // A house with a job still attached must not report itself idle. Left
+            // out, the yard was a thing she was demonstrably doing on stream that
+            // her own readout said nothing about - and she speaks from the readout.
+            phase: spec.met
+                ? (!spec.yardClear ? 'clearing_the_yard'
+                    : (nextAppliance ? `waiting_for_${nextAppliance}` : 'core_program_complete'))
+                : spec.phase,
+            complete: spec.met && installed >= slots.length,
             shellComplete: spec.met,
-            furnaceCount: spec.furnaces, furnaceTarget: s.furnaceTarget,
-            smokerCount, nextAppliance,
-            program: { expansions: { complete: Math.floor(expansionProgress), target: TOASTER_FURNACE_TARGET, fractional: expansionProgress },
-                furnaces: { complete: spec.furnaces, target: TOASTER_FURNACE_TARGET },
-                smokers: { complete: Math.min(1, smokerCount), target: 1 }, completedUnits, totalUnits },
-            dimensions: { width: s.width, depth: s.depth, height: s.height },
-            components: spec.progress ? { clear: !!spec.progress.clear, floor: !!spec.progress.floor,
-                walls: !!spec.progress.walls, roof: !!spec.progress.roof, toastSlots: !!spec.progress.toastSlots,
-                walkthrough: !!spec.progress.walkthrough, sideTorches: !!spec.progress.lit } : {},
+            furnaceCount: spec.furnaces,
+            furnaceTarget: TOASTER_FURNACE_TARGET,
+            smokerCount,
+            nextAppliance,
+            yard: { margin: TOASTER_YARD_MARGIN, clear: spec.yardClear, remaining: spec.yardRemaining },
+            program: {
+                shell: { complete: spec.met ? 1 : 0, target: 1, fractional: spec.percent / 100 },
+                appliances: { complete: installed, target: slots.length },
+                furnaces: { complete: inPlan('furnace'), target: TOASTER_FURNACE_TARGET },
+                smokers: { complete: inPlan('smoker'), target: TOASTER_SMOKER_TARGET },
+                chests: { complete: inPlan('chest'), target: TOASTER_CHEST_TARGET },
+                completedUnits, totalUnits
+            },
+            dimensions: { width: spec.width, depth: spec.depth, height: spec.height },
+            blueprint: toasterBlueprint(spec.settlement),
+            components: {
+                clear: spec.clear, floor: spec.floor, walls: spec.walls, roof: spec.roof,
+                toastSlots: spec.toastSlots, walkthrough: spec.walkthrough, sideTorches: spec.lit
+            },
+            material: spec.material || 'stone',
+            // wire key kept as-is (the in-game telemetry still sends it); it now
+            // counts shell blocks of ANY accepted stone, not smooth stone alone.
             smoothStoneRemaining: Number(spec.progress?.smoothStoneRemaining) || 0,
-            clearRemaining: Number(spec.progress?.clearRemaining) || 0 };
+            clearRemaining: Number(spec.progress?.clearRemaining) || 0,
+            torches: Number(spec.progress?.torches) || 0,
+            torchesRequired: Number(spec.progress?.torchesRequired) || 0
+        };
     }
 
     setOutpostHere(name = 'toaster outpost', level = 1) {
-        if (!this.gameConnected || this._stateIsStale()) throw new Error('need a live world position to establish an outpost');
+        if (!this.gameConnected || this._stateIsStale()) {
+            throw new Error('need a live world position to establish a toaster outpost');
+        }
         const main = this._ensureMainToaster();
-        if (!main) throw new Error('establish the main homestead first');
-        const position = this._point(this.gameState.position);
-        if (!position || !this._dimMatches(main.dimension, this.gameState.dimension)) throw new Error('outpost must share the homestead dimension');
+        if (!main) throw new Error('establish the main toaster homestead before adding outposts');
         if (this.memory.listOutposts(this._worldId()).some((entry) => entry.name.toLowerCase() === String(name).trim().toLowerCase())) {
-            throw new Error(`an outpost named "${name}" already exists`);
+            throw new Error(`a toaster outpost named "${name}" already exists`);
         }
-        if (main.distanceTo(position) < OUTPOST_MIN_HOME_DISTANCE) throw new Error(`outposts must be ${OUTPOST_MIN_HOME_DISTANCE} blocks from home`);
-        if (this.gameState.underwater === true || OCEAN_BIOME_RE.test(String(this.gameState.biome || ''))) throw new Error('outpost needs dry land');
-        if (this._isClaimedCell(position.x, position.z)) throw new Error('outpost site is claimed');
-        const outpost = fitOutpostBelowHomestead(new ToasterOutpost({ name, anchor: position,
-            dimension: this.gameState.dimension, world: this._worldId(), level,
-            ...toasterOutpostDimensions(level) }), main);
+        const position = this._point(this.gameState.position);
+        if (!position || !this._dimMatches(main.dimension, this.gameState.dimension)) {
+            throw new Error('the outpost must be in the main homestead dimension');
+        }
+        if (main.distanceTo(position) < OUTPOST_MIN_HOME_DISTANCE) {
+            throw new Error(`toaster outposts must be at least ${OUTPOST_MIN_HOME_DISTANCE} blocks from the main homestead`);
+        }
+        if (this.gameState.underwater === true || OCEAN_BIOME_RE.test(String(this.gameState.biome || ''))) {
+            throw new Error('a toaster outpost needs dry land');
+        }
+        if (this._isClaimedCell(position.x, position.z)) {
+            throw new Error('that land has already refused building; choose an unclaimed outpost site');
+        }
+        const dimensions = toasterOutpostDimensions(level);
+        const outpost = fitOutpostBelowHomestead(new ToasterOutpost({
+            name, anchor: position, dimension: this.gameState.dimension,
+            world: this._worldId(), level, ...dimensions
+        }), main);
+        // EACH TOASTER'S YARD HAS TO MISS EVERY OTHER TOASTER'S WALLS. Spacing
+        // them by their footprints alone left the nearer one's shell standing
+        // INSIDE the further one's ten-block yard - and "clear the yard" would
+        // then read as "demolish the outpost", one block at a time, forever.
+        const overlaps = this.memory.listSettlements(this._worldId()).some((entry) =>
+            entry.distanceTo(outpost.anchor) < toasterYardSeparation(entry, outpost));
+        if (overlaps) throw new Error('that site overlaps an existing homestead or outpost');
         if (!mainIsBiggest(main, [...this.memory.listOutposts(this._worldId()), outpost])) {
-            throw new Error('main homestead must remain bigger than every outpost');
+            throw new Error('the main toaster must stay strictly larger than every outpost');
         }
-        if (this.memory.listSettlements(this._worldId()).some((entry) =>
-            entry.distanceTo(outpost.anchor) < Math.max(entry.width, entry.depth) + Math.max(outpost.width, outpost.depth))) {
-            throw new Error('outpost overlaps an existing settlement');
-        }
-        return this.memory.upsertSettlement(outpost);
+        const saved = this.memory.upsertSettlement(outpost);
+        this.memory.setFavorite(saved.name, saved.anchor, saved.dimension, 'smooth-stone toaster outpost', saved.world);
+        this.recentEvents.record(`established toaster outpost "${saved.name}"`);
+        return saved;
     }
 
     _findOutpost(name = null) {
-        const entries = this.memory.listOutposts(this._worldId());
+        const outposts = this.memory.listOutposts(this._worldId());
         const wanted = String(name || '').trim().toLowerCase();
-        if (wanted) return entries.find((entry) => entry.name.toLowerCase() === wanted || entry.id.toLowerCase() === wanted) || null;
-        return entries.sort((a, b) => a.distanceTo(this.gameState.position) - b.distanceTo(this.gameState.position))[0] || null;
+        if (wanted) return outposts.find((entry) => entry.id.toLowerCase() === wanted || entry.name.toLowerCase() === wanted) || null;
+        const here = this.gameState.position;
+        return outposts.sort((a, b) => a.distanceTo(here) - b.distanceTo(here))[0] || null;
     }
 
     // save the spot she's standing on under a name of her choosing
@@ -2464,6 +3671,17 @@ class MinecraftTool extends EventEmitter {
         return out;
     }
 
+    // is this whole chat line just somebody's username? checked against the live
+    // roster only, so ordinary one-word replies - "bread", "lmao", "mine" - still
+    // go out, while a leaked addressee never does.
+    _bareRosterName(text) {
+        const bare = String(text || '').trim().replace(/^[@<]+/, '').replace(/[>,:;!?.\s]+$/, '').trim();
+        if (!bare || /\s/.test(bare)) return null;
+        let roster = [];
+        try { roster = this.knownPlayers(24) || []; } catch { roster = []; }
+        return roster.find((name) => String(name).toLowerCase() === bare.toLowerCase()) || null;
+    }
+
     _rememberPlayer(name) {
         const key = String(name || '').trim();
         if (!key) return;
@@ -2474,6 +3692,26 @@ class MinecraftTool extends EventEmitter {
             if (oldest) this._chatRoster.delete(oldest[0]);
         }
         this._chatRoster.set(key, Date.now());
+    }
+
+    // the durable half of meeting someone. the roster above is a RAM cache that dies
+    // with the process; this is the part that means she still knows them tomorrow.
+    _rememberPlayerDurably(kind, name, detail = null) {
+        const who = String(name || '').trim();
+        if (!who) return null;
+        if (this.gameUsername && who.toLowerCase() === String(this.gameUsername).toLowerCase()) return null;
+        const world = this._worldId();
+        try {
+            let out;
+            if (kind === 'chat') out = this.memory.recordPlayerChat(who, detail, world);
+            else if (kind === 'gift') out = this.memory.recordPlayerGift(who, detail || 'bread', world);
+            else if (kind === 'request') out = this.memory.recordPlayerRequest(who, detail?.text, detail?.action, world);
+            else out = this.memory.recordPlayerSighting(who, world);
+            // talking, asking and receiving bread are the things that make somebody a
+            // person she knows rather than a name that walked past.
+            this._bridgePlayerToMemory(who, { immediate: kind !== 'sighting' });
+            return out;
+        } catch { return null; }   // memory is an enhancement, never a reason to stop playing
     }
 
     // is this line clearly aimed at somebody who is not her? a greeting or a
@@ -2494,11 +3732,53 @@ class MinecraftTool extends EventEmitter {
         return null;
     }
 
+    // is this person mid-conversation with her right now? an exchange is opened
+    // when she actually answers somebody (see _openChatExchange) and expires on
+    // its own, so a finished conversation stops making the room sound like it's
+    // hers.
+    _inChatExchange(key) {
+        const ex = this._chatExchanges.get(key);
+        if (!ex) return null;
+        const now = Date.now();
+        if (now >= ex.until || now - ex.since > CHAT_EXCHANGE_MAX_MS) {
+            this._chatExchanges.delete(key);
+            return null;
+        }
+        return ex;
+    }
+
+    // she just said something in game chat. whoever addressed her and is still
+    // waiting on an answer is now in an open exchange - their next lines are for
+    // her whether or not they say her name again. called at the point the message
+    // is genuinely handed to the bridge, never for a refused/paced send.
+    _openChatExchange() {
+        const now = Date.now();
+        this._recentAddressers = this._recentAddressers.filter((a) => now - a.at < CHAT_ADDRESSER_RECENT_MS);
+        for (const who of this._recentAddressers.slice(-3)) {
+            const prev = this._chatExchanges.get(who.key);
+            // extending keeps `since` so the hard ceiling still applies
+            this._chatExchanges.set(who.key, {
+                until: now + CHAT_EXCHANGE_MS,
+                since: prev?.since || now,
+                name: who.name,
+            });
+        }
+        this._recentAddressers = [];
+        if (this._chatExchanges.size > 24) {
+            for (const k of this._chatExchanges.keys()) {
+                if (!this._inChatExchange(k)) this._chatExchanges.delete(k);
+            }
+        }
+    }
+
     shouldSurfaceChat(sender, text) {
         const s = String(sender || '').trim();
         const t = String(text || '').trim();
         if (!s || !t) return { surface: false };
         this._rememberPlayer(s);
+        // record WHAT they said, not just that they spoke. gated to real conversation
+        // (command noise is filtered on the next line) so the roster stays about people.
+        if (!/^[\/!.#@]/.test(t)) this._rememberPlayerDurably('chat', s, t);
         if (this.gameUsername && s.toLowerCase() === String(this.gameUsername).toLowerCase()) return { surface: false };
         if (/^[\/!.#@]/.test(t)) return { surface: false }; // command noise, not conversation
         const now = Date.now();
@@ -2513,10 +3793,21 @@ class MinecraftTool extends EventEmitter {
         const ownerName = String(process.env.MINECRAFT_OWNER || '').toLowerCase();
         const owner = !!ownerName && key === ownerName;
         const addressed = CHAT_ADDRESSED_RE.test(t);
-        if (owner || addressed) {
-            if (now - senderLast < CHAT_SENDER_GAP_MS) return { surface: false };
+        // someone mid-exchange who turns and names ANOTHER player has changed who
+        // they are talking to. that still belongs to the overhear branch below.
+        const aside = !addressed && !!this.addressedToSomeoneElse(t);
+        const exchange = aside ? null : this._inChatExchange(key);
+        if (owner || addressed || exchange) {
+            // inside a live exchange two quick lines are one thought, not spam
+            const gap = (exchange && !addressed && !owner) ? CHAT_EXCHANGE_GAP_MS : CHAT_SENDER_GAP_MS;
+            if (now - senderLast < gap) return { surface: false };
             this._chatSenderLastAt.set(key, now);
-            return { surface: true, addressed: true, owner };
+            // she owes this person an answer; when she gives one the window opens
+            // (or extends) so their NEXT line lands too.
+            this._recentAddressers = this._recentAddressers
+                .filter((a) => a.key !== key && now - a.at < CHAT_ADDRESSER_RECENT_MS);
+            this._recentAddressers.push({ key, name: s, at: now });
+            return { surface: true, addressed: true, owner, followUp: !!exchange && !addressed && !owner };
         }
         // a line clearly aimed at another player is somebody else's conversation.
         // she used to answer "hi marble" with "i'm not marble but sure" because
@@ -2543,6 +3834,19 @@ class MinecraftTool extends EventEmitter {
         return { surface: true, addressed: false, owner: false };
     }
 
+    // WE are about to kill this goal ourselves. mark its pending entry while the
+    // id is still in hand, because altoclef reports a CANCELLED task as a
+    // FINISHED one: UserTaskChain.cancel() calls stop() and then onTaskFinish()
+    // on the way out, and TaskFinishedEvent carries no success/failure channel at
+    // all. so the @stop we are about to send comes straight back as SUCCESS for
+    // this very action - a toaster abandoned at 34% was recorded as a completed
+    // build, put its arc step on the 6 minute cooldown, and left her standing in
+    // an unfinished house with nothing left to do. that was the freeze.
+    _markPendingAborted(id, reason) {
+        const pending = id ? this.pendingActions.get(id) : null;
+        if (pending) pending.abortedByRecovery = reason || 'aborted by recovery';
+    }
+
     _failAllPending(reason) {
         for (const [id, pending] of this.pendingActions) {
             clearTimeout(pending.timer);
@@ -2551,6 +3855,7 @@ class MinecraftTool extends EventEmitter {
                 pending.reject(new Error(reason));
             }
             this.pendingActions.delete(id);
+            this._noteTaskEnded(pending.action);
         }
         this.currentAction = null;
         this.currentActionId = null;
@@ -2569,8 +3874,9 @@ class MinecraftTool extends EventEmitter {
             this.currentTask = null;
         }
         if (this.activeGoal?.id === id) this.activeGoal = null;
+        this._noteTaskEnded(pending.action);
         if (!NON_TASK_ACTIONS.has(pending.action)) {
-            this._lastTaskOutcomeAt = Date.now();
+            this._noteTaskOutcome();
             try { this.memory.recordFailure(pending.action, pending.params?.target, reason); } catch { /* best-effort */ }
             this._applyMinecraftOutcome(false, pending.action);
             this.emit('actionFailed', {
@@ -2586,9 +3892,11 @@ class MinecraftTool extends EventEmitter {
         }
         this.emit('actionTimeout', { id, action: pending.action, params: pending.params, error: reason });
         if (pending.action === 'stop' && this.connected) {
-            // An unconfirmed cancellation is unsafe. Closing the controller link
-            // activates the relay/companion control-loss fail-safes, which issue
-            // their own stop before reconnecting.
+            // We cannot safely assume cancellation when the game never confirms
+            // it. Closing the controller link activates the relay and companion
+            // control-loss fail-safes, both of which issue their own stop before
+            // reconnecting. This converts a lost stop ACK into a bounded recovery
+            // instead of an unsupervised AltoClef task continuing behind a blank HUD.
             this._setFault('stop_unconfirmed', reason);
             try {
                 if (typeof this.client?.terminate === 'function') this.client.terminate();
@@ -2611,8 +3919,13 @@ class MinecraftTool extends EventEmitter {
         const t = text.toLowerCase().trim();
         const speaker = String(inGameSender || '').trim() || process.env.MINECRAFT_OWNER || null;
 
-        // stop / cancel
-        if (/\b(stop|halt|cancel|quit it|knock it off|abort)\b/.test(t)) {
+        // stop / cancel. "stand still" is the single most common cooperation request
+        // on a server - someone is trying to hand her items or build around her - and
+        // it parsed to nothing at all, so an admin asking twice got silence.
+        if (/\b(stop|halt|cancel|quit it|knock it off|abort)\b/.test(t) ||
+            /\b(stand|hold|sit|stay)\s+(still|there|put)\b/.test(t) ||
+            /\bstop\s+moving\b/.test(t) || /\bdon'?t\s+move\b/.test(t) ||
+            /\bwait\s+(there|here|up|a\s+(sec|second|moment|minute))\b/.test(t)) {
             return { action: 'stop' };
         }
         // "turn around", "look at me", "over here" - facing, not travelling
@@ -2657,9 +3970,11 @@ class MinecraftTool extends EventEmitter {
         if (ovenAsk) {
             const kind = ovenAsk[1].replace(/\s+/g, '_');
             // carrying one already -> install it; otherwise go get it
-            return new RegExp(`(^|[^a-z_])${kind}([^a-z_]|$)`).test(this._carrying())
-                ? { action: 'place', target: kind }
-                : { action: 'get', target: kind, params: { amount: 1 } };
+            if (!new RegExp(`(^|[^a-z_])${kind}([^a-z_]|$)`).test(this._carrying())) {
+                return { action: 'get', target: kind, params: { amount: 1 } };
+            }
+            const home = this.homeSpec();
+            return home.met ? (this._installInSettlement(home.settlement, kind) || { action: 'idle' }) : { action: 'go_home' };
         }
         if (/\b(fuel|coal|charcoal)\b/.test(t) && /\b(get|need|more|restock|mine|grab)\b/.test(t)) {
             return { action: 'get', target: /charcoal/.test(t) ? 'charcoal' : 'coal', params: { amount: FUEL_COMFORT } };
@@ -2709,21 +4024,40 @@ class MinecraftTool extends EventEmitter {
         if (craft && /\b(pickaxe|sword|axe|shovel|table|furnace|chest|boat|bed|torch)\b/.test(t)) {
             return { action: 'craft', target: craft[1].trim().replace(/\s+/g, '_') };
         }
-        // move to coords
-        const coords = t.match(/\b(?:go to|move to|walk to|head to)\s+(-?\d+)[ ,]+(-?\d+)[ ,]+(-?\d+)/);
+        // move to coords. two numbers are x and z - the way a destination is
+        // actually said out loud - and three are x y z. the y is optional the
+        // whole way down: travel walks to the COLUMN and lands on whatever
+        // ground is there, so insisting on a height only ever refused people.
+        const coords = t.match(TRAVEL_COORD_RE);
         if (coords) {
-            return { action: 'move', params: { x: +coords[1], y: +coords[2], z: +coords[3] } };
+            const nums = coords.slice(1, 4).filter((n) => n !== undefined).map(Number);
+            if (nums.every(Number.isFinite)) {
+                const [rawX, rawY, rawZ] = nums.length === 3 ? nums : [nums[0], null, nums[1]];
+                const x = Math.round(rawX);
+                const z = Math.round(rawZ);
+                if (Math.abs(x) <= WORLD_EDGE && Math.abs(z) <= WORLD_EDGE) {
+                    const params = { x, z, target: `${x}, ${z}` };
+                    if (rawY !== null) params.y = Math.round(rawY);
+                    return { action: 'move', params };
+                }
+            }
         }
         // "put your armor on" / "armor up" / "gear up". a real instruction people give
         // her constantly in game, and it used to fall through to freeform - which meant
-        // the host llm had to guess the tool call, guessed a target-less equip, and the
+        // her brain had to guess the tool call, guessed a target-less equip, and the
         // bridge answered "no built-in task for equip". mapped explicitly so it just
-        // happens; executeAction resolves which pieces from the live inventory.
+        // happens; _dispatchAction resolves which pieces from her inventory.
         if (/\b(?:armou?r|gear)\s*(?:yourself\s*)?up\b/.test(t)
             || /\b(?:put|throw|get)\s+(?:your|ur|yr|some|that|the)?\s*(?:armou?r|gear)\s+on\b/.test(t)
             || /\b(?:put on|wear|equip)\s+(?:your|ur|yr|some|that|the)?\s*(?:armou?r|gear)\b/.test(t)) {
             return { action: 'equip' };
         }
+        if (/\b(?:set up|establish|make|claim|call)\b[^.?!]{0,24}\b(?:toaster\s+)?outpost\b/.test(t)) {
+            const named = t.match(/\b(?:called|named)\s+([a-z0-9_' -]{2,40})\s*$/);
+            return { action: 'set_outpost', target: named?.[1]?.trim() || 'toaster outpost' };
+        }
+        const goOutpost = t.match(/\b(?:go|head|walk|travel|return)\s+(?:back\s+)?to\s+(?:the\s+)?(?:toaster\s+)?outpost(?:\s+([a-z0-9_' -]{2,40}))?\s*$/);
+        if (goOutpost) return { action: 'go_outpost', target: goOutpost[1]?.trim() || undefined };
         // claiming a home. she should be able to be GIVEN one by the people standing
         // next to her, not only by her own brain - "set your home here", "this is home
         // now", "make this your base". checked before the navigation patterns because
@@ -2754,23 +4088,36 @@ class MinecraftTool extends EventEmitter {
     _looksLikeRequest(text) {
         const t = String(text || '').trim();
         if (t.length < 4 || t.length > 200) return false;
-        return REQUEST_SHAPE_RE.test(t);
+        if (REQUEST_SHAPE_RE.test(t)) return true;
+        // saying her name in a room full of people is deliberate. anything but a bare
+        // greeting is almost always aimed at her and usually wants something.
+        return CHAT_ADDRESSED_RE.test(t) && !GREETING_ONLY_RE.test(t);
     }
 
     recordViewerSuggestion(username, text, { inGame = false } = {}) {
         // only trust the name as a minecraft username when the line came from
         // server chat - a twitch handle is not a player and must never become a
         // follow target.
-        const suggestion = this.interpretChatCommand(text, inGame ? username : null);
+        let suggestion = this.interpretChatCommand(text, inGame ? username : null);
+
+        // where she LIVES is hers to choose. dropping the parsed verb (rather than the
+        // whole line) turns "make this your home" into a freeform ask she hears and
+        // answers herself - so a stranger cannot plant her house by typing one line,
+        // and the request is not silently swallowed either.
+        if (suggestion && ['set_home', 'set_outpost'].includes(suggestion.action)) suggestion = null;
+
+        // "stand still" from someone STANDING NEXT TO HER in the world is the most
+        // basic cooperation primitive there is - they are trying to hand her items or
+        // build around her - and refusing it is most of why she reads as unable to take
+        // direction. an admin asked twice tonight and got silence. stream chat still
+        // cannot halt her (a twitch handle is not in the room), but it degrades to a
+        // freeform ask she can answer rather than vanishing.
+        if (suggestion && suggestion.action === 'stop' && !inGame) suggestion = null;
 
         // A plain chat request must never turn into an immediate dangerous or
-        // disruptive action. Stops, player attacks, giving items, and chat
-        // messages are handled only by an explicit operator/model tool call.
-        // 'set_home' is here for a different reason than the rest: it is not dangerous,
-        // it is PERSONAL. where she lives is hers to choose, so a person asking becomes
-        // a request she can take or refuse in her own words - never a stranger planting
-        // her house somewhere by typing one line.
-        if (suggestion && ['stop', 'attack', 'give', 'chat', 'set_home'].includes(suggestion.action)) return null;
+        // disruptive action. Player attacks, giving items away, and chat messages are
+        // handled only by an explicit operator/model tool call.
+        if (suggestion && ['attack', 'give', 'chat'].includes(suggestion.action)) return null;
 
         // anything ELSE someone asks her to do still counts as a request, even
         // when it matches no built-in verb. this used to `return null` on an
@@ -2801,10 +4148,17 @@ class MinecraftTool extends EventEmitter {
             target: suggestion?.target || suggestion?.params?.target || null,
             params: suggestion?.params || {},
             freeform: !suggestion,
+            // whether this came from somebody standing in the world (a real player
+            // record) or from stream chat (a handle, not a minecraft person)
+            inGame: !!inGame,
             at: now
         };
         this.viewerSuggestions.push(entry);
         if (this.viewerSuggestions.length > MAX_VIEWER_SUGGESTIONS) this.viewerSuggestions.shift();
+        // an ask survived only ten minutes in RAM, so "you never did the thing i asked"
+        // had no possible answer. only in-game asks become a player record: a twitch
+        // handle is not somebody standing in the world.
+        if (inGame) this._rememberPlayerDurably('request', user, { text: entry.text, action: entry.action });
         this.emit('viewerSuggestion', entry);
         return entry;
     }
@@ -2843,15 +4197,13 @@ class MinecraftTool extends EventEmitter {
             };
         }
         if (Number.isFinite(health) && health > 0 && health <= 8) {
-            // WITH FOOD, EAT. this used to return action:null while SAYING "backing
-            // off long enough to eat and regenerate" - so she announced a meal,
-            // issued nothing, and waited for FoodChain to save her. FoodChain only
-            // auto-eats when needsToEat() is true (health <= 10 AND foodLevel <= 19),
-            // so on a full stomach at 8hp it never fires: she parked, and
-            // _requestSafetyIntervention re-stopped her every 12s forever. found
-            // live with a diamond pickaxe, food in the bag, 8hp, staring at a
-            // crafting table for minutes.
-            //
+            // WITH FOOD, EAT. this used to return action:null while SAYING "backing off
+            // long enough to eat and regenerate" - so she announced a meal, issued
+            // nothing, and waited for FoodChain to save her. FoodChain only auto-eats
+            // when needsToEat() is true (health <= 10 AND foodLevel <= 19), so on a
+            // full stomach at 8hp it never fires: she parked, and _requestSafetyIntervention
+            // re-stopped her every 12s forever. found live 2026-08-01 with a diamond
+            // pickaxe, food in the bag, 8hp, staring at a crafting table for minutes.
             // ...but only while eating is a thing that actually happens. this
             // branch used to return `eat` on EVERY tick with no gate at all, so
             // when the game answered "nothing edible in the inventory" (it does:
@@ -2960,7 +4312,9 @@ class MinecraftTool extends EventEmitter {
         if (say) this._pushCommentary(say);
 
         this._safetyIntervention = (async () => {
-            const busy = this.currentAction || this.currentTask || this.activeGoal || this.pendingActions.size > 0;
+            const hasPendingTask = [...this.pendingActions.values()]
+                .some((pending) => !NON_TASK_ACTIONS.has(pending.action));
+            const busy = this.currentAction || this.currentTask || this.activeGoal || hasPendingTask;
             if (busy) {
                 try {
                     await this.executeAction('stop', {}, {
@@ -3026,9 +4380,21 @@ class MinecraftTool extends EventEmitter {
             .finally(() => { this._escapingProtection = false; });
     }
 
+    // OVER the sea without being IN it - i.e. parked on a bridge baritone built to
+    // avoid swimming. she is dry and on the ground, so every water check said "fine"
+    // while she stood in the middle of an ocean doing nothing, and the route never
+    // got recorded as wet so the spot picker would happily send her back across it.
+    _isOverWater() {
+        return this.gameState.overWater === true;
+    }
+
     _isInWater() {
         const g = this.gameState;
         if (g.inWater === true || g.underwater === true) return true;
+        // a bridge over the sea is water as far as "get off it" is concerned. it is
+        // NOT swimming, so this deliberately sits above the legacy inference below
+        // rather than replacing it.
+        if (g.overWater === true) return true;
         // compatibility with an older companion that did not yet emit inWater.
         // defaultGameState seeds inWater:false and _applyState only ever assigns,
         // so `== null` was unreachable and this whole watchdog would have gone
@@ -3064,8 +4430,9 @@ class MinecraftTool extends EventEmitter {
             for (const key of Object.keys(this.memory.getClaimedAreas?.() || {})) this._claimedCells.add(key);
         } catch { /* best-effort */ }
         // rehydrate where she has already been sent. without this the search history
-        // was ram-only: every process restart handed her a blank map and she
-        // re-checked ground she had already walked.
+        // was ram-only: every burnt restart handed her a blank map and she re-checked
+        // ground she had already walked, which is what "it doesn't remember where it
+        // already looked" actually was.
         try {
             const now = Date.now();
             for (const v of this.memory.getVisitedSpots?.() || []) {
@@ -3080,12 +4447,6 @@ class MinecraftTool extends EventEmitter {
     // the server just told her she may not touch this place. remember the GROUND, not
     // the goal: a claim belongs to the location and outlives whatever she was trying
     // to do there, so blacklisting the action alone sends her straight back.
-    // mirror the search memory to disk. best-effort on purpose: failing to remember
-    // is a worse walk, not a broken bot.
-    _persistVisited(x, z, at) {
-        try { this.memory.recordVisitedSpot?.(x, z, at); } catch { /* best-effort */ }
-    }
-
     _recordClaimHere(point) {
         this._ensureTerrainLoaded();
         const p = point || this.gameState.position;
@@ -3095,8 +4456,9 @@ class MinecraftTool extends EventEmitter {
         // a claim is a REGION, not the 64-block cell she happened to be standing in.
         // marking one cell meant the next pick 70 blocks away - still deep inside the
         // same player's base - scored as unclaimed, so she walked back in and got
-        // refused again from another angle. mark the footprint so ONE refusal teaches
-        // her the whole plot.
+        // refused again. that is the "it checks places that are obviously claimed"
+        // complaint: she was re-testing one claim from every direction. mark the
+        // footprint so ONE refusal teaches her the whole plot.
         for (let dx = -CLAIM_SPREAD_CELLS; dx <= CLAIM_SPREAD_CELLS; dx++) {
             for (let dz = -CLAIM_SPREAD_CELLS; dz <= CLAIM_SPREAD_CELLS; dz++) {
                 const key = this._cellKey(x + dx * TERRAIN_CELL, z + dz * TERRAIN_CELL);
@@ -3109,6 +4471,133 @@ class MinecraftTool extends EventEmitter {
 
     _isClaimedCell(x, z) {
         return this._claimedCells.has(this._cellKey(x, z));
+    }
+
+    // the middle of the map she can never own. the companion does not report world
+    // spawn, and every server where this matters puts spawn on the origin, so 0,0
+    // is the default; MINECRAFT_SPAWN_CENTER moves it and MINECRAFT_SPAWN_EXCLUSION=0
+    // switches the whole rule off for a server that has no protected middle.
+    _spawnRegion() {
+        if (this.gameState.multiplayer !== true) return null;
+        if (!(SPAWN_EXCLUSION_RADIUS > 0)) return null;
+        return { x: SPAWN_EXCLUSION_CENTER.x, z: SPAWN_EXCLUSION_CENTER.z, radius: SPAWN_EXCLUSION_RADIUS };
+    }
+
+    // HOW FAR OUT OF THE BOX IS THIS POINT. chebyshev, because the region is a
+    // cuboid: leaving it means pushing max(|dx|,|dz|) past the radius, and no
+    // amount of diagonal travel does that faster than going straight at a wall.
+    // every "am i getting out" question must use THIS and not a radius.
+    _spawnDepth(x, z) {
+        const region = this._spawnRegion();
+        if (!region) return Infinity;
+        const px = Number(x);
+        const pz = Number(z);
+        if (!Number.isFinite(px) || !Number.isFinite(pz)) return Infinity;
+        return Math.max(Math.abs(px - region.x), Math.abs(pz - region.z));
+    }
+
+    _inSpawnRegion(x, z) {
+        const region = this._spawnRegion();
+        if (!region) return false;
+        return this._spawnDepth(x, z) <= region.radius;
+    }
+
+    // is she standing in it RIGHT NOW? a missing position is not a yes - the rest
+    // of the tick falls back to a placeholder 0,0,0 that sits dead centre.
+    //
+    // AND: if her HOME is in there, the rule stands down entirely. someone put it
+    // there deliberately and the server evidently allows it, so refusing to work
+    // at her own house - or worse, marching her back out every time she arrives -
+    // would be this fix picking a fight with a human decision.
+    _standingInSpawnRegion() {
+        const p = this._point(this.gameState.position);
+        if (!p || !this._inSpawnRegion(p.x, p.z)) return false;
+        const home = this._home();
+        if (home && this._inSpawnRegion(home.position?.x, home.position?.z)) return false;
+        return true;
+    }
+
+    // where an action's work would actually LAND, or null when it just happens
+    // wherever she is standing (a wood run, a stone run, a craft).
+    _actionTargetPoint(params) {
+        const x = Number(params?.x);
+        const z = Number(params?.z);
+        if (Number.isFinite(x) && Number.isFinite(z)) return { x, z };
+        if (params?.settlementId) {
+            try {
+                const settlement = this.memory.getSettlement(params.settlementId);
+                const anchor = settlement?.anchor || settlement?.origin;
+                if (anchor && Number.isFinite(Number(anchor.x)) && Number.isFinite(Number(anchor.z))) {
+                    return { x: Number(anchor.x), z: Number(anchor.z) };
+                }
+            } catch { /* an unknown id just means "no target", never a crash */ }
+        }
+        return null;
+    }
+
+    // the one rule: get clear of the spawn region before doing anything in it.
+    // returns a refusal string (so her brain HEARS why and can say so) or null.
+    _spawnRegionRefusal(action, source, params) {
+        if (!SPAWN_REGION_GATED_SOURCES.has(source || 'agent')) return null;
+        const act = String(action || '').trim().toLowerCase();
+        if (!act || SPAWN_REGION_ALLOWED_ACTIONS.has(act) || NON_TASK_ACTIONS.has(act)) return null;
+        const region = this._spawnRegion();
+        if (!region || !this._standingInSpawnRegion()) return null;
+        // WHERE THE WORK LANDS, NOT WHERE HER BODY IS.
+        //
+        // The rule is about GROUND she is not allowed to touch. Her own house can
+        // be a thousand blocks outside the region while she is 108 blocks from
+        // spawn walking back to it - and refusing `build_settlement` there is
+        // refusing her to build her own home, on land nobody has any objection to,
+        // because of where she happened to be standing when she decided to.
+        // An action that names ground outside the region is always fine.
+        // A stone run names nothing, so it stays gated - that was the whole
+        // point, and it is still the thing that was felling the server's trees.
+        const target = this._actionTargetPoint(params);
+        if (target && !this._inSpawnRegion(target.x, target.z)) return null;
+        const p = this._point(this.gameState.position);
+        const out = Math.round(this._spawnDepth(p.x, p.z));
+        return `not here - everything within ${region.radius} blocks of spawn belongs to the server ` +
+            `(she is ${out} out). walk clear of it first, then ${act}`;
+    }
+
+    _isRejectedCell(x, z) {
+        return this._rejectedCells.has(this._cellKey(x, z));
+    }
+
+    /**
+     * SHE LOOKED AT THIS GROUND AND SAID NO. Remember that.
+     *
+     * Nothing did, before: a site turned down for bad footing or no room was
+     * forgotten the moment she walked off, and the spot picker - which only ever
+     * hard-excluded SERVER-refused land - would happily send her straight back
+     * to assess it again. That is the "she keeps going to the same spot" loop,
+     * and it is not even a bug in the picker: it had no idea the place had been
+     * seen. Terrain does not improve while she is away.
+     *
+     * Evidence of PEOPLE is stronger than a terrain verdict, so it goes in the
+     * claim ledger instead - permanent, persisted, spread over the whole plot,
+     * and never waived however desperate the search gets.
+     */
+    _recordSiteRejection(point, reasons = []) {
+        const p = point || this.gameState.position;
+        if (!p || !Number.isFinite(Number(p.x))) return;
+        if (reasons.some((reason) => /people have built here/.test(String(reason)))) {
+            this._recordClaimHere(p);
+            return;
+        }
+        // transient reasons say nothing about the ground - a wandering skeleton
+        // or a player walking past must not condemn a good site forever.
+        const aboutTheGround = reasons.some((reason) => SITE_GROUND_REASONS.test(String(reason)));
+        if (!aboutTheGround) return;
+        this._ensureTerrainLoaded();
+        const key = this._cellKey(Number(p.x), Number(p.z));
+        if (this._rejectedCells.has(key)) return;
+        this._rejectedCells.add(key);
+        while (this._rejectedCells.size > REJECTED_CELL_CAP) {
+            this._rejectedCells.delete(this._rejectedCells.values().next().value);
+        }
+        this.log('debug', `turned down ground at ${Math.round(p.x)},${Math.round(p.z)}: ${reasons.join(', ')}`);
     }
 
     // every long-distance destination she commits to, so the spot picker can refuse to
@@ -3137,9 +4626,15 @@ class MinecraftTool extends EventEmitter {
                 return;
             }
         }
-        this._persistVisited(x, z, now);
         this._recentDestinations.push({ x, z, at: now });
         while (this._recentDestinations.length > RECENT_DESTINATION_CAP) this._recentDestinations.shift();
+        this._persistVisited(x, z, now);
+    }
+
+    // mirror the search memory to disk. best-effort on purpose: failing to remember
+    // is a worse walk, not a broken bot.
+    _persistVisited(x, z, at) {
+        try { this.memory.recordVisitedSpot?.(x, z, at); } catch { /* best-effort */ }
     }
 
     _isRecentDestination(x, z, now = Date.now()) {
@@ -3282,7 +4777,11 @@ class MinecraftTool extends EventEmitter {
     //      a corridor she has personally walked earns a long march
     // returns null when nothing survives. every caller treats that as "skip this
     // pick": standing still is strictly better content than swimming.
-    _pickLandingSpot(origin, minDist, maxDist) {
+    // `opts.notInSpawnRegion` refuses ground inside the server's protected middle;
+    // `opts.awayFrom` demands each candidate put real distance between her and a
+    // point. Both are OPT-IN and only the home-site callers pass them - a flee, a
+    // water escape or a viewer's goto must still be free to cross the map's centre.
+    _pickLandingSpot(origin, minDist, maxDist, opts = {}) {
         this._ensureTerrainLoaded();
         const p = { x: Number(origin?.x) || 0, z: Number(origin?.z) || 0 };
         const y = this._safeTravelY(origin);
@@ -3310,8 +4809,39 @@ class MinecraftTool extends EventEmitter {
                 if (this._wetCells.has(this._cellKey(x, z))) continue;
                 // land she is not allowed to touch is not a destination, however dry it is
                 if (this._isClaimedCell(x, z)) continue;
+                // nor is ground she already walked out to and turned down. this is
+                // a HARD exclusion in both passes on purpose: the relaxed pass
+                // exists to stop her standing still, and re-walking to a site she
+                // has already judged is not movement, it is the loop the operator kept
+                // watching. terrain does not improve while she is away.
+                if (this._isRejectedCell(x, z)) continue;
                 if (strict && this._isRecentDestination(x, z)) continue;
+                // dry, reachable, and never hers. checked AFTER the blind-route
+                // clamp, because clamping is what moves a candidate back inside.
+                if (opts.notInSpawnRegion && this._inSpawnRegion(x, z)) continue;
+                // SHE IS WALKING OUT OF SOMEWHERE. `outward.depth` is whatever
+                // metric the caller has to beat - for the spawn region that is
+                // CHEBYSHEV distance, because the region is a cuboid and the
+                // distance she must actually cover to leave one is max(|dx|,|dz|).
+                // measuring it as a radius (hypot) is why a diagonal hop passed
+                // the outward test having gained 70 blocks of the 580 she needed.
+                let gain = 0;
+                if (opts.outward) {
+                    gain = opts.outward.depth(x, z) - opts.outward.here;
+                    // and it has to be MOSTLY outward, not technically outward:
+                    // a fraction of the hop's own length, so a 200-block walk
+                    // cannot bank 60 blocks of progress and call it a march.
+                    const need = Math.max(opts.outward.min || 0, (opts.outward.fraction || 0) * dist);
+                    if (gain < need) continue;
+                }
                 let score = route.dry + (this._dryCells.has(this._cellKey(x, z)) ? 0.5 : 0);
+                if (opts.outward) {
+                    // GAIN DOMINATES, familiarity is only a tiebreak. it was the
+                    // other way round (dry+known = 1.5 against gain/600 = 0.33),
+                    // so the best-scoring "escape" was reliably a short hop back
+                    // onto ground she had already walked. that is not an escape.
+                    score = gain + score * 20;
+                }
                 if (!strict) {
                     // relaxed pass: get as far from her own recent history as the
                     // terrain allows, rather than accepting the first thing going
@@ -3320,8 +4850,10 @@ class MinecraftTool extends EventEmitter {
                 }
                 if (!best || score > best.score) best = { x, z, score };
                 // the relaxed pass must compare every candidate; stopping at the first
-                // good-enough route is what would hand back the spot she just left
-                if (strict && route.dry >= KNOWN_ROUTE_MIN_DRY_FRACTION) break;
+                // good-enough route is what would hand back the spot she just left.
+                // an outward march must compare them all too - the first acceptable
+                // hop is rarely the longest one, and here length IS the point.
+                if (strict && !opts.outward && route.dry >= KNOWN_ROUTE_MIN_DRY_FRACTION) break;
             }
             return best;
         };
@@ -3411,7 +4943,7 @@ class MinecraftTool extends EventEmitter {
             distanceTo(knownDry) >= 8 && distanceTo(knownDry) <= 1500) {
             return { x: knownDry.x, y: knownDry.y, z: knownDry.z, target: 'the last dry ground' };
         }
-        const home = this.memory.getHome();
+        const home = this._home();
         if (home && this._dimMatches(home.dimension, dimension) &&
             distanceTo(home.position) >= 8 && distanceTo(home.position) <= 1500) {
             return {
@@ -3568,7 +5100,9 @@ class MinecraftTool extends EventEmitter {
             }
             if (!this.connected || !this.gameConnected || this.manualControl || this._stateIsStale()) return;
             await this.executeAction(req.action, params, {
-                priority: 'normal', source: 'request', waitForCompletion: false
+                priority: 'normal', source: 'request', waitForCompletion: false,
+                // carried so that finishing the job closes THEIR request, not just any
+                requestedBy: req.inGame ? req.user : null
             });
             this._pushCommentary(`${req.user} asked, so that's what i'm doing now`);
         })().catch((err) => {
@@ -3577,6 +5111,28 @@ class MinecraftTool extends EventEmitter {
             this._requestIntervention = null;
         });
         return true;
+    }
+
+    // A JOB ENDED, SO START THE CLOCK ON THE NEXT ONE.
+    //
+    // The idle menu is deliberately held back for LLM_GOAL_GRACE_MS so her own
+    // reasoned choice leads - but it was only ever CHECKED on the 25s
+    // autonomous tick, so a 20-second grace really meant 20 to 50 seconds of
+    // standing still, decided by where in the tick the task happened to land.
+    // On 2026-08-05 that was 35 seconds, and a spider used seven of them.
+    //
+    // So the grace now ends on its own schedule instead of waiting to be
+    // noticed. One timer, replaced each outcome, cleared on shutdown.
+    _noteTaskOutcome() {
+        this._lastTaskOutcomeAt = Date.now();
+        if (this._idleWakeTimer) clearTimeout(this._idleWakeTimer);
+        this._idleWakeTimer = setTimeout(() => {
+            this._idleWakeTimer = null;
+            try { this._autonomousTick(); } catch (err) {
+                this.log('warn', `idle wake tick: ${err.message}`);
+            }
+        }, LLM_GOAL_GRACE_MS + 500);
+        if (typeof this._idleWakeTimer.unref === 'function') this._idleWakeTimer.unref();
     }
 
     _autonomousTick() {
@@ -3604,23 +5160,28 @@ class MinecraftTool extends EventEmitter {
         if (this.manualControl) return; // the operator has the keyboard (f1)
         if (this._stateIsStale()) return;
         this._observeMinecraftState();
+        // runs above every early return below, because the two things it records -
+        // "she got home" and "the walk home is closing the gap" - both happen WHILE a
+        // goal is live, and every gate under this point exists to skip busy ticks.
+        this._trackHomeCampaign();
         if (this._waterWatchdog()) return;
         // Goal recovery protects every Burnt-issued finite task, including
         // operator/LLM actions made while autonomous self-play is off.
         if (this._recoverStalledGoal()) return;
         if (this._recoverLoopingGoal()) return;
-        // Ownership/lifecycle recovery applies even when autonomous choices are
-        // disabled: a requested persistent task or orphan can still wedge.
-        if (this._recoverPersistentGoal(now)) return;
-        if (this._recoverOrphanTask(now)) return;
+        // These are ownership/lifecycle invariants, not autonomous choices.
+        // A viewer-issued follow/explore and an unowned in-game task must still
+        // be bounded when self-play is disabled.
+        if (this._recoverPersistentGoal()) return;
+        if (this._recoverOrphanTask()) return;
         if (!this.autonomous) return;
         // SAFETY IS NOT ALLOWED TO OWN THE LOOP FOREVER. this branch returns
         // before every other behaviour, so if the situation it reacts to cannot
         // be fixed by the action it picks, she stands still with the safety goal
         // on screen and nothing ever runs again. that is not a hypothetical: a
-        // permanently-failing eat at 8hp froze the bot solid. the individual
-        // answers already back off; this is the floor under all of them,
-        // including ones that don't exist yet.
+        // permanently-failing eat at 8hp froze her solid on 2026-08-01. the
+        // individual answers already back off; this is the floor under all of
+        // them, including ones that don't exist yet.
         const urgentSafety = this._urgentSafetyBehavior(now);
         if (!urgentSafety) {
             this._urgentSafetySince = 0;
@@ -3650,11 +5211,43 @@ class MinecraftTool extends EventEmitter {
         // don't stack behaviors on top of an active task or a viewer command
         const hasPendingTask = [...this.pendingActions.values()]
             .some((pending) => !NON_TASK_ACTIONS.has(pending.action));
+        // HUD/chat/status responses are concurrent controls, not task owners.
+        // Letting a lost cosmetic ACK trip this gate can turn 30 seconds of
+        // protocol cleanup into 30 seconds of unexplained idling.
         if (this.currentAction || this.currentTask || hasPendingTask) return;
         // a task just finished/failed: the outcome is already queued to burnt's
         // brain, which usually picks what's next. hold the fixed menu back so her
         // reasoned choice leads; the menu is only the fallback for real idle time.
         if (Date.now() - this._lastTaskOutcomeAt < LLM_GOAL_GRACE_MS) return;
+        // GET COMPLETELY CLEAR OF THE SPAWN REGION BEFORE DOING ANYTHING IN IT.
+        //
+        // Every branch below this line touches the world: prep chops wood and
+        // mines stone, the rain pull and the homestead arc quarry, the bread
+        // tendency farms, the menu collects, and the last resort does a "small
+        // wood run". Refusing to SETTLE at spawn (the home-site rule) left all of
+        // that running, so she stood in the server's front garden felling its
+        // trees. Until she is out, her own autonomy is MOVEMENT ONLY - and this
+        // deliberately RETURNS rather than falling through, because falling
+        // through is exactly how the wood run got picked.
+        //
+        // Safety and anything a real person asked for are both already above.
+        if (this._standingInSpawnRegion()) {
+            // the escape may hand her to go_home, so the campaign that retires a
+            // home she can no longer reach has to keep running - it lives below
+            // this gate in the normal flow and would never get a tick otherwise.
+            const homeVerdict = this._homeCampaignVerdict();
+            if (homeVerdict) this._declareHomeUnreachable(homeVerdict);
+            const leave = this._spawnEscapeStep(this._point(this.gameState.position), this._homeRelocation);
+            if (leave && this._safeExecute(leave.action, leave.params, leave.say)) {
+                this.lastAutonomousAt = Date.now();
+            } else if (leave) {
+                // refused (usually `move` blacklisted for 2min after a wander abort).
+                // bounded and self-clearing, but say so out loud - a quiet return
+                // here is the one shape that could read as a freeze.
+                this.log('warn', 'in the spawn region and the walk out was refused; waiting rather than working here');
+            }
+            return;
+        }
         // gear up before wandering. the idle menu is pure entertainment picks, so
         // she used to spawn in with nothing, walk into the dark, and get shot by a
         // skeleton with no pickaxe and no food. one prep goal beats one more death.
@@ -3666,13 +5259,50 @@ class MinecraftTool extends EventEmitter {
                 return;
             }
         }
+        // it's raining on her and she owns a roof. above the homestead arc on
+        // purpose: the arc's open-ended errands (site search, stone runs, the
+        // frontier) are exactly the outdoor time a person would put off until the
+        // weather passed. it holds a 5-minute cooldown, so this is a preference
+        // she acts on once and then gets on with her life - not a rule that pins
+        // her indoors for the whole storm.
+        const shelter = this._rainShelterBehavior();
+        if (shelter) {
+            if (this._safeExecute(shelter.action, shelter.params, shelter.say)) {
+                this.lastAutonomousAt = Date.now();
+                return;
+            }
+            // REFUSED (blacklisted action, busy gate). the pull armed its cooldown
+            // on the way out, so charging it for a walk that never started would
+            // leave her standing in the rain for five minutes having decided to go
+            // inside. give it back - the next tick may well be allowed to move.
+            this._homesteadCooldowns.delete('rain_shelter');
+        }
+        // before the homestead arc gets to send her home AGAIN: has going home
+        // stopped working? this is the whole loop-breaker. the arc below re-issues
+        // go_home on a 4-minute cooldown forever and has no concept of a route that
+        // cannot be walked, so the judgement has to happen above it.
+        const verdict = this._homeCampaignVerdict();
+        if (verdict) this._declareHomeUnreachable(verdict);
+        // No requested goal is active: her standing goal is the homestead. This
+        // is deterministic (not a dice-roll menu entry), while safety and every
+        // human/LLM task above still preempt it.
         const homestead = this._homesteadBehavior();
         if (homestead) {
             if (this._safeExecute(homestead.action, homestead.params || {}, homestead.say)) {
                 this.lastAutonomousAt = Date.now();
                 return;
             }
+            // REFUSED (blacklisted action, or a home-relocation backoff). the step
+            // armed a 4-minute cooldown on its way out, so charging it for work that
+            // never happened meant one refusal cost the toaster four minutes AND
+            // handed this tick to the wander menu. give the cooldown back: the next
+            // tick may well be allowed to build.
+            this._releaseHomesteadCooldown();
         }
+        // A relocation search may deliberately wait one short cooldown for a fresh
+        // site observation. Generic boredom/explore must not carry her hundreds of
+        // blocks away while that bounded nearby search is in progress.
+        if (this._homeRelocation) return;
         // bread tendency: burnt loves bread. with downtime and wheat on hand she
         // gravitates to baking a loaf (she collects + eats bread). fires ~45% of
         // idle ticks when she has the makings; then the wheat's spent and she moves on.
@@ -3691,7 +5321,22 @@ class MinecraftTool extends EventEmitter {
             this.lastAutonomousAt = Date.now();
             return;
         }
-        if (this._avoidAction && Date.now() < (this._avoidUntil || 0)) this._executeAvoidFallback();
+        // NOTHING ABOVE WANTED THE TICK, SO THIS ONE HAS TO.
+        //
+        // Every branch above can decline: the menu can roll a pick it has no
+        // materials for, _safeExecute can refuse a blacklisted action, and the
+        // homestead arc goes quiet whenever its one next step is on cooldown or
+        // paused. Each of those is individually correct and the sum of them was
+        // a bot standing in a field. This used to be reachable ONLY while an
+        // action was suppressed for stalling, which is the one case somebody had
+        // already been bitten by - the general case just fell off the end of the
+        // function and she stood there until the next tick asked again.
+        //
+        // Standing still is now only ever a DECISION (stop, gamer mode, manual
+        // control, a bounded relocation wait) - never the residue of one.
+        if (!this._executeLastResort()) {
+            this.log('warn', 'idle tick found nothing she is allowed to do - even the fallback was refused');
+        }
     }
 
     // parse the biggest stack count of an item from the compact inventory list
@@ -3710,68 +5355,622 @@ class MinecraftTool extends EventEmitter {
     }
 
     _homeDistance() {
-        const home = this.memory.getHome();
+        const home = this._home();
         const p = this.gameState.position;
         if (!home || !p || !this._dimMatches(home.dimension, this.gameState.dimension)) return Infinity;
         return Math.hypot(p.x - home.position.x, p.z - home.position.z);
     }
 
-    _settlementBuildBehavior(settlement) {
-        if (!settlement) return null;
-        if (!this._dimMatches(settlement.dimension, this.gameState.dimension) || settlement.distanceTo(this.gameState.position) > HOMESTEAD_NEAR_HOME) {
-            return { action: 'go_home', params: {}, say: 'returning home to continue the toaster project' };
+    /** Is there anything over her head right now? */
+    _underCover() {
+        return this.gameState.skyVisible === false;
+    }
+
+    /**
+     * Is rain actually landing on HER?
+     *
+     * The companion answers this properly with isRainingAt (biome, sky and roof
+     * aware), but an older deployed jar only sends the global `weather` string -
+     * and that string says "rain" in a desert, in a cave, in the nether and
+     * under her own roof. So when the good signal is absent, fall back to the
+     * string AND the sky check rather than believing the string alone.
+     */
+    _rainingOnHer() {
+        const g = this.gameState;
+        if (typeof g.rainingHere === 'boolean') return g.rainingHere;
+        const wet = g.weather === 'rain' || g.weather === 'thunder';
+        return wet && !this._underCover() && this._dimMatches('overworld', g.dimension);
+    }
+
+    /**
+     * Get out of the rain.
+     *
+     * Not a safety rule - rain does not hurt her. It is what a person does, and
+     * it gives the weather somewhere to land in her behaviour instead of being
+     * one word in a status block she is told not to recite. Returns null when
+     * she is already dry, when there is nowhere to be dry, or when she has
+     * decided this recently, so it is a pull and never a loop.
+     */
+    _rainShelterBehavior() {
+        if (!this._rainingOnHer()) return null;
+        if (this._underCover()) return null;
+        const now = Date.now();
+        if (now - (this._homesteadCooldowns.get('rain_shelter') || 0) < RAIN_SHELTER_COOLDOWN_MS) return null;
+        const home = this._home();
+        if (!home || this._homeRelocation) return null;
+        const dist = this._homeDistance();
+        // already standing on the doorstep: the roof is the fix, not the walk.
+        if (!(dist > 12 && dist < RAIN_SHELTER_MAX_DIST)) return null;
+        this._homesteadCooldowns.set('rain_shelter', now);
+        const thunder = this.gameState.weather === 'thunder';
+        return {
+            action: 'go_home',
+            params: {},
+            say: thunder
+                ? `it's thundering on me. ${home.name} is ${Math.round(dist)} blocks away and has a roof`
+                : `getting rained on. heading back to ${home.name} until it stops`
+        };
+    }
+
+    // `relax` rises with each failed search attempt. an ideal-site standard that can
+    // never be met is worth exactly as much as having no escape hatch at all: on a
+    // populated ocean server "no hostiles" and "no players" are close to permanently
+    // false, so a strict bar would burn all six attempts, back off fifteen minutes,
+    // and drop her straight back into the go-home loop she was escaping.
+    // the HARD rules never relax - water, lava, wrong dimension, someone's claim, a
+    // fresh protection denial. those are the ones that make a home not a home.
+    _homeSiteAssessment(relax = 0) {
+        const g = this.gameState;
+        const p = this._point(g.position);
+        const reasons = [];
+        if (!p) reasons.push('no reliable position');
+        if (this._dimForMove(g.dimension) !== 'overworld') reasons.push('not in the overworld');
+        if (g.onGround === false) reasons.push('not on solid ground');
+        if (g.inLava === true) reasons.push('lava');
+        if (g.inWater === true || g.underwater === true || g.overWater === true ||
+            OCEAN_BIOME_RE.test(String(g.biome || ''))) reasons.push('water');
+        const lowY = relax >= 2 ? 40 : 50;
+        const highY = relax >= 2 ? 220 : 200;
+        if (p && (p.y < lowY || p.y > highY)) reasons.push('awkward elevation');
+        if (g.skyVisible === false && relax < 3) reasons.push('no open sky');
+        const clearEdge = g.clearEdge == null ? NaN : Number(g.clearEdge);
+        // 17 is the 14x9 toaster with elbow room; a cramped-but-dry patch beats
+        // a fifth hour of walking at an ocean.
+        const wantEdge = relax >= 3 ? 9 : (relax >= 2 ? 12 : (relax >= 1 ? 15 : HOME_SITE_MIN_CLEAR_EDGE));
+        if (Number.isFinite(clearEdge) && clearEdge < wantEdge) reasons.push('not enough open room');
+        const site = g.homeSite && typeof g.homeSite === 'object' ? g.homeSite : {};
+        const wantSupport = relax >= 2 ? 60 : 80;
+        const wantSpread = relax >= 2 ? 7 : 4;
+        if (Number.isFinite(Number(site.supportPercent)) && Number(site.supportPercent) < wantSupport) reasons.push('uneven footing');
+        if (Number.isFinite(Number(site.heightSpread)) && Number(site.heightSpread) > wantSpread) reasons.push('terrain too steep');
+        if (Number(site.waterColumns) > 0) reasons.push('water under the footprint');
+        // THE YARD SHE WOULD HAVE TO DIG. Ten clear blocks on every wall is a
+        // promise kept with a pickaxe, so a site is partly a bill: open ground
+        // costs nothing, a copse costs an afternoon of felling, a hillside is a
+        // quarry. Reading it BEFORE she commits is the difference between a house
+        // and a house with a permanently unfinished job attached to it.
+        //
+        // Never a reason at full relax. Felling a wood is real work she is
+        // capable of, and this must not be the standard that makes a forested
+        // continent unsettleable - the yard is a preference, water and claims are
+        // the rules.
+        const yardFill = Number(site.yardFill);
+        const wantYardFill = relax >= 2 ? 2600 : (relax >= 1 ? 1400 : 700);
+        if (relax < HOME_SITE_MAX_RELAX && Number.isFinite(yardFill) && yardFill > wantYardFill) {
+            reasons.push('the yard here would have to be dug out');
         }
-        return { action: 'build_settlement', params: { role: settlement.role, settlementId: settlement.id,
-            ...settlement.anchor, width: settlement.width, depth: settlement.depth, height: settlement.height,
-            target: settlement.name }, say: 'building the smooth-stone toaster shell and its two top slots' };
+        // hostiles wander past constantly and players walk on; neither says anything
+        // permanent about the GROUND. they stop being disqualifying once she has
+        // looked at a few patches and found nothing perfect.
+        if (Number(g.nearbyHostiles) > 0 && relax < 1) reasons.push('hostiles nearby');
+        if (g.multiplayer === true && Number(g.nearbyPlayers) > 0 && relax < 2) reasons.push('other players nearby');
+        // SOMEBODY ALREADY LIVES HERE, and this is the one standard that is never
+        // relaxed. Until now the ONLY way she learned a place was taken was the
+        // server refusing her a block - after she had walked there, settled, and
+        // started quarrying someone's wall. On a world with no claim plugin she
+        // never learned at all. The companion now reads the actual blocks, so a
+        // village or a base is a fact about the ground before she commits to it.
+        // She wants elbow room and no neighbours to damage; being desperate for a
+        // site is not a reason to move into someone's garden.
+        const builtColumns = Number(site.builtColumns);
+        const builtNearest = Number(site.builtNearest);
+        if (Number.isFinite(builtColumns) && builtColumns > BUILT_GROUND_TOLERANCE) {
+            reasons.push(Number.isFinite(builtNearest) && builtNearest >= 0
+                ? `people have built here (${builtColumns} spots, nearest ${builtNearest} blocks)`
+                : 'people have built here');
+        }
+        this._ensureTerrainLoaded();
+        if (p && this._isClaimedCell(p.x, p.z)) reasons.push('known claim');
+        // NEVER RELAXED, like a claim - because it is one, just drawn kilometres
+        // wide instead of in 64-block cells. Without this the relocation branch
+        // (which forces `farEnough` true) would happily found the toaster on the
+        // one piece of ground the server is guaranteed to refuse her.
+        if (p && this._standingInSpawnRegion()) reasons.push('inside the server spawn region');
+        // ground she has already walked out to and turned down. terrain does not
+        // improve while she is away, so re-testing it is the "why does she keep
+        // going back to the same spot" loop exactly. Only a maxed-out search may
+        // reconsider, and even then never one that people had built on.
+        if (p && relax < HOME_SITE_MAX_RELAX && this._isRejectedCell(p.x, p.z)) {
+            reasons.push('already turned this ground down');
+        }
+        this._protectionDenials = this._protectionDenials.filter((at) => Date.now() - at < 60000);
+        if (this._protectionDenials.length > 0) reasons.push('recent protection denial');
+        // ASSESSMENT IS A PURE READ. It runs every tick on the ground under her
+        // feet, so recording a rejection here condemned the spot she was standing
+        // on from its first bad reading - including readings that change a moment
+        // later (she steps out from under an overhang and the sky comes back).
+        // The rejection is recorded where she actually GIVES UP on a site and
+        // walks away, which is the only moment that means "I looked, and no".
+        return { favorable: reasons.length === 0, reasons, clearEdge: Number.isFinite(clearEdge) ? clearEdge : null };
     }
 
-    _installInSettlement(kind, settlement) {
-        const position = settlement.appliancePosition(this._homeOvens().length);
-        return { action: 'install_appliance', params: { target: kind, ...position, settlementId: settlement.id },
-            say: `installing ${kind.replace(/_/g, ' ')} in the center gallery` };
+    /**
+     * WALK OUT OF THE SPAWN REGION BEFORE LOOKING AT ANY GROUND.
+     *
+     * The observed failure: she died, respawned at spawn with her home 4000
+     * blocks away, the go-home campaign called that home unreachable, and the
+     * nearby-site hunt started - 48-160 blocks a hop, capped 360 blocks from
+     * where it began, entirely inside land the server will not let her build on.
+     * Six refusals, a fifteen-minute backoff, the go-home failure again, and the
+     * same hunt: "heading to a better nearby home site", forever, in a box.
+     *
+     * So the exit is its own step, and it is a march - an unknown route is still
+     * clipped to BLIND_WANDER_MAX, so she crosses the region a hop at a time and
+     * each hop only has to earn ground outward.
+     */
+    _spawnEscapeStep(p, relocation = null) {
+        const region = this._spawnRegion();
+        // _standingInSpawnRegion, not _inSpawnRegion: it also rejects the missing
+        // position the caller papers over with a placeholder 0,0,0 (dead centre of
+        // the region - never march away from a guess), and stands the whole rule
+        // down when her home is in there on purpose.
+        if (!region || !p || !this._standingInSpawnRegion()) return null;
+        const now = Date.now();
+        // SHE HAS A HOUSE AND IT IS OUTSIDE. Then walking out is not a
+        // destination, it is what you do when you haven't got one. Marching her
+        // to a random outward point when her own home sits a thousand blocks past
+        // the boundary is both slower and stupider than just going there - and it
+        // is what the operator was watching. Skipped once the home is under relocation:
+        // that means go_home has already been judged unreachable, and the march
+        // is exactly the right answer again.
+        const home = this._home();
+        if (!this._homeRelocation && home && home.position &&
+            this._dimMatches(home.dimension, this.gameState.dimension) &&
+            !this._inSpawnRegion(home.position.x, home.position.z)) {
+            if (now - (this._homesteadCooldowns.get('leave_spawn_region') || 0) < SPAWN_ESCAPE_COOLDOWN_MS) return null;
+            this._homesteadCooldowns.set('leave_spawn_region', now);
+            return {
+                action: 'go_home',
+                params: {},
+                say: `nothing round spawn is mine to touch. ${home.name} is well outside it, so that's where i'm going`
+            };
+        }
+        if (now - (this._homesteadCooldowns.get('leave_spawn_region') || 0) < SPAWN_ESCAPE_COOLDOWN_MS) return null;
+        // the ocean lesson outranks this: a hop out of spawn is not worth a swim
+        if (this._justLeftWater()) return null;
+        const reach = Math.max(HOME_SEARCH_MIN_DISTANCE + 1, region.radius + SPAWN_ESCAPE_MARGIN);
+        const here = this._spawnDepth(p.x, p.z);
+        const depth = (x, z) => this._spawnDepth(x, z);
+        // A MARCH, IN DESCENDING ORDER OF AMBITION. the first tier is what she
+        // should be doing: a hop that spends most of its length going straight at
+        // the nearest wall. the tiers below exist because the autonomous tick now
+        // RETURNS on this step rather than falling through to work she isn't
+        // allowed to do here, so "no good bearing" must never mean "stand in
+        // spawn forever" - on a coast every outward line can be sea.
+        const tiers = [
+            { min: SPAWN_ESCAPE_MIN_GAIN, fraction: 0.55 },   // a real march
+            { min: SPAWN_ESCAPE_MIN_GAIN, fraction: 0 },      // an honest step out
+            { min: 1, fraction: 0 }                           // anything outward at all
+        ];
+        let spot = null;
+        let outward = true;
+        for (const tier of tiers) {
+            spot = this._pickLandingSpot(p, HOME_SEARCH_MIN_DISTANCE, reach,
+                { outward: { depth, here, ...tier } });
+            if (spot) break;
+        }
+        if (!spot) {
+            // nothing outward survives the water rules. keep WALKING (never
+            // working) so the next tick rolls its bearings from new ground.
+            spot = this._pickLandingSpot(p, HOME_SEARCH_MIN_DISTANCE, Math.min(reach, BLIND_WANDER_MAX));
+            outward = false;
+        }
+        this._homesteadCooldowns.set('leave_spawn_region', now);
+        if (!spot) return null;
+        if (relocation) {
+            // the relocation budget is for LOOKING AT GROUND. crossing a region she
+            // was never allowed to build in must not spend it, or the search times
+            // out mid-march and hands her straight back into the same box. clearing
+            // the origin re-anchors the 360-block search area where the hunt really
+            // begins instead of where she happened to respawn.
+            relocation.startedAt = now;
+            relocation.origin = null;
+        }
+        const togo = Math.max(0, Math.round(region.radius - here));
+        return {
+            action: 'move',
+            params: { ...spot, target: 'open land past the spawn region' },
+            // a sideways re-roll is not progress and must not be narrated as any.
+            // she is allowed to sound stuck when she is stuck; she is not allowed
+            // to count a lap as ground gained.
+            say: outward
+                ? `everything within ${region.radius} blocks of spawn is the server's. ${togo} more blocks of other people's ground before i touch anything`
+                : `straight out from spawn is water. going sideways to find a line that isn't, still ${togo} blocks of somebody else's land either way`
+        };
     }
 
-    // the homestead arc: settle -> provision -> live. returns an idle behavior
-    // or null when the arc has nothing due (mood menu takes over). every step
-    // has its own cooldown so a failing step never loops - it goes quiet and
-    // the next-priority step (or the menu) gets its turn.
+    _beginNearbyHomeSearch(goal) {
+        if (this._homeRelocation) return true;
+        if (!this.autonomous || this.manualControl || goal?.source !== 'autonomous') return false;
+        if (Date.now() < this._homeRelocationBackoffUntil) return false;
+        const home = this._home();
+        const where = goal?.params || {};
+        if (!home || !this._dimMatches(home.dimension, where.dimension || this.gameState.dimension)) return false;
+        if (![where.x, where.z].every(Number.isFinite) ||
+            Math.hypot(where.x - home.position.x, where.z - home.position.z) > 3) return false;
+        const distance = this._homeDistance();
+        if (!Number.isFinite(distance) || distance < HOME_RELOCATION_MIN_DISTANCE) return false;
+        this._homeRelocation = {
+            from: { ...home, position: { ...home.position } },
+            origin: { ...this.gameState.position },
+            startedAt: Date.now(), distance, attempts: 0
+        };
+        this._homesteadCooldowns.delete('venture_out');
+        this._homesteadCooldowns.delete('search_nearby_home');
+        try {
+            this.memory.record('recovery', `started looking for a new home near here after the old route failed`, {
+                action: 'move', target: home.name, position: this.gameState.position, dimension: this.gameState.dimension
+            });
+        } catch { /* best-effort */ }
+        return true;
+    }
+
+    // live bookkeeping for the home campaign, run every autonomous tick.
+    // arriving is the only thing that proves a home is fine, and it wipes the doubt
+    // completely - one bad afternoon must never count against a house she uses daily.
+    _trackHomeCampaign() {
+        const home = this._home();
+        if (!home) return;
+        const distance = this._homeDistance();
+        if (!Number.isFinite(distance)) return;       // wrong dimension: not evidence of anything
+        try {
+            if (distance <= HOMESTEAD_NEAR_HOME) {
+                if (this.memory.getHomeCampaign(this._worldId(), home.name, HOME_CAMPAIGN_STALE_MS)) {
+                    this.memory.clearHomeCampaign();
+                    this.log('debug', `arrived at ${home.name}; home route is proven, clearing the unreachable count`);
+                }
+                return;
+            }
+            const goal = this.activeGoal;
+            const walkingHome = goal && goal.requestedAction === 'go_home';
+            if (walkingHome) {
+                this.memory.noteHomeProgress(this._worldId(), home.name, distance, HOME_PROGRESS_FRACTION);
+            }
+        } catch { /* memory is an enhancement, never a reason to stop playing */ }
+    }
+
+    // has setting out for home stopped being worth doing? attempts (or a long enough
+    // campaign) with no meaningful approach in between. progress rebases the campaign
+    // in memory, so reaching this point means she genuinely has not got closer.
+    _homeCampaignVerdict() {
+        const home = this._home();
+        if (!home) return null;
+        let campaign = null;
+        try {
+            campaign = this.memory.getHomeCampaign(this._worldId(), home.name, HOME_CAMPAIGN_STALE_MS);
+        } catch { return null; }
+        if (!campaign) return null;
+        const attempts = Number(campaign.attempts) || 0;
+        const elapsed = Date.now() - (Number(campaign.startedAt) || Date.now());
+        if (attempts < HOME_UNREACHABLE_ATTEMPTS && elapsed < HOME_UNREACHABLE_CAMPAIGN_MS) return null;
+        return { home, attempts, elapsed, bestDistance: Number(campaign.bestDistance) };
+    }
+
+    // the give-up. deliberately NOT gated on goal.source or a 1200-block minimum the
+    // way the wander-ladder path is: whether she can reach her house has nothing to do
+    // with who asked her to walk there, and a home that is unreachable at 400 blocks is
+    // exactly as unreachable as one at 2600.
+    _declareHomeUnreachable(verdict) {
+        if (this._homeRelocation) return true;
+        if (!verdict || !this.autonomous || this.manualControl) return false;
+        if (Date.now() < this._homeRelocationBackoffUntil) return false;
+        const distance = this._homeDistance();
+        if (!Number.isFinite(distance) || distance < HOME_UNREACHABLE_MIN_DISTANCE) return false;
+        const home = verdict.home;
+        const minutes = Math.max(1, Math.round(verdict.elapsed / 60000));
+        this._homeRelocation = {
+            from: { ...home, position: { ...home.position } },
+            origin: { ...this.gameState.position },
+            startedAt: Date.now(), distance, attempts: 0, reason: 'campaign'
+        };
+        this._homesteadCooldowns.delete('venture_out');
+        this._homesteadCooldowns.delete('search_nearby_home');
+        this._homesteadCooldowns.delete('go_home_for_gallery');
+        this._homesteadCooldowns.delete('go_home_for_build');
+        try { this.memory.markHomeCampaignDeclared(); } catch { /* best-effort */ }
+        try {
+            this.memory.recordFailure('go_home', `home (${home.name})`,
+                `unreachable: ${verdict.attempts} departures over ${minutes}min never closed the gap`);
+            this.memory.record('recovery', 'gave up on an unreachable home and started looking for new ground', {
+                action: 'go_home', target: home.name, position: this.gameState.position, dimension: this.gameState.dimension
+            });
+        } catch { /* best-effort */ }
+        this.log('warn', `home unreachable: ${verdict.attempts} departures over ${minutes}min, still ${Math.round(distance)} blocks out - relocating`);
+        this.recentEvents.record(`gave up walking to ${home.name} (${Math.round(distance)} blocks, ${verdict.attempts} tries) and started a new home nearby`);
+        this._pushCommentary(`i've set out for ${home.name} ${verdict.attempts} times in ${minutes} minutes and it's still ${Math.round(distance)} blocks away. that route is not happening. new ground, new toaster, starting here.`, 'unreachable');
+        this.emit('gameEvent', 'home_unreachable', {
+            name: home.name, distance: Math.round(distance), attempts: verdict.attempts, minutes
+        });
+        return true;
+    }
+
+    _claimAutomaticHome(name, note) {
+        const p = this._point(this.gameState.position);
+        if (!p) return null;
+        const old = this._homeRelocation?.from || null;
+        if (old && String(old.name || '').trim().toLowerCase() === String(name || '').trim().toLowerCase()) {
+            this.memory.setFavorite(`former ${old.name}`.slice(0, 48), old.position, old.dimension,
+                'previous toaster home; its route became unreachable', old.world || this._worldId());
+        }
+        const entry = this.memory.setHome(name, p, this.gameState.dimension, note, this._worldId());
+        if (!entry) return null;
+        this._homeRelocation = null;
+        this._homeRelocationBackoffUntil = 0;
+        this._ensureMainToaster();
+        return entry;
+    }
+
+    // hand back the cooldown a homestead step armed when the caller then refused to
+    // run it. only the key armed by the most recent _homesteadBehavior pass is
+    // released, so this can never wipe an unrelated step's genuine cooldown.
+    _releaseHomesteadCooldown() {
+        if (!this._homesteadArmed) return;
+        this._homesteadCooldowns.delete(this._homesteadArmed);
+        this._homesteadArmed = null;
+    }
+
+    _settlementBuildBehavior(settlement, say = null) {
+        if (!settlement) return null;
+        if (!this._dimMatches(settlement.dimension, this.gameState.dimension) ||
+            settlement.distanceTo(this.gameState.position) > HOMESTEAD_NEAR_HOME) {
+            return settlement.role === 'homestead'
+                ? { action: 'go_home', params: {}, say: 'going home. the big toaster is the job now' }
+                : {
+                    action: 'move',
+                    params: { ...settlement.anchor, dimension: this._dimForMove(settlement.dimension), target: settlement.name },
+                    say: `heading to ${settlement.name} to work on the outpost toaster`
+                };
+        }
+        return {
+            action: 'build_settlement',
+            params: {
+                role: settlement.role,
+                settlementId: settlement.id,
+                x: settlement.anchor.x, y: settlement.anchor.y, z: settlement.anchor.z,
+                width: settlement.width, depth: settlement.depth, height: settlement.height,
+                target: settlement.name
+            },
+            say: say || `building ${settlement.name}: whatever stone i've got, two toast slots, a walk-through, and torches up the walls`
+        };
+    }
+
+    // Which blocks in the plan are already spoken for.
+    //
+    // POSITIONS, never a count. The gallery used to be "appliance number N goes
+    // in grid cell N", so one lost record shifted every later appliance by a
+    // block; the floorplan is a fixed map, so the only honest question is which
+    // of its blocks are full. Ovens recorded before this ledger existed still
+    // count - the block is occupied whether or not the settlement remembers
+    // putting it there.
+    _filledApplianceKeys(settlement) {
+        const at = (p) => `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
+        const keys = new Set();
+        for (const entry of settlement?.appliances || []) {
+            if ([entry.x, entry.y, entry.z].every(Number.isFinite)) keys.add(at(entry));
+        }
+        for (const oven of this.memory.listOvens()) {
+            const p = oven.position;
+            if (!p || ![p.x, p.y, p.z].every(Number.isFinite)) continue;
+            if (!this._dimMatches(oven.dimension, settlement.dimension)) continue;
+            if (!settlement.contains(p)) continue;
+            keys.add(at(p));
+        }
+        return keys;
+    }
+
+    // The next empty block in the plan, or null once the toaster is furnished.
+    // A kind narrows it to that kind's stacks; a kind the map has no square for
+    // (campfires, blast furnaces - collection pieces, not toaster parts) gets
+    // the first open patch of floor instead of displacing a planned stack.
+    _nextApplianceSlot(settlement, kind = null) {
+        if (typeof settlement?.applianceSlots !== 'function') return null;
+        const all = settlement.applianceSlots();
+        const filled = this._filledApplianceKeys(settlement);
+        // THE WORLD OUTRANKS THE LEDGER, but only once it has had a look since
+        // the last install. A cancelled place still reports finished, so a
+        // booked-but-absent appliance would otherwise retire its block from a
+        // fixed plan forever; the in-game survey says which slot is REALLY
+        // empty and any later booking is dropped. The freshness guard is what
+        // stops the opposite error - a survey up to a second stale re-offering
+        // the block she just filled.
+        const live = this._matchingBuild(settlement);
+        const worldNext = Number(live?.nextApplianceIndex);
+        const bookedAt = (settlement.appliances || []).reduce((max, e) => Math.max(max, Number(e.at) || 0), 0);
+        if (Number.isInteger(worldNext) && Number(live.appliancesRequired) === all.length
+            && Number(live.updatedAt) > bookedAt + 2000) {
+            // the survey walks the plan in order, so everything before the first
+            // empty block is standing and everything from it is not, whatever
+            // was booked. -1 means it found none empty: the gallery is finished.
+            // ONLY THE PLAN'S OWN BLOCKS are re-judged - the survey says nothing
+            // about the open floor, so a campfire or a workbench standing out
+            // there keeps its record instead of having its square re-offered.
+            const standing = worldNext < 0 ? all.length : worldNext;
+            for (const slot of all) filled.delete(`${slot.x},${slot.y},${slot.z}`);
+            for (const slot of all.slice(0, standing)) filled.add(`${slot.x},${slot.y},${slot.z}`);
+        }
+        const free = (slot) => !filled.has(`${slot.x},${slot.y},${slot.z}`);
+        const planned = all.filter((slot) => !kind || slot.kind === kind);
+        const next = planned.find(free);
+        if (next) return next;
+        if (!kind || planned.length) return null;
+        const spare = toasterOpenFloor(settlement).find(free);
+        return spare ? { ...spare, kind, level: 0, unplanned: true } : null;
+    }
+
+    _installInSettlement(settlement, kind = null, say = null, resolved = null) {
+        const slot = resolved || this._nextApplianceSlot(settlement, kind);
+        if (!slot) return null;
+        return {
+            action: 'install_appliance',
+            params: { target: slot.kind, x: slot.x, y: slot.y, z: slot.z, settlementId: settlement.id },
+            say: say || this._applianceLine(slot)
+        };
+    }
+
+    // A stack reads as one object being built, so the line says which course it
+    // is on rather than announcing an unrelated appliance three times.
+    _applianceLine(slot) {
+        const pretty = String(slot.kind).replace(/_/g, ' ');
+        if (slot.level === 0 || slot.unplanned) return this._ovenLine(slot.kind, 'place');
+        if (slot.level === TOASTER_STACK_HEIGHT - 1) return `${pretty} number three. that stack is finished`;
+        return `stacking another ${pretty} on top. they go three high in here`;
+    }
+
+    _carriesExact(item) {
+        return new RegExp(`(^|[^a-z_])${String(item).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z_]|$)`).test(this._carrying());
+    }
+
+    // the homestead arc is the deterministic idle goal: settle, build the exact
+    // toaster shell, then fill its floorplan one block at a time.
+    // Viewer/operator/LLM goals still win because this is only called
+    // after the task slots are empty.
     _homesteadBehavior() {
         const g = this.gameState;
         const now = Date.now();
         const onCooldown = (key) => now - (this._homesteadCooldowns.get(key) || 0) < HOMESTEAD_STEP_COOLDOWN_MS;
-        const arm = (key) => this._homesteadCooldowns.set(key, now);
-        const home = this.memory.getHome();
+        // the step is armed here but the CALLER may still refuse to run it (a
+        // blacklisted action, a home backoff). remember which key this pass armed
+        // so a refusal can hand it back - see _releaseHomesteadCooldown.
+        this._homesteadArmed = null;
+        const arm = (key) => {
+            this._homesteadCooldowns.set(key, now);
+            this._homesteadArmed = key;
+        };
+        const home = this._home();
         const p = g.position || { x: 0, y: 64, z: 0 };
 
-        // -- settle: no home yet -> push out into the wilderness, then claim a spot
-        if (!home) {
+        // -- settle: no home yet, or a distant home route was proven unreachable.
+        // Relocation searches nearby and keeps the old favorite until a better site
+        // is actually verified, so a disconnect cannot erase the last known home.
+        const relocation = this._homeRelocation;
+        if (!home || relocation) {
+            // an exhausted or expired search gives up BEFORE anything is claimed.
+            // this check used to sit after the "is this ground good enough" branch,
+            // and `relax` climbs with every attempt until it waives the open-sky
+            // rule - so a maxed-out search claimed whatever it happened to be
+            // standing on and founded the toaster in a hole with no roof line.
+            if (relocation) {
+                const searchedFor = now - (relocation.startedAt || now);
+                if (relocation.attempts >= HOME_SEARCH_MAX_ATTEMPTS || searchedFor >= HOME_RELOCATION_MAX_MS) {
+                    this._homeRelocation = null;
+                    this._homeRelocationBackoffUntil = now + HOME_RELOCATION_BACKOFF_MS;
+                    this.recentEvents.record('kept the old home after the nearby replacement search found no good ground');
+                    this._pushCommentary("none of the nearby ground is good enough for the toaster. keeping the old home on the map and dropping this search before it becomes another loop.");
+                    return null;
+                }
+            }
+            // SHE IS STANDING IN THE PART OF THE MAP THAT CAN NEVER BE HERS.
+            // Assessing ground in here is six guaranteed refusals on a loop, so
+            // the walk out comes first and nothing else in this branch runs until
+            // she is clear of it. Yielding when there is no dry way out hands the
+            // tick to the mood menu - she mines, explores and drifts like a person
+            // instead of standing in spawn re-reading the same refused dirt.
+            const escape = this._spawnEscapeStep(p, relocation);
+            if (escape) return escape;
+            if (this._standingInSpawnRegion()) return null;
             const anchor = this._sessionAnchor;
             const anchorDist = anchor ? Math.hypot(p.x - anchor.x, p.z - anchor.z) : 0;
-            const farEnough = g.multiplayer === true
+            const farEnough = !!relocation || (g.multiplayer === true
                 ? anchorDist >= HOMESTEAD_SETTLE_DIST_MP
-                : anchorDist >= HOMESTEAD_SETTLE_DIST_SP;
-            const denialFree = this._protectionDenials.length === 0 &&
-                now - this._lastProtectionEscapeAt > 10 * 60 * 1000;
-            const alone = g.multiplayer !== true || (g.nearbyPlayers || 0) === 0;
-            // never settle in open water - home is where the ovens go, and ovens sink
-            const dryLand = !OCEAN_BIOME_RE.test(String(g.biome || '')) && g.underwater !== true;
-            if (farEnough && denialFree && alone && dryLand) {
-                const entry = this.memory.setHome('the homestead', p, g.dimension, 'claimed wilderness, ovens pending');
+                : anchorDist >= HOMESTEAD_SETTLE_DIST_SP);
+            // a relocation that has already rejected ground gets progressively less
+            // fussy; a first-time settle keeps the full standard. clamped: the ladder
+            // in _homeSiteAssessment only defines rungs 0-3, and past that it stops
+            // meaning "less fussy" and starts meaning "no standards at all".
+            const site = this._homeSiteAssessment(
+                relocation ? Math.min(HOME_SITE_MAX_RELAX, relocation.attempts || 0) : 0);
+            if (farEnough && site.favorable) {
+                const name = relocation?.from?.name || 'the homestead';
+                const entry = this._claimAutomaticHome(name,
+                    relocation ? 'nearby replacement for an unreachable home; toaster rebuilding' : 'favorable claimed wilderness; ovens pending');
                 if (entry) {
                     this.recentEvents.record(`settled: "${entry.name}" is home now (${entry.position.x},${entry.position.z})`);
-                    this._pushCommentary("this is the spot. middle of nowhere, nobody's claims, good bones. home.");
+                    this._pushCommentary(relocation
+                        ? "this ground is dry, open, quiet, and reachable. moving home here. the toaster starts again now."
+                        : "this is the spot. open sky, room for the toaster, nobody's claims. home.");
                     this.emit('gameEvent', 'homestead_settled', { name: entry.name, position: entry.position });
+                    return this._settlementBuildBehavior(this.homeSpec().settlement,
+                        'new home claimed. starting the smooth-stone toaster shell before i wander off again');
                 }
-                return null; // provisioning starts next tick
+                return null;
+            }
+            if (relocation) {
+                // (the attempt/time budget is checked at the top of this branch, before
+                // any ground can be claimed)
+                const lastSearch = this._homesteadCooldowns.get('search_nearby_home') || 0;
+                if (now - lastSearch < HOME_SEARCH_STEP_COOLDOWN_MS) return null;
+                // the hunt anchors itself where it really begins. it used to anchor
+                // where the relocation was declared, which after a march out of the
+                // spawn region is a thousand blocks behind her - every candidate
+                // then fails the origin-radius test and the search never picks one.
+                if (!relocation.origin) relocation.origin = { x: p.x, z: p.z };
+                let spot = null;
+                for (let i = 0; i < 4 && !spot; i++) {
+                    const candidate = this._pickLandingSpot(p, HOME_SEARCH_MIN_DISTANCE, HOME_SEARCH_MAX_DISTANCE,
+                        { notInSpawnRegion: true });
+                    const origin = relocation.origin || p;
+                    if (candidate && Math.hypot(candidate.x - origin.x, candidate.z - origin.z) <= HOME_SEARCH_MAX_ORIGIN_RADIUS) {
+                        spot = candidate;
+                    }
+                }
+                // an attempt is a SITE she went and looked at. finding no candidate
+                // route is a search failure, not a verdict on the ground - counting it
+                // burned all six attempts without her taking a single step whenever she
+                // was stranded somewhere the spot picker couldn't see land from.
+                if (!spot) {
+                    this._homesteadCooldowns.set('search_nearby_home', now);
+                    return null;
+                }
+                relocation.attempts += 1;
+                this._homesteadCooldowns.set('search_nearby_home', now);
+                // she is walking away from this patch having judged it: remember
+                // the verdict so the next candidate is somewhere she has not
+                // already stood and said no.
+                this._recordSiteRejection(p, site.reasons);
+                return {
+                    action: 'move',
+                    params: { ...spot, target: 'a better nearby home site' },
+                    say: `this patch has ${site.reasons.join(', ') || 'bad footing'}. checking better ground nearby, not walking back into that broken route`
+                };
             }
             if (onCooldown('venture_out')) return null;
             // she has no home, so this fires constantly - it was the main engine
             // driving her into the ocean over and over on a coastal server.
             if (this._justLeftWater()) return null;
-            const min = g.multiplayer === true ? 500 : 150;
-            const spot = this._pickLandingSpot(p, min, min + (g.multiplayer === true ? 400 : 150));
+            // GO PROPERLY FAR. these were 500-900 on a server and 150-300 alone,
+            // which on an inhabited map is still somebody's back garden - she kept
+            // surfacing inside the same settled ring and finding it taken. The
+            // BLIND_WANDER_MAX clamp still holds each individual hop to something
+            // survivable when the route is unknown, so this reads as "keep going"
+            // rather than one reckless leap across an ocean.
+            const min = g.multiplayer === true ? VENTURE_MIN_MP : VENTURE_MIN_SP;
+            const span = g.multiplayer === true ? VENTURE_SPAN_MP : VENTURE_SPAN_SP;
+            const spot = this._pickLandingSpot(p, min, min + span, { notInSpawnRegion: true });
             if (!spot) return null;   // no dry way out - let the mood menu have the tick
+            // only the GROUND's fault counts here: `farEnough` being false means
+            // she is simply still too close to where she started, which says
+            // nothing about this patch and must not condemn it.
+            if (!site.favorable) this._recordSiteRejection(p, site.reasons);
             arm('venture_out');
             return {
                 action: 'move',
@@ -3780,81 +5979,123 @@ class MinecraftTool extends EventEmitter {
             };
         }
 
-        // -- provision: build the place up, one goal at a time
+        // -- construct: exact companion-surveyed shell before furniture.
         const homeDist = this._homeDistance();
         const nb = g.nearby || {};
         const inv = this._carrying();
         const has = (frag) => inv.includes(frag);
         const hasExact = (item) => new RegExp(`(^|[^a-z_])${item}([^a-z_]|$)`).test(inv);
+        if (!PICKAXE_TIERS.some((t) => has(`${t}_pickaxe`))) {
+            if (!onCooldown('pickaxe')) {
+                arm('pickaxe');
+                return { action: 'get', params: { target: 'stone_pickaxe', amount: 1 }, say: 'tools first. that much stone needs a pickaxe' };
+            }
+        }
         const spec = this.homeSpec();
         if (!spec.met) {
-            const next = this._settlementBuildBehavior(spec.settlement);
+            const next = this._settlementBuildBehavior(spec.settlement,
+                `main toaster is ${spec.percent}% done. ${this._buildPhaseLabel(spec.phase)}; stone first, appliances after`);
             const key = next?.action === 'build_settlement' ? 'build_main_toaster' : 'go_home_for_build';
-            if (next && !onCooldown(key)) { arm(key); return next; }
-            return null;
-        }
-        if (homeDist > HOMESTEAD_NEAR_HOME && !onCooldown('go_home_for_gallery')) {
-            arm('go_home_for_gallery');
-            return { action: 'go_home', params: {}, say: 'returning to the finished toaster shell' };
-        }
-        const missingSmoker = this._homeOvens('smoker').length === 0;
-        const wanted = spec.furnaces === 0 ? 'furnace' : (missingSmoker ? 'smoker' : (spec.furnaces < TOASTER_FURNACE_TARGET ? 'furnace' : null));
-        if (wanted && !onCooldown(`gallery_${wanted}`)) {
-            arm(`gallery_${wanted}`);
-            return hasExact(wanted) ? this._installInSettlement(wanted, spec.settlement)
-                : { action: 'get', params: { target: wanted, amount: 1 }, say: `getting ${wanted} for the toaster gallery` };
-        }
-        const steps = [];
-        if (!PICKAXE_TIERS.some((t) => has(`${t}_pickaxe`))) {
-            steps.push({ key: 'pickaxe', atHome: false, action: 'get', params: { target: 'stone_pickaxe', amount: 1 }, say: 'tools first. a homestead without a pickaxe is a campsite' });
-        }
-        if (nb.craftingTable == null) {
-            steps.push(hasExact('crafting_table')
-                ? { key: 'crafting_table_place', atHome: true, action: 'place', params: { target: 'crafting_table' }, say: 'workbench down. the homestead has a shop floor now' }
-                : { key: 'crafting_table_get', atHome: true, action: 'get', params: { target: 'crafting_table', amount: 1 }, say: 'workbench for the homestead' });
-        }
-        if (nb.furnace == null) {
-            // If the unit is already in her pack, install it explicitly so the
-            // block really exists at home and enters the durable oven ledger.
-            // Gathering charcoal alone can use a temporary furnace that AltoClef
-            // later picks back up, which is not a homestead installation.
-            steps.push(hasExact('furnace')
-                ? { key: 'oven_furnace_place', atHome: true, action: 'place', params: { target: 'furnace' }, say: 'first oven going in. this one lives HERE' }
-                : { key: 'oven_furnace_get', atHome: true, action: 'get', params: { target: 'furnace', amount: 1 }, say: 'getting the first proper oven for home' });
-        }
-        if (nb.bed == null) {
-            steps.push(has('_bed') || has(' bed')
-                ? { key: 'bed_place', atHome: true, action: 'place', params: { target: 'bed' }, say: 'bed down, spawn set. this is real now' }
-                : { key: 'bed_get', atHome: false, action: 'get', params: { target: 'bed', amount: 1 }, say: 'a homestead needs a bed. some sheep is about to sponsor me' });
-        }
-        if (nb.chest == null) {
-            steps.push(has('chest')
-                ? { key: 'chest_place', atHome: true, action: 'place', params: { target: 'chest' }, say: 'storage installed. the hoard begins' }
-                : { key: 'chest_get', atHome: false, action: 'get', params: { target: 'chest', amount: 1 }, say: 'need a chest for the loot' });
-        }
-        if (nb.smoker == null) {
-            steps.push(has('smoker')
-                ? { key: 'smoker_place', atHome: true, action: 'place', params: { target: 'smoker' }, say: 'smoker joins the oven family' }
-                : { key: 'smoker_get', atHome: false, action: 'get', params: { target: 'smoker', amount: 1 }, say: 'the oven collection grows. smoker next' });
-        }
-        if (nb.campfire == null) {
-            steps.push(has('campfire')
-                ? { key: 'campfire_place', atHome: true, action: 'place', params: { target: 'campfire' }, say: 'campfire out front. ambiance is a survival stat' }
-                : { key: 'campfire_get', atHome: false, action: 'get', params: { target: 'campfire', amount: 1 }, say: 'every homestead needs a campfire to stare into' });
-        }
-        if (!has('torch')) {
-            steps.push({ key: 'torches', atHome: true, action: 'get', params: { target: 'torch', amount: 8 }, say: 'lighting the yard so nothing explodes me at my own front door' });
+            if (next && !onCooldown(key)) {
+                arm(key);
+                return next;
+            }
         }
 
-        for (const step of steps) {
-            if (onCooldown(step.key)) continue;
-            if (step.atHome && homeDist > HOMESTEAD_NEAR_HOME) {
-                if (onCooldown('go_home_for_step')) return null;
-                arm('go_home_for_step');
-                return { action: 'go_home', params: {}, say: 'heading home to work on the place' };
+        // A fresh completed survey is mandatory. If building is cooling down,
+        // don't sneak furniture into an unverified shell.
+        if (!spec.met) return null;
+
+        if (homeDist > HOMESTEAD_NEAR_HOME && !onCooldown('go_home_for_gallery')) {
+            arm('go_home_for_gallery');
+            return { action: 'go_home', params: {}, say: 'the shell is ready. going home to fill the middle with furnaces' };
+        }
+
+        // A MAINTENANCE LOOK. Re-issuing the build on a finished shell surveys,
+        // finds nothing to do and ends - which is exactly the cheap fresh
+        // reading the heal in _nextApplianceSlot needs, and it catches creeper
+        // damage besides. Attempt-timed, not result-timed: if the reading never
+        // arrives this costs one tick every fifteen minutes instead of starving
+        // the gallery forever.
+        if (Date.now() - Number(this._matchingBuild(spec.settlement)?.updatedAt || 0) > GALLERY_RESURVEY_MS
+            && now - (this._lastGalleryResurveyAt || 0) > GALLERY_RESURVEY_MS
+            && !onCooldown('gallery_resurvey')) {
+            this._lastGalleryResurveyAt = now;
+            arm('gallery_resurvey');
+            return this._settlementBuildBehavior(spec.settlement,
+                'walking the toaster before i add to it. checking nothing got blown up');
+        }
+
+        // THE GALLERY IS THE MAP. The floorplan decides what goes in next and
+        // where, so this no longer counts furnaces and guesses - it reads the
+        // first empty block off the plan and fills it. The wave order means the
+        // first three units she ever fits are a chest, a furnace and a smoker,
+        // and each column is finished three high before the course above starts.
+        const slot = this._nextApplianceSlot(spec.settlement);
+        if (slot && !onCooldown(`gallery_${slot.kind}`)) {
+            arm(`gallery_${slot.kind}`);
+            const pretty = slot.kind.replace(/_/g, ' ');
+            // the slot is handed over, never re-derived: the cooldown is already
+            // burned by the time this runs, so a second lookup that disagreed
+            // would spend four minutes on a null.
+            return hasExact(slot.kind)
+                ? this._installInSettlement(spec.settlement, null, null, slot)
+                : { action: 'get', params: { target: slot.kind, amount: 1 }, say: `getting a ${pretty} for the stack` };
+        }
+
+        // THE YARD: ten blocks of air on every wall.
+        //
+        // Below the gallery on purpose, and interleaved with it rather than ahead
+        // of it. The gallery's per-kind cooldowns leave most ticks free, so both
+        // still progress - but a yard is the one job whose size the plan cannot
+        // know (open ground is already finished, a forest is thousands of blocks),
+        // and putting it first would let one treeline starve the furnaces forever.
+        if (!spec.yardClear && !onCooldown('clear_yard')) {
+            const left = Number(spec.yardRemaining);
+            // Did the LAST trip out there actually move anything? A yard that has
+            // not shrunk since she last stood in it is one she cannot reach, and
+            // the answer to that is an hour off, not another walk.
+            const watch = this._yardWatch;
+            if (watch && Number.isFinite(left) && Number.isFinite(watch.remaining)
+                && left >= watch.remaining && now - watch.at < YARD_STUCK_BACKOFF_MS) {
+                return null;
             }
-            arm(step.key);
-            return step;
+            this._yardWatch = { remaining: Number.isFinite(left) ? left : null, at: now };
+            arm('clear_yard');
+            return this._settlementBuildBehavior(spec.settlement, left > 0
+                ? `${left} blocks of hill and tree still crowding the walls. clearing the yard`
+                : 'clearing the ten blocks round the toaster so you can actually see it');
+        }
+
+        // Optional domestic fixtures come only after the exact requested house
+        // and appliance cycle. They remain preserved by later shell repairs.
+        // Chests are NOT here any more - they are three planned stacks in the
+        // map, and a loose "put one somewhere" would have landed on a slot.
+        const fixtures = [];
+        if (nb.craftingTable == null) fixtures.push(hasExact('crafting_table')
+            // an exact square of open floor, not "somewhere nearby" - a loose
+            // place lands on a planned stack's block and strands that slot.
+            ? { key: 'crafting_table_place',
+                ...(this._installInSettlement(spec.settlement, 'crafting_table')
+                    || { action: 'place', params: { target: 'crafting_table' } }),
+                say: 'workbench inside the toaster' }
+            : { key: 'crafting_table_get', action: 'get', params: { target: 'crafting_table', amount: 1 }, say: 'getting a workbench for the toaster' });
+        // The plan keeps a two-bed nook in the middle, walled in by ovens. The
+        // bed task places where she is STANDING, so the only way to honour the
+        // map is to go and stand in it first.
+        if (nb.bed == null) {
+            const nook = toasterBedPositions(spec.settlement)[0];
+            const away = nook && Math.hypot(p.x - nook.x, p.z - nook.z) > 3;
+            fixtures.push(!has('_bed')
+                ? { key: 'bed_get', action: 'get', params: { target: 'bed', amount: 1 }, say: 'getting a bed for the middle of the toaster' }
+                : (away
+                    ? { key: 'bed_nook', action: 'move', params: { ...nook, target: 'the bed nook' }, say: 'the bed goes dead centre, walled in by ovens' }
+                    : { key: 'bed_place', action: 'place', params: { target: 'bed' }, say: 'bed in the nook. the ovens can watch me sleep' }));
+        }
+        for (const fixture of fixtures) {
+            if (onCooldown(fixture.key)) continue;
+            arm(fixture.key);
+            return fixture;
         }
 
         // -- live: the bread pipeline + putting the haul away.
@@ -3875,7 +6116,16 @@ class MinecraftTool extends EventEmitter {
             // replants what it takes, and the protection escape covers claims
             return { action: 'get', params: { target: 'wheat', amount: 6 }, say: 'wheat hunt. the bread must flow' };
         }
-        if ((Array.isArray(g.inventory) ? g.inventory.length : 0) >= 15 && nb.chest != null && !onCooldown('deposit')) {
+        // "the bag is full" is a SLOT question, not a distinct-type question. the
+        // old `>= 15 entries` proxy was calibrated against a companion that capped
+        // the list at 18 types; now the whole bag is reported, so that proxy would
+        // trip on any well-stocked homesteader. use the real free-slot count when
+        // the companion sends it, and keep the proxy only for older jars.
+        const freeSlots = Number.isFinite(g.inventoryFree) ? g.inventoryFree : null;
+        const bagFull = freeSlots !== null
+            ? freeSlots <= 4
+            : (Array.isArray(g.inventory) ? g.inventory.length : 0) >= 15;
+        if (bagFull && nb.chest != null && !onCooldown('deposit')) {
             arm('deposit');
             return { action: 'deposit', params: {}, say: 'offloading the haul into the home chest' };
         }
@@ -3919,12 +6169,18 @@ class MinecraftTool extends EventEmitter {
     // the family is complete. prereq-gated so she never burns a cooldown asking
     // for a blast furnace with no iron on her.
     _nextOvenWanted() {
-        const tally = this.memory.ovenTally();
         const hay = this._carrying();
-        for (const [kind, target] of Object.entries(OVEN_TARGETS)) {
-            if ((tally[kind] || 0) >= target) continue;
+        const affordable = (kind) => {
             const prereq = OVEN_PREREQ[kind];
-            if (prereq && !prereq.test(hay)) continue;
+            return !prereq || prereq.test(hay);
+        };
+        // Plain furnaces and the first smoker are owned by the homestead cycle:
+        // it expands and re-surveys before installing them. This secondary drive
+        // only adds exact-position specialty appliances to a finished shell.
+        for (const kind of ['campfire', 'blast_furnace', 'soul_campfire']) {
+            const target = OVEN_TARGETS[kind] || 1;
+            if (this._homeOvens(kind).length >= target) continue;
+            if (!affordable(kind)) continue;
             return kind;
         }
         return null;
@@ -3937,7 +6193,7 @@ class MinecraftTool extends EventEmitter {
     // call, each on its own cooldown, null when nothing is due.
     _obsessionBehavior() {
         const g = this.gameState;
-        const home = this.memory.getHome();
+        const home = this._home();
         if (!home) return null;                    // settle first; the arc owns that phase
         const now = Date.now();
         const onCooldown = (key) => now - (this._obsessionCooldowns.get(key) || 0) < OBSESSION_STEP_COOLDOWN_MS;
@@ -3962,7 +6218,8 @@ class MinecraftTool extends EventEmitter {
         // 2. THE COLLECTION. she keeps adding units - the plain furnace most of
         // all, because that's the toaster. get it, then install it at home so it
         // joins the family with a name.
-        const wanted = this._nextOvenWanted();
+        const readyHome = this.homeSpec();
+        const wanted = readyHome.met ? this._nextOvenWanted() : null;
         if (wanted && !onCooldown(`oven_${wanted}`)) {
             // exact item match: plain 'furnace' is a substring of 'blast_furnace'
             // and 'campfire' of 'soul_campfire', so a substring test would think
@@ -3976,7 +6233,8 @@ class MinecraftTool extends EventEmitter {
             } else {
                 arm(`oven_${wanted}`);
                 return carryingIt
-                    ? { action: 'place', params: { target: wanted }, say: this._ovenLine(wanted, 'place') }
+                    ? (this._installInSettlement(readyHome.settlement, wanted)
+                        || { action: 'place', params: { target: wanted }, say: this._ovenLine(wanted, 'place') })
                     : { action: 'get', params: { target: wanted, amount: 1 }, say: this._ovenLine(wanted, 'get') };
             }
         }
@@ -4023,6 +6281,20 @@ class MinecraftTool extends EventEmitter {
                     return null;                   // a bookmark, not a goal - let the menu play
                 }
             }
+        }
+
+        // THE BREAD HOARD. past what she needs to eat, she just likes having an
+        // absurd amount of bread on her - it is the personality, and it is what makes
+        // "here, have a loaf" possible the moment somebody wanders up. LAST on
+        // purpose: this is what she does with leftover time, never instead of tools,
+        // fire, shelter or anything a person asked for.
+        if (this._breadCount() < BREAD_HOARD && this._hasWheat() && !onCooldown('bread_hoard')) {
+            arm('bread_hoard');
+            return {
+                action: 'craft',
+                params: { target: 'bread', amount: 3 },
+                say: `${this._breadCount()} loaves on me and that is not enough loaves`
+            };
         }
         return null;
     }
@@ -4087,9 +6359,6 @@ class MinecraftTool extends EventEmitter {
             ? g.nearby.nearestOre
             : null;
 
-        // the homestead arc is her default way of living - it outranks the mood
-        // menu most of the time but never a strong feeling (checks above) and
-        // never an operator/viewer/llm goal (autonomy only runs when idle).
         // the obsession picks up where the homestead checklist stops. provisioning
         // finishes; keeping the fuel bin full, the collection growing, the pantry
         // stocked and the place lit never does. sampled under the homestead so the
@@ -4109,7 +6378,13 @@ class MinecraftTool extends EventEmitter {
         // own home, hanging out there with visitors is fine), else the menu
         // just avoids block-breaking picks near people.
         const nearPeople = g.multiplayer === true && (g.nearbyPlayers || 0) > 0;
-        if (nearPeople && this._homeDistance() > 64 && Math.random() < 0.4) {
+        const unfinishedToaster = this._toasterUnfinished();
+        // nobody sets off on a long walk in the rain. these two rolls are the
+        // menu's outbound picks (hundreds of blocks each), so while it's actually
+        // landing on her they sit the turn out and the indoor/near picks below
+        // get it instead. the shelter pull above already had its one go.
+        const wet = this._rainingOnHer();
+        if (!wet && nearPeople && !unfinishedToaster && this._homeDistance() > 64 && Math.random() < 0.4) {
             const p2 = g.position || { x: 0, y: 64, z: 0 };
             const drift = this._pickLandingSpot(p2, 120, 180);
             if (drift) {
@@ -4124,7 +6399,13 @@ class MinecraftTool extends EventEmitter {
         // multiplayer wanderlust: everything near spawn/towns is claimed, so idle
         // time favors real distance - pick a far point and walk until the land
         // stops belonging to people. fires often enough to keep her moving out.
-        if (g.multiplayer === true && g.timeOfDay !== 'night' && !this._justLeftWater() && Math.random() < 0.4) {
+        // ...but a half-built toaster at home outranks the frontier. this roll had no
+        // home guard at all, so 40% of every idle tick walked her up to 900 blocks
+        // away from a shell she was in the middle of building - the single biggest
+        // reason the homestead never got finished. the wanderlust is hers again the
+        // moment the shell surveys complete.
+        if (!wet && g.multiplayer === true && !unfinishedToaster && g.timeOfDay !== 'night' &&
+            !this._justLeftWater() && Math.random() < 0.4) {
             const p = g.position || { x: 0, y: 64, z: 0 };
             const spot = this._pickLandingSpot(p, 300, 900);
             if (spot) {
@@ -4140,10 +6421,15 @@ class MinecraftTool extends EventEmitter {
         // home instinct: night, far from home, same dimension -> head back like
         // a person would. bounded range so she doesn't cross the map at 3am, and
         // sampled so it's a pull, not a compulsion.
-        const home = this.memory.getHome();
-        if (home && g.timeOfDay === 'night' && this._dimMatches(home.dimension, g.dimension)) {
+        const home = this._home();
+        if (home && g.timeOfDay === 'night' && this._dimMatches(home.dimension, g.dimension) && !this._homeRelocation) {
             const hd = Math.hypot((g.position?.x ?? 0) - home.position.x, (g.position?.z ?? 0) - home.position.z);
-            if (hd > 48 && hd < 1200 && Math.random() < 0.6) {
+            // the one go_home issuer that had NO cooldown at all: a 0.6 dice roll on
+            // every idle tick that got this far, all night. a pull she keeps acting on
+            // every forty seconds is not a pull, it's the loop with better narration.
+            const lastPull = this._homesteadCooldowns.get('home_instinct') || 0;
+            if (hd > 48 && hd < 1200 && Date.now() - lastPull >= HOME_INSTINCT_COOLDOWN_MS && Math.random() < 0.6) {
+                this._homesteadCooldowns.set('home_instinct', Date.now());
                 return { action: 'go_home', params: {}, say: `night's here and ${home.name} is ${Math.round(hd)} blocks that way. going home` };
             }
         }
@@ -4363,7 +6649,8 @@ class MinecraftTool extends EventEmitter {
 
     // why an "armour up" instruction cannot be carried out. the old path answered
     // "altoclef has no built-in task for equip yet", which is not true and told
-    // nobody anything useful.
+    // neither her nor the person who asked anything useful. she can only relay a
+    // real reason if she is given one.
     _armorRefusalReason() {
         const g = this.gameState;
         const worn = (Array.isArray(g.armor) ? g.armor : []).filter(Boolean);
@@ -4384,6 +6671,18 @@ class MinecraftTool extends EventEmitter {
         const isNight = String(this.gameState.timeOfDay || '').toLowerCase() === 'night';
         const deep = Number.isFinite(Number(this.gameState.position?.y)) && Number(this.gameState.position.y) < 45;
         const candidates = [];
+        // A WEAPON COMES FIRST WHEN SOMETHING IS HUNTING HER. she respawns owning
+        // nothing, and the list used to open with the pickaxe - so a fresh spawn walked
+        // off to mine stone while a zombie ate her, and died holding air. gear order is
+        // a comfort question right up until something is actually chasing you.
+        if (!/_sword/.test(hay) && Number(this.gameState.nearbyHostiles) > 0) {
+            candidates.push({
+                key: 'stone_sword',
+                action: 'craft',
+                params: { target: 'stone_sword' },
+                say: 'something is following me and my hands are empty. sword first, everything else after'
+            });
+        }
         if (!PICKAXE_TIERS.some((t) => hay.includes(`${t}_pickaxe`))) {
             candidates.push({
                 key: 'stone_pickaxe',
@@ -4393,6 +6692,13 @@ class MinecraftTool extends EventEmitter {
             });
         }
         if (!FOOD_RE.test(hay)) {
+            // Bread is only a quick food answer when the wheat is already in her
+            // pockets. `craft bread` is implemented by AltoClef's recursive `get`;
+            // without wheat it silently turns into a crop expedition. On the live
+            // server that became `wander for infinity blocks` and Burnt stood still
+            // rescanning for 3m38s while claiming to be crafting bread. Let the food
+            // task choose an available source instead of hard-locking survival prep
+            // to a crop that may not exist anywhere nearby.
             const canBakeNow = this._hasWheat();
             candidates.push({
                 key: 'food',
@@ -4503,6 +6809,7 @@ class MinecraftTool extends EventEmitter {
         if (!goal?.persistent) return false;
         const base = goal.action === 'idle' ? PERSISTENT_IDLE_DWELL_MS : PERSISTENT_DWELL_MS;
         let dwellMs = goal.source === 'autonomous' ? base : base * PERSISTENT_REQUESTED_DWELL_MULT;
+        // Being hurt ends a parked goal early no matter who asked for it.
         const hurtRecently = now - (this._lastDamageAt || 0) < PERSISTENT_DANGER_BREAK_MS;
         if (hurtRecently) dwellMs = Math.min(dwellMs, PERSISTENT_DANGER_BREAK_MS);
         if (now - goal.startedAt < dwellMs) return false;
@@ -4517,8 +6824,8 @@ class MinecraftTool extends EventEmitter {
                 position: this.gameState.position,
                 dimension: this.gameState.dimension
             });
-        } catch { /* optional memory must not defeat recovery */ }
-        this._avoidAction = goal.action;
+        } catch { /* recovery must not be defeated by optional memory */ }
+        this._avoidAction = goal.requestedAction || goal.action;
         this._avoidUntil = now + LOOP_AVOID_MS;
         this._applyMinecraftEvent('bored');
         this.activeGoal = null;
@@ -4529,6 +6836,9 @@ class MinecraftTool extends EventEmitter {
     }
 
     _recoverOrphanTask(now = Date.now()) {
+        // The task gate refuses to pick anything while currentTask is set. If no
+        // action, pending request, or tracked goal owns that string, no watchdog
+        // can supervise it and it must be treated as stale state.
         const hasPendingTask = [...this.pendingActions.values()]
             .some((pending) => !NON_TASK_ACTIONS.has(pending.action));
         const orphaned = this.currentTask && !this.activeGoal && !this.currentAction && !hasPendingTask;
@@ -4548,7 +6858,12 @@ class MinecraftTool extends EventEmitter {
         return true;
     }
 
-    _executeAvoidFallback() {
+    /**
+     * The floor of the idle loop: something safe, mechanically different from
+     * whatever just declined, and always available. Called whenever a tick would
+     * otherwise end with her standing still.
+     */
+    _executeLastResort() {
         const candidates = Number(this.gameState.nearbyHostiles) > 0
             ? [
                 { action: 'defend', params: {}, say: 'that plan wedged. clearing the immediate problem instead' },
@@ -4583,9 +6898,25 @@ class MinecraftTool extends EventEmitter {
     // it now rides along to the goal so the in-game hud can show WHY, which is the half
     // the mechanical task chain can never tell you.
     _safeExecute(action, params, say, source = 'autonomous') {
-        if (this._avoidAction === action && Date.now() < (this._avoidUntil || 0)) {
-            this.log('debug', `skipping recently stalled autonomous action: ${action}`);
+        if (source === 'autonomous' && action === 'go_home' &&
+            this._homeDistance() >= HOME_RELOCATION_MIN_DISTANCE &&
+            Date.now() < this._homeRelocationBackoffUntil) {
+            this.log('debug', 'skipping distant home route during relocation backoff');
             return false;
+        }
+        if (this._avoidAction === action && Date.now() < (this._avoidUntil || 0)) {
+            // ...EXCEPT WALKING OUT OF THE SPAWN REGION. this blacklist exists so
+            // she stops re-picking an action that just stalled, but the march
+            // picks a fresh destination every time and is the ONLY thing she is
+            // allowed to do in here. a mob pinning her mid-hop blacklists `move`
+            // for two minutes, and the tick has nothing else to offer, so she
+            // stood in the middle getting chased while the one escape she had was
+            // switched off. that is the loop the operator watched, not a symptom of it.
+            if (!(action === 'move' && this._standingInSpawnRegion())) {
+                this.log('debug', `skipping recently stalled autonomous action: ${action}`);
+                return false;
+            }
+            this.log('info', 'walking out of the spawn region overrides the stalled-move backoff');
         }
         if (say) this._pushCommentary(say);
         this.executeAction(action, params, { priority: 'low', source, why: say || null, waitForCompletion: false }).catch((err) => {
@@ -4594,14 +6925,98 @@ class MinecraftTool extends EventEmitter {
         return true;
     }
 
+    /**
+     * SHE IS NOT FAILING AT JOBS, SHE IS STUCK IN A PLACE.
+     *
+     * Every recovery in this file abandons a GOAL: the action gets blacklisted,
+     * the destination gets remembered, the idle menu picks something else. All of
+     * that is right when the job was the problem. None of it can see the case
+     * where the GROUND is the problem, and then "try something else" just feeds
+     * the next goal into the same wall.
+     *
+     * Live on 2026-08-05: pinned at (-258,81,1476), a `move` to a site FORTY-EIGHT
+     * blocks away, baritone re-deriving the identical "Path goes for
+     * 84.8174510345601 blocks" every six seconds and never arriving, then `craft
+     * torch` stalling at the same coordinates, then another move. Each individual
+     * abort was correct and she never went anywhere for minutes.
+     *
+     * So count aborts BY PLACE. Several in a row inside a few blocks is not bad
+     * luck with tasks, it is terrain she cannot leave by asking politely.
+     */
+    _noteStallHere() {
+        const p = this._point(this.gameState.position);
+        if (!p) return;
+        const now = Date.now();
+        const anchor = this._stallAnchor;
+        if (anchor && now - anchor.at < STUCK_WINDOW_MS &&
+            Math.hypot(p.x - anchor.x, p.z - anchor.z) <= STUCK_RADIUS) {
+            anchor.at = now;
+            anchor.count += 1;
+        } else {
+            this._stallAnchor = { x: p.x, z: p.z, at: now, count: 1 };
+        }
+        if (this._stallAnchor.count < STUCK_STREAK) return;
+        this._stallAnchor = null;
+        this._breakOutOfStuckSpot(p);
+    }
+
+    /**
+     * Get off this square, by the shortest honest means available.
+     *
+     * Ground she has PERSONALLY STOOD ON first: a cell in her own terrain memory
+     * is ground baritone demonstrably walked her across, which is a far better bet
+     * than any computed bearing when the computed bearings are what just failed.
+     * Then a short hop - short on purpose, because the long ones are the ones that
+     * cannot be pathed. Never a full-size venture; this is a door, not a journey.
+     */
+    _breakOutOfStuckSpot(p) {
+        // the ground itself is suspect now, so the site picker must stop offering it
+        this._recordSiteRejection(p, ['terrain too steep']);
+        this._rememberDestination(p);
+        const known = this._nearestDryCell(p);
+        const spot = (known && Math.hypot(known.x - p.x, known.z - p.z) <= STUCK_ESCAPE_MAX
+            ? { x: known.x, y: this._safeTravelY(p), z: known.z }
+            : null)
+            || this._pickLandingSpot(p, 12, STUCK_ESCAPE_MAX);
+        this.recentEvents.record('got wedged on one spot and had to break out of it');
+        try {
+            this.memory.record('recovery', 'wedged in one spot - every job failed there', {
+                action: 'move', position: p, dimension: this.gameState.dimension
+            });
+        } catch { /* best-effort */ }
+        if (!spot) {
+            // nothing reachable that she knows of. say so rather than pretending -
+            // the honest fallback is altoclef's own wander, which at least moves.
+            this._pushCommentary("i can't get off this square. every single thing i start dies right here.");
+            this._safeExecute('explore', {}, null);
+            return;
+        }
+        // bypass the action backoff: `move` is very likely the thing that just got
+        // blacklisted, and it is also the only thing that can help.
+        this._avoidAction = null;
+        this._avoidUntil = 0;
+        this._safeExecute('move', { ...spot, target: 'anywhere but this exact square' },
+            "three jobs in a row died on this one spot. it's not the jobs. getting off it.");
+    }
+
     _recoverStalledGoal() {
         const goal = this.activeGoal;
         const now = Date.now();
-        const stallMs = goal ? (ACTION_STALL_MS[goal.action] || AUTONOMOUS_STALL_MS) : AUTONOMOUS_STALL_MS;
+        let stallMs = goal ? (ACTION_STALL_MS[goal.action] || AUTONOMOUS_STALL_MS) : AUTONOMOUS_STALL_MS;
+        // The builder telling us outright that it cannot build this site is a
+        // verdict, not a silence, so it does not have to serve out the whole
+        // build budget before she is moved onto something else. Previously
+        // nothing on this side ever read the string and it only mattered by
+        // being stable enough not to fake progress.
+        const blocked = goal?.action === 'build_settlement'
+            && this.gameState.settlementBuild?.phase === BUILD_BLOCKED_PHASE;
+        if (blocked) stallMs = Math.min(stallMs, BUILD_BLOCKED_GRACE_MS);
         if (!goal || !goal.watchdog || now - goal.lastProgressAt < stallMs) return false;
         const description = this._describeTask(goal.action, goal.params);
         const stalledFor = Math.max(1, Math.round((now - goal.lastProgressAt) / 1000));
-        const reason = `no movement or inventory progress for ${stalledFor}s`;
+        const reason = blocked
+            ? `baritone refuses to build this site (${stalledFor}s)`
+            : `no movement or inventory progress for ${stalledFor}s`;
         this.log('warn', `minecraft goal stalled; stopping ${description} (${reason})`);
         this.memory.recordFailure(goal.action, goal.params?.target, reason);
         this.memory.record('recovery', `abandoned stalled ${description}`, {
@@ -4610,11 +7025,18 @@ class MinecraftTool extends EventEmitter {
             position: this.gameState.position,
             dimension: this.gameState.dimension
         });
+        this._markPendingAborted(goal.id, reason);
         this._applyMinecraftEvent('stalled');
-        this._avoidAction = goal.action;
+        // Do not immediately select the exact same dead action from another idle
+        // branch on the next tick. Homestead/prep have their own cooldowns; this
+        // closes the generic idle-menu path too.
+        this._avoidAction = goal.requestedAction || goal.action;
         this._avoidUntil = now + LOOP_AVOID_MS;
         this.activeGoal = null;
         this.currentTask = `recovering from stalled ${description}`;
+        // "trying something else" is only an answer when the JOB was the problem.
+        // count the failures that happen on one patch of ground - see _noteStallHere.
+        this._noteStallHere();
         this._pushCommentary(`i'm stuck on ${description}. aborting and trying something else.`);
         this.executeAction('stop', {}, { priority: 'urgent', source: 'recovery', waitForCompletion: false }).catch((err) => {
             this.log('warn', `failed to stop stalled goal: ${err.message}`);
@@ -4651,9 +7073,10 @@ class MinecraftTool extends EventEmitter {
                 position: this.gameState.position, dimension: this.gameState.dimension
             });
         } catch { /* memory best-effort */ }
+        this._markPendingAborted(goal.id, `looping: ${why}`);
         this._applyMinecraftEvent('looping');
         // don't let the next tick immediately re-pick the action that just looped
-        this._avoidAction = goal.action;
+        this._avoidAction = goal.requestedAction || goal.action;
         this._avoidUntil = now + LOOP_AVOID_MS;
         this.activeGoal = null;
         this.currentTask = `breaking out of a loop (${description})`;
@@ -4720,14 +7143,26 @@ class MinecraftTool extends EventEmitter {
                 // home she keeps living her arc and only holds position when
                 // hostiles are genuinely pressing (altoclef's survival chain
                 // covers mobs while she works).
-                const home = this.memory.getHome();
+                const home = this._home();
                 const homeDist = this._homeDistance();
-                if (home && homeDist > 24 && homeDist < 1500) {
+                // a home she has already given up on is not somewhere to sleep.
+                if (home && !this._homeRelocation && homeDist > 24 && homeDist < 1500) {
                     this._safeExecute('go_home', {}, `night's here. heading back to ${home.name}`);
-                } else if (!home && (this.gameState.nearbyHostiles || 0) >= 2) {
+                } else if ((!home || this._homeRelocation) && (this.gameState.nearbyHostiles || 0) >= 2) {
                     this._safeExecute('idle', {}, null);
                 }
                 // else: fall through - the autonomy tick keeps the homestead arc moving
+            } else if (event === 'weather_changed') {
+                // the sky just turned over. if it's landing on her and she has a
+                // roof, start walking now rather than at the next idle tick -
+                // that gap is up to 25 seconds of standing in a downpour. the
+                // shelter pull owns the cooldown, so this cannot double-fire with
+                // the autonomy tick.
+                const shelter = this._rainShelterBehavior();
+                if (shelter && !this._safeExecute(shelter.action, shelter.params, shelter.say)) {
+                    // refused: hand the cooldown back so the idle tick can retry.
+                    this._homesteadCooldowns.delete('rain_shelter');
+                }
             }
         }
     }
@@ -4744,11 +7179,11 @@ class MinecraftTool extends EventEmitter {
         if (this.commentaryQueue.length > 50) this.commentaryQueue.shift();
         this.emit('commentary', entry);
         // NOTHING here is spoken verbatim. commentary is an internal CUE that
-        // burnt.js hands to her brain ("you're playing on your own and thinking:
-        // ...") so the words the audience gets are always hers. it must never be
-        // published straight to server chat - that is what made pre-written
-        // strings show up in-game word for word. she talks in minecraft through
-        // her own `chat` tool action, in her own words.
+        // your brain rewrites ("you're playing on your own and thinking: ...")
+        // so the words the audience gets are always your character's. it must
+        // never be published straight to server chat - that is what made
+        // pre-written strings show up in-game word for word. she talks in
+        // minecraft through her own `chat` tool action, in her own words.
 
         // optional best-effort mirror to your own UI / stream overlay. inject it
         // with `new MinecraftTool({ broadcast })` or setBroadcast(fn); leave it
@@ -4779,6 +7214,10 @@ class MinecraftTool extends EventEmitter {
             clearInterval(this.autonomousTimer);
             this.autonomousTimer = null;
         }
+        if (this._idleWakeTimer) {
+            clearTimeout(this._idleWakeTimer);
+            this._idleWakeTimer = null;
+        }
         this._failAllPending('tool shutting down');
         if (this.client) {
             try { this.client.close(); } catch { /* ignore */ }
@@ -4795,7 +7234,8 @@ class MinecraftTool extends EventEmitter {
     }
 }
 
-// singleton - execute_minecraft() imports this exact instance.
+// ready-made singleton for the common case of one bot. construct MinecraftTool
+// yourself if you need more control (a different memory path, names, hooks).
 const minecraftTool = new MinecraftTool();
 export default minecraftTool;
 export { MinecraftTool };

@@ -25,6 +25,22 @@ public class ChatMessageEvent {
         return sender.name();
     }
 
+    // the mojang ACCOUNT name only. on any server running a nick/rank plugin
+    // this is not the name the room uses - resolve the speaker from the
+    // rendered line (bound().decorate(contentComponent())) instead, and keep
+    // this as the vanilla fallback.
+    public GameProfile senderProfile() {
+        return sender;
+    }
+
+    public net.minecraft.network.chat.Component contentComponent() {
+        return message.decoratedContent();
+    }
+
+    public ChatType.Bound bound() {
+        return messageType;
+    }
+
     public ChatType messageType() {
         return messageType.chatType().value();
     }

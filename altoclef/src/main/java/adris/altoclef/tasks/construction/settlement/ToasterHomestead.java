@@ -1,6 +1,7 @@
 package adris.altoclef.tasks.construction.settlement;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.level.block.Blocks;
 
 import java.util.List;
@@ -22,4 +23,13 @@ public final class ToasterHomestead extends Homestead {
 
     @Override
     public List<BlockPos> torchPositions() { return ToasterGeometry.torchPositions(this); }
+
+    @Override
+    public Direction torchFacing(BlockPos pos) { return ToasterGeometry.torchFacing(this, pos); }
+
+    @Override
+    public List<ToasterGeometry.Slot> applianceSlots() { return ToasterGeometry.applianceSlots(this); }
+
+    @Override
+    public List<BlockPos> bedPositions() { return ToasterGeometry.bedPositions(this); }
 }

@@ -187,7 +187,19 @@ public class SmeltInFurnaceTask extends ResourceTask {
                     - totalFuelInFurnace;
 
             // We don't have enough materials...
-            if (mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches()) < materialsNeeded) {
+            // this is a GATE, not an end goal, so it must see materials that a
+            // sub-task has already staged in an open crafting grid. counting
+            // inventory-only made the task that SPENDS these materials (crafting
+            // the furnace itself out of the same cobblestone) re-trip this check
+            // the instant it moved them into the grid: the craft got interrupted,
+            // the items came back, the gate cleared, the craft restarted - an
+            // endless open/close of the crafting menu that never made a furnace.
+            // while the smelter screen is open we keep inventory-only, because
+            // materialsNeeded already subtracts what is sitting in its input slot.
+            int materialsHeld = isContainerOpen(mod)
+                    ? mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches())
+                    : mod.getItemStorage().getItemCount(materialTarget.getMatches());
+            if (materialsHeld < materialsNeeded) {
                 setDebugState("Getting Materials");
                 return getMaterialTask(_target.getMaterial());
             }
@@ -332,9 +344,14 @@ public class SmeltInFurnaceTask extends ResourceTask {
 
         @Override
         protected double getCostToMakeNew(AltoClef mod) {
+            // the slots start as ItemStack.EMPTY and are only ever reassigned from
+            // getItemStackInSlot, which also returns EMPTY - so `!= null` was always
+            // true and this method always returned 9999999, making the cost estimate
+            // below dead code. the intent is "don't abandon a furnace that has a
+            // smelt in it", which is an emptiness test, not a null test.
             if (_furnaceCache.burnPercentage > 0 || _furnaceCache.burningFuelCount > 0 ||
-                    _furnaceCache.fuelSlot != null || _furnaceCache.materialSlot != null ||
-                    _furnaceCache.outputSlot != null) {
+                    !_furnaceCache.fuelSlot.isEmpty() || !_furnaceCache.materialSlot.isEmpty() ||
+                    !_furnaceCache.outputSlot.isEmpty()) {
                 return 9999999.0;
             }
             if (mod.getItemStorage().getItemCount(Items.COBBLESTONE) > 8) {

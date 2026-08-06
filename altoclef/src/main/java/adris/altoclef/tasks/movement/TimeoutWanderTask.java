@@ -239,8 +239,11 @@ public class TimeoutWanderTask extends Task implements ITaskRequiresGrounded {
             mod.getClientBaritone().getExploreProcess().explore((int) _origin.x(), (int) _origin.z());
         }
         if (!_progressChecker.check(mod)) {
-            // ExploreProcess may remain "active" forever while producing no
-            // path. Reset it so the next tick makes a fresh exploration request.
+            // An active ExploreProcess is not proof that Baritone has a path. It can
+            // remain active forever while returning REQUEST_PAUSE for a region-cache
+            // load; the crop collector then reports "wander for infinity" while the
+            // player literally does not move. Tear the dead process down so the next
+            // tick performs a fresh exploration request instead of trusting isActive().
             mod.getClientBaritone().getExploreProcess().onLostControl();
             mod.getClientBaritone().getPathingBehavior().forceCancel();
             _origin = mod.getPlayer().position();
@@ -273,8 +276,9 @@ public class TimeoutWanderTask extends Task implements ITaskRequiresGrounded {
         //if (_origin == null) return true;
 
         // If we fail 10 times or more, we may as well try the previous task again.
-        // Search tasks use infinite wander, so failure must be checked before
-        // the infinite-distance shortcut or the counter is dead code.
+        // This check must come before the infinite-distance shortcut. Search tasks
+        // use infinite wander, so the old order made their failure counter dead code
+        // and prevented them from ever rechecking the original resource target.
         if (_failCounter > 10) {
             return true;
         }

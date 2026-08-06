@@ -122,6 +122,12 @@ public class MLGBucketFallChain extends SingleTaskChain implements ITaskOverride
         return true;
     }
 
+    @Override
+    public boolean runsWhileIdle() {
+        // gravity is not on a schedule either
+        return true;
+    }
+
     public boolean doneMLG() {
         return _lastMLG == null;
     }

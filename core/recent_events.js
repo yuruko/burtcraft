@@ -1,4 +1,4 @@
-// node/tools/recent_events.js
+// core/recent_events.js
 // a tiny rolling log of notable game events so burnt can conceptualize what just
 // happened (the last few minutes), not just the current snapshot. shared by the
 // minecraft + tetris tools; surfaced as a "recently:" line in the mode context.

@@ -2,6 +2,7 @@ package adris.altoclef.tasks.movement;
 
 import adris.altoclef.AltoClef;
 import adris.altoclef.Debug;
+import adris.altoclef.chains.MobDefenseChain;
 import adris.altoclef.tasksystem.ITaskRequiresGrounded;
 import adris.altoclef.tasksystem.Task;
 import adris.altoclef.util.helpers.WorldHelper;
@@ -28,6 +29,13 @@ public abstract class CustomBaritoneGoalTask extends Task implements ITaskRequir
     private final boolean _wander;
     protected MovementProgressChecker _checker = new MovementProgressChecker();
     protected Goal _cachedGoal = null;
+    // how far she must actually travel before "baritone is pathing" is allowed to
+    // vouch for her again. one lazy step is ~0.2 blocks, so this clears on real
+    // walking and never on a statue being jostled by physics.
+    private static final double PATHING_PROGRESS_EPSILON = 0.15;
+    private double _lastPathingX = Double.NaN;
+    private double _lastPathingY = Double.NaN;
+    private double _lastPathingZ = Double.NaN;
     Block[] annoyingBlocks = new Block[]{
             Blocks.VINE,
             Blocks.NETHER_SPROUTS,
@@ -108,11 +116,51 @@ public abstract class CustomBaritoneGoalTask extends Task implements ITaskRequir
         mod.getClientBaritone().getPathingBehavior().forceCancel();
         _checker.reset();
         stuckCheck.reset();
+        _lastPathingX = Double.NaN;
+        _lastPathingY = Double.NaN;
+        _lastPathingZ = Double.NaN;
+    }
+
+    // `isPathing()` is "a path object exists", NOT "she is moving", and during a
+    // failed-calculation retry loop it is true the whole time: baritone fails the
+    // calc, CustomGoalProcess drops itself (onLostControl), the bottom of this tick
+    // re-issues setGoalAndPath on the very next tick, and round it goes - forever,
+    // while she stands perfectly still. resetting the progress checker on that
+    // signal disarmed the ONLY escape an unreachable goal has (the 6s no-movement
+    // check below), so she stayed a statue with the debug state parked on
+    // "Completing goal." and NOTHING in the log to show for it - measured at 91s to
+    // 359s across the game logs, escaping only when a mob happened to interrupt her.
+    // this is the same shape as the craft-oscillation bug: a liveness signal that
+    // the wedge itself keeps perturbing. so pathing may only vouch for her while it
+    // is actually carrying her somewhere - the reset now costs real displacement.
+    private boolean pathingIsActuallyMovingHer(AltoClef mod) {
+        double x = mod.getPlayer().getX();
+        double y = mod.getPlayer().getY();
+        double z = mod.getPlayer().getZ();
+        if (Double.isNaN(_lastPathingX)) {
+            _lastPathingX = x;
+            _lastPathingY = y;
+            _lastPathingZ = z;
+            return true;
+        }
+        double dx = x - _lastPathingX;
+        double dy = y - _lastPathingY;
+        double dz = z - _lastPathingZ;
+        if (dx * dx + dy * dy + dz * dz < PATHING_PROGRESS_EPSILON * PATHING_PROGRESS_EPSILON) {
+            // deliberately does NOT re-anchor: the anchor has to stay put across the
+            // whole retry loop or every dropped path would re-arm the benefit of the
+            // doubt and the checker would never age.
+            return false;
+        }
+        _lastPathingX = x;
+        _lastPathingY = y;
+        _lastPathingZ = z;
+        return true;
     }
 
     @Override
     protected Task onTick(AltoClef mod) {
-        if (mod.getClientBaritone().getPathingBehavior().isPathing()) {
+        if (mod.getClientBaritone().getPathingBehavior().isPathing() && pathingIsActuallyMovingHer(mod)) {
             _checker.reset();
         }
         if (WorldHelper.isInNetherPortal(mod)) {
@@ -127,7 +175,14 @@ public abstract class CustomBaritoneGoalTask extends Task implements ITaskRequir
                 mod.getInputControls().release(Input.MOVE_FORWARD);
             }
         } else {
-            if (mod.getClientBaritone().getPathingBehavior().isPathing()) {
+            // ...unless the anti-freeze watchdog is driving. it only takes the keys when
+            // she has not actually moved for FROZEN_SECONDS with something hostile on
+            // her, and "baritone is pathing" is exactly the state it stops trusting -
+            // a path that keeps getting recalculated reports isPathing() forever while
+            // she stands still. releasing here would undo the rescue one tick after it
+            // started, which is how she stood still for 47 seconds and died on 2026-08-04.
+            if (mod.getClientBaritone().getPathingBehavior().isPathing()
+                    && !MobDefenseChain.isPanicDriving()) {
                 mod.getInputControls().release(Input.SNEAK);
                 mod.getInputControls().release(Input.MOVE_BACK);
                 mod.getInputControls().release(Input.MOVE_FORWARD);

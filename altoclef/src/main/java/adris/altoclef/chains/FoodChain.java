@@ -168,6 +168,12 @@ public class FoodChain extends SingleTaskChain {
     }
 
     @Override
+    public boolean runsWhileIdle() {
+        // hunger does not wait for the next command
+        return true;
+    }
+
+    @Override
     public String getName() {
         return "Food";
     }

@@ -23,35 +23,49 @@ public class Debug {
         return "[Alto Clef] ";
     }
 
+    /**
+     * These three all used to write into her in-game CHAT, which is ON STREAM, so
+     * every one of them was commented out wholesale - and that silently killed the
+     * mod's entire diagnostic surface. 69 logWarning call sites, every logError,
+     * and the toaster builder's own "builder is not building (active=.. paused=..)"
+     * line all went NOWHERE: not to chat, not to the log, not to a file. Three
+     * separate build freezes then had to be diagnosed by reading source and
+     * guessing, because the one message that names the cause was a no-op.
+     *
+     * They go to STDOUT instead: it lands in latest.log where we can read it, and
+     * it never appears on stream. Repeats of an identical line are collapsed so a
+     * per-tick caller (safe to write while these were no-ops) cannot flood it.
+     */
+    private static final long REPEAT_SUPPRESS_MS = 5_000L;
+    private static final java.util.Map<String, Long> lastPrintedAt = new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(java.util.Map.Entry<String, Long> eldest) {
+            return size() > 256;
+        }
+    };
+
+    private static synchronized boolean shouldPrint(String message) {
+        long now = System.currentTimeMillis();
+        Long previous = lastPrintedAt.get(message);
+        if (previous != null && now - previous < REPEAT_SUPPRESS_MS) return false;
+        lastPrintedAt.put(message, now);
+        return true;
+    }
+
     public static void logMessage(String message, boolean prefix) {
-//        if (Minecraft.getInstance() != null && Minecraft.getInstance().player != null) {
-//            if (prefix) {
-//                message = "\u00A72\u00A7l\u00A7o" + getLogPrefix() + "\u00A7r" + message;
-//            }
-//            Minecraft.getInstance().player.sendMessage(Component.literal(message), false);
-//            //Minecraft.getInstance().player.sendChatMessage(msg);
-//        } else {
-//            logInternal(message);
-//        }
+        if (shouldPrint(message)) logInternal(message);
     }
 
     public static void logMessage(String message) {
-//        logMessage(message, true);
+        logMessage(message, true);
     }
 
     public static void logMessage(String format, Object... args) {
-//        logMessage(String.format(format, args));
+        logMessage(String.format(format, args));
     }
 
     public static void logWarning(String message) {
-//        logInternal("WARNING: " + message);
-//        if (jankModInstance != null && !jankModInstance.getModSettings().shouldHideAllWarningLogs()) {
-//            if (Minecraft.getInstance() != null && Minecraft.getInstance().player != null) {
-//                String msg = "\u00A72\u00A7l\u00A7o" + getLogPrefix() + "\u00A7c" + message + "\u00A7r";
-//                Minecraft.getInstance().player.sendMessage(Component.literal(msg), false);
-//                //Minecraft.getInstance().player.sendChatMessage(msg);
-//            }
-//        }
+        if (shouldPrint("WARNING: " + message)) logInternal("WARNING: " + message);
     }
 
     public static void logWarning(String format, Object... args) {
@@ -59,14 +73,10 @@ public class Debug {
     }
 
     public static void logError(String message) {
-//        String stacktrace = getStack(2);
-//        System.err.println(message);
-//        System.err.println("at:");
-//        System.err.println(stacktrace);
-//        if (Minecraft.getInstance() != null && Minecraft.getInstance().player != null) {
-//            String msg = "\u00A72\u00A7l\u00A7c" + getLogPrefix() + "[ERROR] " + message + "\nat:\n" + stacktrace + "\u00A7r";
-//            Minecraft.getInstance().player.sendMessage(Component.literal(msg), false);
-//        }
+        if (!shouldPrint("ERROR: " + message)) return;
+        System.out.println("ALTO CLEF ERROR: " + message);
+        System.out.println("at:");
+        System.out.println(getStack(2));
     }
 
     public static void logError(String format, Object... args) {

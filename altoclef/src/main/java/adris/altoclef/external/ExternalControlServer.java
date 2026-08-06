@@ -8,6 +8,8 @@ import adris.altoclef.eventbus.events.ChatMessageEvent;
 import adris.altoclef.eventbus.events.TaskFinishedEvent;
 import adris.altoclef.tasks.misc.EatNowTask;
 import adris.altoclef.tasks.construction.ToasterBuildTask;
+import adris.altoclef.tasks.construction.settlement.Settlement;
+import adris.altoclef.tasks.construction.settlement.ToasterGeometry;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -24,6 +26,22 @@ import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.BaseRailBlock;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CarpetBlock;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.FenceBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.SignBlock;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.StairBlock;
+import net.minecraft.world.level.block.TrapDoorBlock;
+import net.minecraft.world.level.block.WallBlock;
+import net.minecraft.world.level.block.WallSignBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
 
 import java.io.BufferedReader;
@@ -96,6 +114,11 @@ public class ExternalControlServer implements ClientModInitializer {
     private static volatile String intentWhy = "";
     private static volatile String intentPhase = "";
     private static volatile long intentAt = 0L;
+    private static volatile int affectFear = -1;
+    private static volatile int affectConfidence = -1;
+    private static volatile int affectSecurity = -1;
+    private static volatile int affectFun = -1;
+    private static volatile long affectAt = 0L;
 
     private static final float LOOK_DOWN_PITCH = 32.0f;   // degrees below horizon
     private static final double MOVING_EPSILON = 0.0016;  // ~0.04 blocks/tick
@@ -119,6 +142,12 @@ public class ExternalControlServer implements ClientModInitializer {
         EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET
     };
 
+    // upper bound on the distinct item types reported per state packet. the main
+    // inventory is 36 slots, so 36 types is the true maximum and this never
+    // actually clips a real bag - it just keeps the packet bounded. it was 18,
+    // which silently hid the tail of a loaded inventory from burnt entirely.
+    private static final int INV_MAX_TYPES = 36;
+
     private final Gson gson = new Gson();
     private final Object writeLock = new Object();
 
@@ -139,6 +168,22 @@ public class ExternalControlServer implements ClientModInitializer {
                 @Override
                 protected boolean removeEldestEntry(java.util.Map.Entry<String, Long> eldest) {
                     return size() > CHAT_DEDUP_CACHE;
+                }
+            };
+    // WHAT SHE JUST SAID, so her own line coming back off the server is never
+    // heard as somebody talking to her.
+    //
+    // the only self-check downstream compares the chat sender to the account name
+    // this companion reports in `hello` (getGameProfile().name()), while senders
+    // are resolved from the line the client RENDERS - on any server that gives her
+    // a nick those two strings differ, nothing recognizes her own words, and she
+    // answers herself. content cannot be nicked, so match on that instead.
+    private static final long CHAT_ECHO_WINDOW_MS = 8000L;
+    private final java.util.LinkedHashMap<String, Long> recentSelfChat =
+            new java.util.LinkedHashMap<>(8, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Long> eldest) {
+                    return size() > 16;
                 }
             };
     private volatile int lastHealth = -1;
@@ -239,15 +284,7 @@ public class ExternalControlServer implements ClientModInitializer {
             net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents.CHAT.register(
                 (message, signedMessage, sender, params, receptionTimestamp) -> {
                     try {
-                        String raw = message.getString();
-                        java.util.regex.Matcher m = CHAT_SHAPE.matcher(raw == null ? "" : raw);
-                        if (m.matches()) {
-                            String who = m.group(1) != null ? m.group(1) : m.group(3);
-                            String what = m.group(1) != null ? m.group(2) : m.group(4);
-                            if (who != null && what != null) emitChatEvent(who, what.trim());
-                        } else if (sender != null && raw != null && !raw.isEmpty()) {
-                            emitChatEvent(sender.name(), raw);
-                        }
+                        emitPlayerChat(message, params, sender);
                     } catch (Throwable ignored) { }
                 });
         } catch (Throwable t) {
@@ -342,6 +379,12 @@ public class ExternalControlServer implements ClientModInitializer {
     private void toggleManualControl(Minecraft mc) {
         manualControl = !manualControl;
         LocalPlayer p = mc.player;
+        // REFLEXES OFF WITH THE HANDS. "stop" only empties her job queue now -
+        // defense, food and the death screen keep their turn while she is merely
+        // idle, which is the whole point of that change. But F1 is not idling,
+        // it is a handoff: a defense chain still swinging for the mouse while
+        // the operator plays is worse than one asleep.
+        adris.altoclef.tasksystem.TaskRunner.setReflexesAllowed(!manualControl);
         if (manualControl) {
             // stop whatever the bot is doing and let go of every forced key
             try {
@@ -454,6 +497,7 @@ public class ExternalControlServer implements ClientModInitializer {
         try {
             if (payload == null || payload.isEmpty()) {   // empty = clear the hud
                 intentWhat = ""; intentWhy = ""; intentPhase = ""; intentAt = 0L;
+                affectFear = -1; affectConfidence = -1; affectSecurity = -1; affectFun = -1; affectAt = 0L;
                 return;
             }
             String json = new String(java.util.Base64.getDecoder().decode(payload),
@@ -462,7 +506,13 @@ public class ExternalControlServer implements ClientModInitializer {
             intentWhat = clip(str(o, "what", ""));
             intentWhy = clip(str(o, "why", ""));
             intentPhase = clip(str(o, "phase", ""));
-            intentAt = intentWhat.isEmpty() ? 0L : System.currentTimeMillis();
+            long now = System.currentTimeMillis();
+            intentAt = intentWhat.isEmpty() ? 0L : now;
+            affectFear = boundedHundred(o, "fear");
+            affectConfidence = boundedHundred(o, "confidence");
+            affectSecurity = boundedHundred(o, "security");
+            affectFun = boundedHundred(o, "fun");
+            affectAt = affectFear < 0 || affectConfidence < 0 || affectSecurity < 0 || affectFun < 0 ? 0L : now;
         } catch (Throwable t) {
             log("bad hud payload: " + t);
         }
@@ -474,10 +524,17 @@ public class ExternalControlServer implements ClientModInitializer {
         return one.length() > 90 ? one.substring(0, 89) + "…" : one;
     }
 
-    // three lines, top-left: WHAT she is doing (bright), WHY (her colour), and the
-    // live altoclef phase (grey) so the machine's real sub-step sits right under her
-    // stated intent - the gap between those two is the thing that was impossible to
-    // read before. small and cornered, because this lives on stream.
+    private static int boundedHundred(JsonObject o, String name) {
+        try {
+            return Math.max(0, Math.min(100, o.get(name).getAsInt()));
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    // Compact top-left panel: intent, live Minecraft affects, then raw block
+    // coordinates on the bottom line. The whole overlay is scaled together so its
+    // text and backdrop keep the same proportions without occupying much of the stream.
     private static void drawIntent(net.minecraft.client.gui.GuiGraphicsExtractor g) {
         if (!INTENT_HUD) return;
         try {
@@ -486,29 +543,48 @@ public class ExternalControlServer implements ClientModInitializer {
             if (mc.options != null && mc.options.hideGui) return;
             if (mc.font == null) return;
 
-            java.util.List<String> lines = new java.util.ArrayList<>(3);
-            java.util.List<Integer> colours = new java.util.ArrayList<>(3);
+            java.util.List<String> lines = new java.util.ArrayList<>(6);
+            java.util.List<Integer> colours = new java.util.ArrayList<>(6);
             if (manualControl) {
                 lines.add("manual - operator has the keyboard");
                 colours.add(0xFFFFC65B);
             } else {
                 // a stale line claiming she is mid-task is worse than no line at all
-                if (intentAt <= 0L || System.currentTimeMillis() - intentAt > INTENT_TTL_MS) return;
-                String what = intentWhat;
-                if (what.isEmpty()) return;
-                lines.add(what);
-                colours.add(0xFFFFFFFF);
-                if (!intentWhy.isEmpty()) { lines.add(intentWhy); colours.add(0xFFCBA6FF); }
-                if (!intentPhase.isEmpty()) { lines.add(intentPhase); colours.add(0xFF9A9A9A); }
+                if (intentAt > 0L && System.currentTimeMillis() - intentAt <= INTENT_TTL_MS) {
+                    String what = intentWhat;
+                    if (!what.isEmpty()) {
+                        lines.add(what);
+                        colours.add(0xFFFFFFFF);
+                        if (!intentWhy.isEmpty()) { lines.add(intentWhy); colours.add(0xFFCBA6FF); }
+                        if (!intentPhase.isEmpty()) { lines.add(intentPhase); colours.add(0xFF9A9A9A); }
+                    }
+                }
             }
 
-            final int x = 6, y = 6, lineHeight = 10, pad = 3;
-            int width = 0;
-            for (String s : lines) width = Math.max(width, mc.font.width(s));
-            width = Math.min(width, Math.max(80, g.guiWidth() / 2));
-            g.fill(x - pad, y - pad, x + width + pad, y + lines.size() * lineHeight + pad - 1, 0x8C000000);
-            for (int i = 0; i < lines.size(); i++) {
-                g.text(mc.font, lines.get(i), x, y + i * lineHeight, colours.get(i));
+            long now = System.currentTimeMillis();
+            if (affectAt > 0L && now - affectAt <= INTENT_TTL_MS) {
+                lines.add("fear " + affectFear + "  confidence " + affectConfidence
+                        + "  security " + affectSecurity + "  fun " + affectFun);
+                colours.add(0xFFCBA6FF);
+            }
+            net.minecraft.core.BlockPos pos = mc.player.blockPosition();
+            lines.add(pos.getX() + " " + pos.getY() + " " + pos.getZ());
+            colours.add(0xFFD7E8FF);
+
+            final float scale = 0.75F;
+            final int margin = 8, lineHeight = 10, pad = 3;
+            g.pose().pushMatrix();
+            try {
+                g.pose().scale(scale, scale);
+                int width = 0;
+                for (String s : lines) width = Math.max(width, mc.font.width(s));
+                g.fill(margin - pad, margin - pad, margin + width + pad,
+                        margin + lines.size() * lineHeight + pad - 1, 0x8C000000);
+                for (int i = 0; i < lines.size(); i++) {
+                    g.text(mc.font, lines.get(i), margin, margin + i * lineHeight, colours.get(i));
+                }
+            } finally {
+                g.pose().popMatrix();
             }
         } catch (Throwable ignored) { }
     }
@@ -666,6 +742,241 @@ public class ExternalControlServer implements ClientModInitializer {
         } catch (Throwable ignored) { }
     }
 
+    /**
+     * Is she standing over open water rather than land?
+     * <p>
+     * True when the column under her feet hits water before it hits anything solid,
+     * OR when most of the eight blocks around her feet are water - which is what a
+     * one-block bridge across an ocean actually looks like. Deliberately does NOT
+     * count a puddle or a shoreline: a single adjacent water block is normal.
+     */
+    private static boolean isOverWater(Minecraft mc, LocalPlayer p) {
+        try {
+            if (mc.level == null || p == null) return false;
+            BlockPos feet = p.blockPosition();
+            // straight down: water before solid ground means she is on something
+            // placed over the sea (or on a lily pad / boat-less crossing).
+            for (int dy = 1; dy <= 4; dy++) {
+                BlockPos below = feet.below(dy);
+                if (!mc.level.getFluidState(below).isEmpty()) return true;
+                if (!mc.level.getBlockState(below).isAir()) break;   // hit real ground
+            }
+            int water = 0;
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    if (dx == 0 && dz == 0) continue;
+                    if (!mc.level.getFluidState(feet.offset(dx, -1, dz)).isEmpty()) water++;
+                }
+            }
+            return water >= 5;   // surrounded, not merely beside a pond
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * THE SITE SURVEY IS THE MOST EXPENSIVE THING IN THE POLL, and it was being
+     * paid for every two seconds forever.
+     *
+     * measureHomeSite plus surveyBuiltGround is ~1400 columns and several
+     * thousand block reads, and all of it runs inside mc.execute - on the render
+     * thread, so the whole bill lands in one frame. That is a hitch every two
+     * seconds of stream, and it was being paid hardest in the case where the
+     * answer provably had not changed: standing still building a house, which is
+     * when she is on camera doing nothing else.
+     *
+     * The ground does not move. So the reading is kept until either it goes
+     * stale or she has actually walked somewhere - eight blocks against a scan
+     * that reaches out forty-eight, which cannot change the verdict. Walking
+     * costs exactly what it did before; standing still costs a fifth.
+     */
+    private static final long SITE_CACHE_MS = 10_000L;
+    private static final int SITE_CACHE_MOVE = 8;
+    private static JsonObject cachedSite;
+    private static BlockPos cachedSiteAt;
+    private static long cachedSiteAtMs;
+
+    private static JsonObject homeSite(Minecraft mc, LocalPlayer p) {
+        BlockPos feet = p.blockPosition();
+        long now = System.currentTimeMillis();
+        if (cachedSite != null && cachedSiteAt != null
+            && now - cachedSiteAtMs < SITE_CACHE_MS
+            && cachedSiteAt.distSqr(feet) <= (double) SITE_CACHE_MOVE * SITE_CACHE_MOVE) {
+            return cachedSite;
+        }
+        cachedSite = measureHomeSite(mc, p);
+        cachedSiteAt = feet;
+        cachedSiteAtMs = now;
+        return cachedSite;
+    }
+
+    /** Cheap footprint survey for choosing a buildable toaster anchor nearby. */
+    private static JsonObject measureHomeSite(Minecraft mc, LocalPlayer p) {
+        JsonObject site = new JsonObject();
+        BlockPos feet = p.blockPosition();
+        int expectedGroundY = feet.getY() - 1;
+        int minY = Integer.MAX_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        int supported = 0;
+        int waterColumns = 0;
+        int columns = 0;
+        // The homestead floorplan is 14x9, so a 21x15 scan reads the footprint
+        // plus a working margin while staying wholly inside loaded chunks.
+        for (int dx = -10; dx <= 10; dx++) {
+            for (int dz = -7; dz <= 7; dz++) {
+                int x = feet.getX() + dx;
+                int z = feet.getZ() + dz;
+                int surfaceY = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                minY = Math.min(minY, surfaceY);
+                maxY = Math.max(maxY, surfaceY);
+                if (Math.abs(surfaceY - expectedGroundY) <= 2) supported++;
+                if (!mc.level.getFluidState(new BlockPos(x, surfaceY, z)).isEmpty()) waterColumns++;
+                columns++;
+            }
+        }
+        site.addProperty("supportPercent", columns == 0 ? 0 : Math.round(100.0 * supported / columns));
+        site.addProperty("heightSpread", columns == 0 ? 999 : maxY - minY);
+        site.addProperty("waterColumns", waterColumns);
+        measureYard(mc, feet, expectedGroundY, site);
+        surveyBuiltGround(mc, feet, site);
+        return site;
+    }
+
+    /**
+     * HOW MUCH DIGGING THE YARD WOULD COST HER.
+     *
+     * A toaster wants ten blocks of air on every wall, and she is the one who
+     * has to make that true - so the cheapest possible yard is one that is
+     * already clear. Measuring it BEFORE she commits is the difference between
+     * settling on a plain and settling halfway up a hill and then spending a
+     * stream shifting it one block at a time.
+     *
+     * One heightmap lookup per column, and MOTION_BLOCKING rather than the
+     * NO_LEAVES variant used above: a forest canopy is exactly the kind of yard
+     * she would have to fell, so leaves have to count here even though they must
+     * not count as "uneven footing".
+     */
+    private static void measureYard(Minecraft mc, BlockPos feet, int expectedGroundY, JsonObject site) {
+        int[] footprint = ToasterGeometry.footprint("homestead");
+        int halfX = footprint[0] / 2 + Settlement.YARD_MARGIN;
+        int halfZ = footprint[1] / 2 + Settlement.YARD_MARGIN;
+        // How far above the floor the yard actually has to be empty. Anything
+        // taller than the house is not in her way and is not counted against it.
+        final int wallHeight = 7;
+        int blocked = 0;
+        int fill = 0;
+        for (int dx = -halfX; dx <= halfX; dx++) {
+            for (int dz = -halfZ; dz <= halfZ; dz++) {
+                int surfaceY = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING,
+                    feet.getX() + dx, feet.getZ() + dz) - 1;
+                int above = surfaceY - expectedGroundY;
+                if (above <= 0) continue;
+                blocked++;
+                fill += Math.min(above, wallHeight);
+            }
+        }
+        site.addProperty("yardBlockedColumns", blocked);
+        site.addProperty("yardFill", fill);
+        site.addProperty("yardMargin", Settlement.YARD_MARGIN);
+    }
+
+    /** How far out we look for signs of people, and how coarsely. */
+    private static final int BUILT_SCAN_RADIUS = 48;
+    private static final int BUILT_SCAN_STEP = 3;
+
+    /**
+     * HAS ANYONE BUILT HERE.
+     *
+     * Until now the only way burnt learned a place was taken was the server
+     * slapping her hand - a `protection_denied` AFTER she had already walked
+     * there and started mining someone's wall. On a world with no claim plugin
+     * she never learned at all. So she kept picking ground that was visibly,
+     * obviously somebody's base, because nothing in the whole stack ever LOOKED
+     * at the blocks.
+     *
+     * This looks. Coarse on purpose - a 3-block grid over a 48-block radius is
+     * ~1000 columns every 2 seconds, and nothing anyone builds is smaller than
+     * 3x3. Only the surface band is read (ground-1 to ground+3), so mineshaft
+     * rails and stronghold brick far underground do not read as a neighbour.
+     *
+     * Villages count as people. She should not move in next door to villagers
+     * and quarry their houses for cobblestone either.
+     */
+    private static void surveyBuiltGround(Minecraft mc, BlockPos feet, JsonObject site) {
+        int found = 0;
+        int nearest = Integer.MAX_VALUE;
+        for (int dx = -BUILT_SCAN_RADIUS; dx <= BUILT_SCAN_RADIUS; dx += BUILT_SCAN_STEP) {
+            for (int dz = -BUILT_SCAN_RADIUS; dz <= BUILT_SCAN_RADIUS; dz += BUILT_SCAN_STEP) {
+                int x = feet.getX() + dx;
+                int z = feet.getZ() + dz;
+                int surfaceY = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                for (int y = surfaceY - 1; y <= surfaceY + 3; y++) {
+                    if (!isPlacedByPeople(mc.level.getBlockState(new BlockPos(x, y, z)))) continue;
+                    found++;
+                    int distance = (int) Math.round(Math.sqrt((double) dx * dx + (double) dz * dz));
+                    if (distance < nearest) nearest = distance;
+                    break;   // one hit per column is enough to call it built-on
+                }
+            }
+        }
+        site.addProperty("builtColumns", found);
+        site.addProperty("builtNearest", nearest == Integer.MAX_VALUE ? -1 : nearest);
+        site.addProperty("builtScanRadius", BUILT_SCAN_RADIUS);
+    }
+
+    /**
+     * Blocks that do not occur in open terrain by themselves - someone put them
+     * there, whether a player or a village.
+     *
+     * Deliberately conservative about natural look-alikes: plain terracotta is
+     * a badlands hillside, deepslate/andesite/tuff are just rock, and a torch
+     * underground is a mineshaft - which is why the caller only reads the
+     * surface band.
+     */
+    public static boolean isPlacedByPeople(BlockState state) {
+        if (state == null || state.isAir()) return false;
+        Block block = state.getBlock();
+        if (block == Blocks.CRAFTING_TABLE || block == Blocks.CHEST || block == Blocks.TRAPPED_CHEST
+            || block == Blocks.BARREL || block == Blocks.FURNACE || block == Blocks.BLAST_FURNACE
+            || block == Blocks.SMOKER || block == Blocks.TORCH || block == Blocks.WALL_TORCH
+            || block == Blocks.LANTERN || block == Blocks.BOOKSHELF || block == Blocks.ANVIL
+            || block == Blocks.HOPPER || block == Blocks.LADDER || block == Blocks.SCAFFOLDING
+            || block == Blocks.FARMLAND || block == Blocks.COMPOSTER || block == Blocks.CAMPFIRE
+            || block == Blocks.BRICKS || block == Blocks.GLASS || block == Blocks.GLASS_PANE
+            || block == Blocks.IRON_BLOCK || block == Blocks.GOLD_BLOCK || block == Blocks.DIAMOND_BLOCK
+            || block == Blocks.BELL || block == Blocks.LECTERN || block == Blocks.CARTOGRAPHY_TABLE
+            || block == Blocks.SMITHING_TABLE || block == Blocks.LOOM || block == Blocks.STONECUTTER
+            || block == Blocks.GRINDSTONE || block == Blocks.BREWING_STAND || block == Blocks.ENCHANTING_TABLE
+            || block == Blocks.SMOOTH_STONE || block == Blocks.STONE_BRICKS || block == Blocks.CHISELED_STONE_BRICKS) {
+            return true;
+        }
+        // SHAPE, then NAME - never tags. Block tags are datapack DATA: they are
+        // empty until a world finishes loading them, so a tag-based test reads
+        // an entire village as untouched wilderness at exactly the moment she is
+        // deciding where to live. Classes and registry names are code and are
+        // always there. (Proven, not assumed: every tag check in the first draft
+        // of this returned false in tmp/probe/BuiltGroundProbe.)
+        if (block instanceof StairBlock || block instanceof SlabBlock
+            || block instanceof FenceBlock || block instanceof FenceGateBlock
+            || block instanceof DoorBlock || block instanceof TrapDoorBlock
+            || block instanceof BedBlock || block instanceof SignBlock
+            || block instanceof WallSignBlock || block instanceof BaseRailBlock
+            || block instanceof CarpetBlock || block instanceof WallBlock) {
+            return true;
+        }
+        String name;
+        try {
+            name = BuiltInRegistries.BLOCK.getKey(block).getPath();
+        } catch (Throwable ignored) {
+            return false;
+        }
+        // deliberately NOT "_terracotta": that is a badlands hillside, not a house.
+        return name.endsWith("_planks") || name.endsWith("_wool") || name.endsWith("_carpet")
+            || name.endsWith("_glass") || name.endsWith("_glass_pane") || name.endsWith("_concrete")
+            || name.endsWith("_shulker_box") || name.endsWith("_glazed_terracotta")
+            || name.endsWith("_bricks") || name.endsWith("_lamp") || name.endsWith("_banner");
+    }
+
     private static void resetAutoCamera() {
         lookDownTicks = 0;
         lookUpTicks = 0;
@@ -814,8 +1125,8 @@ public class ExternalControlServer implements ClientModInitializer {
                     // chain does its eating inside getPriority(), and the runner
                     // skips every chain while it is disabled - which is exactly
                     // whenever no user task is running. so setting the fillup flag
-                    // while the bot was idle ate nothing at all, forever, and the
-                    // controller kept reissuing eat into that void until she was a
+                    // while burnt was idle ate nothing at all, forever, and the
+                    // node side kept reissuing eat into that void until she was a
                     // statue. when she is idle, park a user task whose only job is
                     // to keep the runner awake until the food is down.
                     if (mod.getTaskRunner().isActive()) {
@@ -874,6 +1185,9 @@ public class ExternalControlServer implements ClientModInitializer {
             }
             try {
                 sendAck(id);
+                // remember her own words BEFORE they go out - the server can echo
+                // them back faster than the next line of this method runs
+                noteSelfChat(text);
                 p.connection.sendChat(text);
                 // For normal chat and Baritone # commands this means dispatched,
                 // not that an open-ended Baritone goal has completed.
@@ -937,6 +1251,19 @@ public class ExternalControlServer implements ClientModInitializer {
                 gs.addProperty("inLava", p.isInLava());
                 gs.addProperty("inWater", p.isInWater());
                 gs.addProperty("underwater", p.isUnderWater());
+                // Home-site selection needs to distinguish an open building site
+                // from a cave or overhang. The wider clearEdge survey below answers
+                // "is there room?"; this answers "is it actually outdoors?".
+                try { gs.addProperty("skyVisible", mc.level.canSeeSky(bp.above())); } catch (Throwable ignored) { }
+                try { gs.add("homeSite", homeSite(mc, p)); } catch (Throwable ignored) { }
+                // OVER water without being IN it. baritone refuses to swim (see the
+                // water settings) so when it must cross an ocean it BRIDGES - and a
+                // bot standing on a one-block dirt bridge in the middle of the sea is
+                // dry, on the ground, and invisible to every water check there is.
+                // that is how she ended up parked on a bridge doing nothing with the
+                // whole water-escape system asleep. report it so the controller can
+                // learn the route is ocean and get her off it.
+                gs.addProperty("overWater", isOverWater(mc, p));
                 // whether she is ACTUALLY eating right now, and whether altoclef
                 // considers her hungry. without these the node side cannot tell a
                 // real eat from an `@food` that finished having done nothing.
@@ -959,14 +1286,21 @@ public class ExternalControlServer implements ClientModInitializer {
                 }
                 gs.add("armor", armor);
 
-                // compact inventory summary (counts per item type, top ~18) so burnt
-                // knows what she's carrying / can craft without reading it off-screen
+                // full inventory summary (counts per item type) so burnt knows what
+                // she's carrying / can craft without reading it off-screen. the cap
+                // used to be 18, which silently hid the tail of a loaded bag; a 36
+                // slot inventory can hold at most 36 distinct types, so INV_MAX_TYPES
+                // is a safety bound rather than a real truncation. inventoryTypes is
+                // the TRUE distinct count and inventoryFree the empty slot count, so
+                // burnt can tell a complete readout from a clipped one and know when
+                // she is out of room instead of guessing.
                 try {
                     JsonArray items = new JsonArray();
                     java.util.LinkedHashMap<String, Integer> counts = new java.util.LinkedHashMap<>();
                     int diamondCount = 0;
+                    int freeSlots = 0;
                     for (ItemStack st : p.getInventory().getNonEquipmentItems()) {
-                        if (st == null || st.isEmpty()) continue;
+                        if (st == null || st.isEmpty()) { freeSlots++; continue; }
                         counts.merge(st.getItem().toString(), st.getCount(), Integer::sum);
                         if ("minecraft:diamond".equals(BuiltInRegistries.ITEM.getKey(st.getItem()).toString())) {
                             diamondCount += st.getCount();
@@ -974,10 +1308,12 @@ public class ExternalControlServer implements ClientModInitializer {
                     }
                     int n = 0;
                     for (java.util.Map.Entry<String, Integer> e : counts.entrySet()) {
-                        if (n++ >= 18) break;
+                        if (n++ >= INV_MAX_TYPES) break;
                         items.add(e.getValue() + " " + e.getKey());
                     }
                     gs.add("inventory", items);
+                    gs.addProperty("inventoryTypes", counts.size());
+                    gs.addProperty("inventoryFree", freeSlots);
                     String inventorySignature = items.toString();
                     if (!inventorySignature.equals(lastInventorySignature)) {
                         lastInventorySignature = inventorySignature;
@@ -1038,6 +1374,16 @@ public class ExternalControlServer implements ClientModInitializer {
                     String weather = mc.level.isThundering() ? "thunder" : (mc.level.isRaining() ? "rain" : "clear");
                     gs.addProperty("timeOfDay", isNight ? "night" : "day");
                     gs.addProperty("weather", weather);
+                    // GLOBAL weather is not the same as GETTING RAINED ON. A
+                    // desert, the nether, a cave and her own finished roof all
+                    // report "rain" while she stays perfectly dry, so shelter
+                    // behaviour driven off the string alone would march her home
+                    // out of a sandstorm-free desert or refuse to let her leave a
+                    // house it is not raining on. isRainingAt is biome-, sky- and
+                    // heightmap-aware: it answers the question actually being asked.
+                    boolean wetHere = false;
+                    try { wetHere = mc.level.isRainingAt(bp); } catch (Throwable ignored) { }
+                    gs.addProperty("rainingHere", wetHere);
                     if (!lastDimension.isEmpty() && !dimension.equals(lastDimension)) {
                         JsonObject changed = new JsonObject();
                         changed.addProperty("dimension", dimension);
@@ -1047,6 +1393,10 @@ public class ExternalControlServer implements ClientModInitializer {
                     if (!lastWeather.isEmpty() && !weather.equals(lastWeather)) {
                         JsonObject changed = new JsonObject();
                         changed.addProperty("weather", weather);
+                        // the reaction wants to know whether it is landing on HER,
+                        // not just whether the sky changed its mind somewhere.
+                        changed.addProperty("rainingHere", wetHere);
+                        changed.addProperty("skyVisible", mc.level.canSeeSky(bp.above()));
                         sendEvent("weather_changed", changed);
                     }
                     lastDimension = dimension;
@@ -1177,13 +1527,17 @@ public class ExternalControlServer implements ClientModInitializer {
                     } catch (Throwable ignored) { }
 
                     // HOW BIG IS THE ROOM SHE IS STANDING IN.
-                    // burnt's home has to be a real space: 20x20x20 clear, plus a block
-                    // of edge per furnace in the collection. node owns that rule; this
-                    // just measures. grows a cube outward from head height and stops at
+                    // burnt's home has to be a real space - enough clear ground for the
+                    // fixed toaster floorplan. node owns that rule; this just measures.
+                    // grows a cube outward from head height and stops at
                     // the first shell that is mostly solid, so a cave or a hillside ends
                     // the scan almost immediately and only a genuine hall costs anything.
                     // the floor is deliberately excluded - a room needs one.
                     try { gs.addProperty("clearEdge", measureClearEdge(mc)); } catch (Throwable ignored) { }
+                    // Exact, component-level toaster construction state. Unlike
+                    // clearEdge this distinguishes floor/walls/roof, the two top
+                    // slots, walk-through, wall torches, the appliance gallery,
+                    // and material shortfall.
                     try {
                         JsonObject toaster = ToasterBuildTask.getLatestTelemetry();
                         if (toaster != null) gs.add("settlementBuild", toaster);
@@ -1239,8 +1593,55 @@ public class ExternalControlServer implements ClientModInitializer {
 
     private void onChatMessage(ChatMessageEvent e) {
         try {
-            emitChatEvent(e.senderName(), e.messageContent());
+            emitPlayerChat(e.contentComponent(), e.bound(), e.senderProfile());
         } catch (Throwable ignored) { }
+    }
+
+    // THE NAME A SERVER SHOWS IS NOT THE NAME A SERVER STORES.
+    //
+    // every rank/nick plugin renders "<(Member) » Nightjar_> hi" while the mojang
+    // account behind that line is something else entirely - GameProfile.name()
+    // returned "mc_a41f9c", a string not one person in that room has ever
+    // seen. reading the speaker off the profile made her answer Nightjar_ by an
+    // account name nobody in the room uses, and filed ONE human under TWO names
+    // (chat under the account name, the join line under the nick, both of them
+    // in her roster at once).
+    //
+    // so the speaker is resolved from the line the client actually RENDERS -
+    // params.decorate() is the exact component minecraft draws on screen - and
+    // the account name survives only as the last resort, for vanilla servers
+    // that decorate nothing.
+    private void emitPlayerChat(net.minecraft.network.chat.Component content,
+                                net.minecraft.network.chat.ChatType.Bound params,
+                                com.mojang.authlib.GameProfile profile) {
+        String body = content == null ? "" : content.getString();
+        String who = null;
+        if (params != null) {
+            try {
+                java.util.regex.Matcher m = CHAT_SHAPE.matcher(params.decorate(content).getString());
+                if (m.matches()) {
+                    who = m.group(1) != null ? m.group(1) : m.group(3);
+                    String what = m.group(1) != null ? m.group(2) : m.group(4);
+                    if (what != null && !what.isBlank()) body = what.trim();
+                }
+            } catch (Throwable ignored) { }
+            // no decoration template matched: the bound name component is still
+            // the display name the server sent for this speaker.
+            if (who == null) {
+                try { who = lastNameToken(params.name().getString()); } catch (Throwable ignored) { }
+            }
+        }
+        if (who == null && profile != null) who = profile.name();
+        if (who != null) emitChatEvent(who, body);
+    }
+
+    // "(Member) » Nightjar_" / "[VIP] Bob" -> the username at the end. ranks and
+    // separators are decoration; the last bare word is the person.
+    private static String lastNameToken(String decorated) {
+        if (decorated == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("([A-Za-z0-9_]{3,16})\\s*$").matcher(decorated.trim());
+        return m.find() ? m.group(1) : null;
     }
 
     // one funnel for every chat delivery path (signed player chat via the
@@ -1249,7 +1650,21 @@ public class ExternalControlServer implements ClientModInitializer {
     private void emitChatEvent(String sender, String text) {
         if (this.out == null) return;
         if (sender == null || text == null || sender.isEmpty() || text.isEmpty()) return;
+        // ONE TEXT PER LINE, whichever path delivered it. emitPlayerChat only
+        // extracts the message body when the decoration regex matches the rendered
+        // line; when it misses it falls back to the WHOLE rendered line, while
+        // tryParseChatLine hands the same server message over as just the body.
+        // two different strings for one thing said, so an exact-match dedup counts
+        // two lines and burnt answers both.
+        text = stripOwnDecoration(sender, text);
         long now = System.currentTimeMillis();
+        String key = chatKey(text);
+        // her own line coming back off the server is not somebody talking to her
+        synchronized (recentSelfChat) {
+            recentSelfChat.values().removeIf(at -> now - at > CHAT_ECHO_WINDOW_MS);
+            Long mine = recentSelfChat.get(key);
+            if (mine != null && now - mine < CHAT_ECHO_WINDOW_MS) return;
+        }
         // Dedup on the TEXT alone, across a ring of recent lines.
         //
         // The old key was sender + text held in ONE slot, and it failed twice
@@ -1265,14 +1680,14 @@ public class ExternalControlServer implements ClientModInitializer {
         // that dropping one is far cheaper than replying four times.
         synchronized (recentChatText) {
             recentChatText.values().removeIf(at -> now - at > CHAT_DEDUP_WINDOW_MS);
-            Long seen = recentChatText.get(text);
+            Long seen = recentChatText.get(key);
             if (seen != null && now - seen < CHAT_DEDUP_WINDOW_MS) {
-                recentChatText.put(text, now);
+                recentChatText.put(key, now);
                 return;
             }
-            recentChatText.put(text, now);
+            recentChatText.put(key, now);
         }
-        lastChatEventKey = text;
+        lastChatEventKey = key;
         lastChatEventAt = now;
         JsonObject d = new JsonObject();
         d.addProperty("sender", sender);
@@ -1283,16 +1698,48 @@ public class ExternalControlServer implements ClientModInitializer {
     // most community servers (plugin chat formats, offline-mode) deliver chat
     // as SYSTEM text, not signed player chat - recognize the common rendered
     // shapes: "<Name> msg", "Name: msg", "[Rank] Name: msg", "[Rank] Name » msg"
-    // real servers decorate the speaker: "<(Member) » Aereon42> hi", "[VIP] Bob: hi",
+    // real servers decorate the speaker: "<(Member) » Nightjar_> hi", "[VIP] Bob: hi",
     // "Bob » hi". the old pattern only accepted a bare "<Name>", so every
     // plugin-formatted line failed to match and fell through to the
     // last-known-sender fallback - which attributed other people's messages to
-    // the WRONG player (observed: Aereon42's line arriving as ShadowAliceZ).
+    // the WRONG player (observed: Nightjar_'s line arriving as mc_a41f9c).
     // the name group must sit immediately before '>', so the token captured is
     // the LAST one inside the brackets - which is where the real username sits in
     // every rank format seen. verified against the live server's exact lines.
     private static final java.util.regex.Pattern CHAT_SHAPE = java.util.regex.Pattern.compile(
         "^\\s*(?:\\[[^\\]]{1,24}\\]\\s*)*(?:<[^>]*?([A-Za-z0-9_]{3,16})>\\s*(.{1,256})|([A-Za-z0-9_]{3,16})\\s*[:»>]\\s*(.{1,256}))$");
+
+    // the comparison key for "is this the same thing said": case and run-length of
+    // whitespace differ between delivery paths and mean nothing to a reader.
+    private static String chatKey(String text) {
+        return text == null ? "" : text.replaceAll("\\s+", " ").trim().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    // "<[Member] > Bob> hi" -> "hi", but ONLY when the name inside the decoration
+    // is the speaker already resolved for this line. somebody typing "Bob: come
+    // here" AT Bob is a real sentence and keeps every word of it.
+    private static String stripOwnDecoration(String sender, String text) {
+        try {
+            java.util.regex.Matcher m = CHAT_SHAPE.matcher(text);
+            if (!m.matches()) return text;
+            String who = m.group(1) != null ? m.group(1) : m.group(3);
+            String body = m.group(1) != null ? m.group(2) : m.group(4);
+            if (who == null || body == null || body.isBlank()) return text;
+            return who.equalsIgnoreCase(sender) ? body.trim() : text;
+        } catch (Throwable ignored) {
+            return text;
+        }
+    }
+
+    private void noteSelfChat(String text) {
+        String key = chatKey(text);
+        if (key.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        synchronized (recentSelfChat) {
+            recentSelfChat.values().removeIf(at -> now - at > CHAT_ECHO_WINDOW_MS);
+            recentSelfChat.put(key, now);
+        }
+    }
 
     private void tryParseChatLine(String raw) {
         if (raw == null || raw.isEmpty()) return;

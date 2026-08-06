@@ -188,7 +188,13 @@ public class SmeltInBlastFurnaceTask extends ResourceTask {
                     - totalFuelInBlastFurnace;
 
             // We don't have enough materials...
-            if (mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches()) < materialsNeeded) {
+            // gate, not end goal - see SmeltInFurnaceTask: counting inventory-only
+            // here lets a craft that stages these same materials in the crafting
+            // grid re-trip the check and interrupt itself forever.
+            int materialsHeld = isContainerOpen(mod)
+                    ? mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches())
+                    : mod.getItemStorage().getItemCount(materialTarget.getMatches());
+            if (materialsHeld < materialsNeeded) {
                 setDebugState("Getting Materials");
                 return getMaterialTask(_target.getMaterial());
             }
@@ -333,9 +339,11 @@ public class SmeltInBlastFurnaceTask extends ResourceTask {
 
         @Override
         protected double getCostToMakeNew(AltoClef mod) {
+            // emptiness, not nullness - see SmeltInFurnaceTask. these slots are
+            // never null, so this always returned 9999999 and the cost below never ran.
             if (_blastFurnaceCache.burnPercentage > 0 || _blastFurnaceCache.burningFuelCount > 0 ||
-                    _blastFurnaceCache.fuelSlot != null || _blastFurnaceCache.materialSlot != null ||
-                    _blastFurnaceCache.outputSlot != null) {
+                    !_blastFurnaceCache.fuelSlot.isEmpty() || !_blastFurnaceCache.materialSlot.isEmpty() ||
+                    !_blastFurnaceCache.outputSlot.isEmpty()) {
                 return 9999999.0;
             }
             if (mod.getItemStorage().getItemCount(Items.COBBLESTONE) > 11 &&

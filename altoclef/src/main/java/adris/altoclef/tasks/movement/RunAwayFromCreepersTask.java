@@ -36,10 +36,18 @@ public class RunAwayFromCreepersTask extends CustomBaritoneGoalTask {
         return "Run " + _distanceToRun + " blocks away from creepers";
     }
 
+    /**
+     * No forceCancel() here - a QUERY MUST NEVER GRAB THE CONTROLS. Same reasoning as
+     * RunAwayFromHostilesTask.newGoal(): CustomBaritoneGoalTask builds this goal lazily,
+     * and the lazy build happens inside isFinished() as well as onTick(), so asking an
+     * unstarted creeper-flee "are we clear yet" would throw away baritone's in-flight
+     * path calculation. MobDefenseChain assigns _runAwayTask a fresh RunAwayFromCreepersTask
+     * on every tick a creeper is fusing while setTask() refuses the twin, so those queries
+     * land on orphans - during the one situation where being able to move matters most.
+     * CustomBaritoneGoalTask.onStart() still cancels on the real start path.
+     */
     @Override
     protected Goal newGoal(AltoClef mod) {
-        // We want to run away NOW
-        mod.getClientBaritone().getPathingBehavior().forceCancel();
         return new GoalRunAwayFromCreepers(mod, _distanceToRun);
     }
 

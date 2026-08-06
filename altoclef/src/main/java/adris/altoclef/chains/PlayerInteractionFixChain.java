@@ -202,6 +202,12 @@ public class PlayerInteractionFixChain extends TaskChain {
     }
 
     @Override
+    public boolean runsWhileIdle() {
+        // a stuck interaction left unfixed is what the NEXT job inherits
+        return true;
+    }
+
+    @Override
     public String getName() {
         return "Hand Stack Fix Chain";
     }

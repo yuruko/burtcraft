@@ -172,6 +172,12 @@ public class WorldSurvivalChain extends SingleTaskChain {
     }
 
     @Override
+    public boolean runsWhileIdle() {
+        // standing in fire between jobs is still standing in fire
+        return true;
+    }
+
+    @Override
     protected void onStop(AltoClef mod) {
         super.onStop(mod);
     }

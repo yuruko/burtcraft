@@ -8,7 +8,7 @@ ambushed, takes requests from chat, and can tell you what it is doing while it
 does it. It is packaged here so you can bolt it onto *your* VTuber instead.
 
 The hard part of "AI plays Minecraft" is not the AI. It is that Minecraft has no
-API. This repo is the missing plumbing, plus a 4,800-line autonomy brain that
+API. This repo is the missing plumbing, plus a 7,200-line autonomy brain that
 already knows how to survive.
 
 ```
@@ -137,11 +137,24 @@ and learn the API before any of the above works.
 
 Burtcraft includes a reusable settlement hierarchy (`Settlement`, `Homestead`,
 `Outpost`) and Burnt's concrete `ToasterHomestead` / `ToasterOutpost` geometry.
-A toaster is an idempotently repaired rectangular smooth-stone prism with a
-clear interior, smooth floor/walls/ceiling, a three-wide doorless walk-through,
-two long roof slots, side torches, and deterministic middle-gallery appliance
-positions. The main homestead expands before each furnace; supported outposts
-remain strictly smaller.
+A toaster is an idempotently repaired rectangular stone prism with a clear
+interior, a two-wide doorless walk-through, two long roof slots, wall torches
+lighting the inside, and a 10-block clear yard on every side.
+
+**The footprint is a fixed ASCII floorplan and never changes size** — homestead
+14x9x8, outpost 12x7x6. Every fixture position is read off that map: 72
+appliance blocks (6 chests, 54 furnaces, 12 smokers), 36 wall torches and a
+two-bed nook for the homestead; 48, 24 and one bed for an outpost. Each
+appliance slot is a **column of three**, installed bottom course first
+(a block in mid-air has no face to click on), rotating chest → furnace → smoker.
+
+The homestead used to grow a block of width per furnace, up to 43x20x12 — which
+meant it re-laid its own house two dozen times and never finished one. A fixed
+plan is the fix, so outposts are smaller by construction rather than by check.
+
+> The floorplan lives in **two** places and they must stay byte-identical:
+> `core/settlements.js` and `altoclef/.../settlement/ToasterGeometry.java`.
+> Edit one, edit the other.
 
 ```js
 await mc.executeAction('set_home', { target: 'main toaster' });
@@ -162,7 +175,7 @@ of trusting inventory or an elapsed timer.
 
 ## Wiring it into your VTuber
 
-There are exactly four seams. You do not need to read the 4,800-line file.
+There are exactly five seams. You do not need to read the 7,200-line file.
 
 ```js
 import { MinecraftTool } from 'burtcraft/core';
@@ -178,7 +191,7 @@ The main firehose. Something happened in the world; turn it into a prompt.
 
 ```js
 mc.on('gameEvent', async (event, data) => {
-  // event: 'creeper_spotted' | 'nightfall' | 'died' | 'diamonds_found' | ...
+  // event: 'creeper_spotted' | 'nightfall' | 'death' | 'diamond_found' | ...
   const line = await askYourBrain(`while playing minecraft: ${event}. react in one line.`);
   speak(line);
 });
@@ -220,13 +233,34 @@ so she does not reply to every line), and command noise.
 
 ```js
 await mc.executeAction('mine', { item: 'diamond', amount: 3 }, {
-  source: 'llm',            // who wants this: 'llm' | 'viewer' | 'autonomy'
+  source: 'agent',          // who wants this - see the table below
   waitForCompletion: true
 });
 ```
 
 Give the LLM the tool schema in `examples/04_llm_tool.mjs` (Anthropic and OpenAI
 shapes, same 43 actions) and this becomes a normal tool call.
+
+### 5. Optional — hand milestones to your own memory
+
+This library keeps no database. It remembers places, builds and people in its own
+JSON file, but that is a closed world: nothing in it reaches whatever long-term
+recall your character already has. If you keep one, pass a sink and the handful
+of events a person would still be telling you about tomorrow get handed over.
+
+```js
+const mc = new MinecraftTool({
+  names: ['ada'],
+  remember: {
+    gameplay: (text, { tags }) => yourVectorStore.add(text, tags),   // deaths, diamonds, achievements
+    player:   (player, worldId) => yourPeopleStore.upsert(player)    // who she plays with
+  },
+  broadcast: (cue) => yourOverlay.send(cue)     // mirror internal cues to your UI
+});
+```
+
+Leave either out and it is a no-op — nothing is recorded and nothing breaks. Both
+can also be set later with `setRemember()` / `setBroadcast()`.
 
 ---
 
@@ -289,7 +323,7 @@ reusable at all.
 `explore` `hunt` `eat` `equip` `deposit` `stash` `give` `locate` `inventory`
 `coords` `chat` `cover_lava` `favorite` `unfavorite` `favorites` `set_home`
 `go_home` `set_outpost` `outposts` `go_outpost` `build_outpost`
-`build_settlement` `install_appliance` `place` `look` `boat`
+`build_settlement` `install_appliance` `place` `look` `boat` `hud`
 
 Selected mappings to the underlying commands:
 
@@ -297,11 +331,12 @@ Selected mappings to the underlying commands:
 |---|---|---|
 | `mine` / `collect` | `@get <resource> <n>` | ore names normalize, `diamond_ore` -> `diamond` |
 | `craft` | `@get <item>` | AltoClef's TaskCatalogue resolves the recipe |
-| `move {x,y,z}` | `@goto x y z` | or a remembered place name |
+| `move {x,z}` | `@goto x z` | y is dropped unless you pass `precise: true`; or a remembered place name |
 | `follow` | `@follow <player>` | defaults to `$MINECRAFT_OWNER` |
 | `defend` / `attack <mob>` | `@hero` | clears nearby hostiles |
 | `speedrun` / `gamer` | `@gamer` | `gamer` is the narrated, committed version |
 | `place` | `@place <block>` | added by this fork |
+| `hud` | pushes the intent overlay | the library sends this itself; you rarely call it |
 | `explore` | Baritone `#explore` | no native AltoClef task |
 | `status`, `favorites`, `set_home`, … | *(never reach the game)* | answered from memory |
 
@@ -311,13 +346,39 @@ Selected mappings to the underlying commands:
 
 | Env var | Default | What |
 |---|---|---|
-| `MINECRAFT_BRIDGE_PORT` | `7431` | ws port your VTuber listens on |
-| `BOT_NAMES` | *(none)* | comma-separated names she answers to in chat |
-| `MINECRAFT_OWNER` | *(none)* | in-game username for a bare "follow me" |
-| `ALTOCLEF_CONTROL_PORT` | `7440` | in-game tcp port |
-| `BURTCRAFT_INTENT_HUD` | on | on-screen "what I'm doing and why" line |
-| `BURTCRAFT_AUTO_THIRD_PERSON` | on | pull the camera out while walking head-down |
-| `BURTCRAFT_KEEP_RENDERING` | on | stop the game throttling to 10fps while unfocused |
+Each hop has **two** ends, and each end reads its own variable. Change one
+without the other and the two halves dial different ports.
+
+| Env var | Read by | Default | What |
+|---|---|---|---|
+| `MINECRAFT_BRIDGE_PORT` | core | `7431` | ws port your VTuber listens on |
+| `MINECRAFT_BRIDGE_URL` | bridge | `ws://localhost:7431` | where the bridge dials your VTuber |
+| `ALTOCLEF_CONTROL_PORT` | companion | `7440` | in-game tcp port it listens on |
+| `ALTOCLEF_HOST` / `ALTOCLEF_PORT` | bridge | `127.0.0.1` / `7440` | where the bridge dials the game |
+| `BOT_NAMES` | core | *(none)* | comma-separated names she answers to in chat |
+| `MINECRAFT_OWNER` | core | *(none)* | in-game username for a bare "follow me" |
+| `MINECRAFT_SPAWN_CENTER` | core | `0,0` | centre of the spawn keep-out box (multiplayer) |
+| `MINECRAFT_SPAWN_EXCLUSION` | core | `1000` | half-width of that box; `0` disables it |
+| `MINECRAFT_BRIDGE_ORPHAN_MS` | bridge | `90000` | how long an unowned task may run before the bridge stops it |
+| `MINECRAFT_BRIDGE_ORPHAN_STARTUP_MS` | bridge | `600000` | grace for the same check after launch |
+| `BURTCRAFT_INTENT_HUD` | companion | on | on-screen "what I'm doing and why" line |
+| `BURTCRAFT_AUTO_THIRD_PERSON` | companion | on | pull the camera out while walking head-down |
+| `BURTCRAFT_KEEP_RENDERING` | companion | on | stop the game throttling to 10fps while unfocused |
+| `BURTCRAFT_HIDE_TUTORIAL` | companion | on | suppress vanilla tutorial toasts on stream |
+| `BURTCRAFT_VANITY_CAMERA` | companion | on | small camera niceties for a watchable shot |
+
+### The spawn keep-out box
+
+On **multiplayer only**, actions from sources `agent` and `autonomous` are
+refused inside a cuboid ±`MINECRAFT_SPAWN_EXCLUSION` blocks around
+`MINECRAFT_SPAWN_CENTER`, and the bot walks itself out instead. Servers protect
+their middle, and a bot that keeps re-deriving "no" one hop at a time looks
+broken on stream. Movement is allowed; chopping, mining and building are not.
+
+This is worth knowing before you debug it: `executeAction('mine', …,
+{source:'agent'})` **will throw near spawn**. Operator, chat and safety requests
+are never gated, a home saved inside the box disarms the rule entirely, and
+`MINECRAFT_SPAWN_EXCLUSION=0` switches it off for servers with no protected hub.
 
 Press **F1** in game to take manual control: the bot stops, releases every forced
 key, and ignores external commands until you press it again. Chat still flows, so
@@ -351,10 +412,14 @@ replacing one of the three processes.
   drive outranks the normal idle menu. The shipped drive is Burnt's (bread and
   ovens). Set it to `0` to disable, or replace `_obsessionBehavior()` with your
   own character's fixation. This is the one structural piece of persona left in
-  the core, and it is isolated behind two call sites.
+  the core, and it is isolated behind a single call site.
 - `avoidWaterWhileDry` (Baritone setting) — on by default in this fork. Vanilla
   prices swimming low enough that crossing an ocean looks cheaper than walking
-  around it, which is how a bot ends up swimming for half an hour.
+  around it, which is how a bot ends up swimming for half an hour. It is not a
+  blanket ban: while dry she may cross up to `smallWaterCrossingMaxLength`
+  (default 6) blocks of water, so ponds and rivers stay pathable and oceans do
+  not. `swimCostMultiplier` (default 2) keeps swimming dearer than walking. Once
+  already wet the restriction lifts, so the way back to shore is never cut off.
 
 ---
 

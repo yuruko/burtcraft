@@ -190,7 +190,13 @@ public class SmeltInSmokerTask extends ResourceTask {
                     - totalFuelInSmoker;
 
             // We don't have enough materials...
-            if (mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches()) < materialsNeeded) {
+            // gate, not end goal - see SmeltInFurnaceTask: counting inventory-only
+            // here lets a craft that stages these same materials in the crafting
+            // grid re-trip the check and interrupt itself forever.
+            int materialsHeld = isContainerOpen(mod)
+                    ? mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches())
+                    : mod.getItemStorage().getItemCount(materialTarget.getMatches());
+            if (materialsHeld < materialsNeeded) {
                 setDebugState("Getting Materials");
                 return getMaterialTask(_target.getMaterial());
             }
@@ -335,9 +341,11 @@ public class SmeltInSmokerTask extends ResourceTask {
 
         @Override
         protected double getCostToMakeNew(AltoClef mod) {
+            // emptiness, not nullness - see SmeltInFurnaceTask. these slots are
+            // never null, so this always returned 9999999 and the cost below never ran.
             if (_smokerCache.burnPercentage > 0 || _smokerCache.burningFuelCount > 0 ||
-                    _smokerCache.fuelSlot != null || _smokerCache.materialSlot != null ||
-                    _smokerCache.outputSlot != null) {
+                    !_smokerCache.fuelSlot.isEmpty() || !_smokerCache.materialSlot.isEmpty() ||
+                    !_smokerCache.outputSlot.isEmpty()) {
                 return 9999999.0;
             }
             if (mod.getItemStorage().getItemCount(Items.COBBLESTONE) > 8 &&
