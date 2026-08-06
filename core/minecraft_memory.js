@@ -97,6 +97,10 @@ export class MinecraftMemory {
             // whole server for the first time again - no idea who she had talked to for
             // weeks, what they said, what they asked her to do, or who she gave bread to.
             players: [],
+            // 64-block cells a server told her she may not touch, as key -> when.
+            // declared here because a field the constructor never names is a field
+            // _load() forgets to restore.
+            claims: {},
             // the standing record of "am i actually able to get home". one departure
             // that fails is nothing; the same walk failing all afternoon means the
             // home is unreachable and she should build somewhere else. this MUST be
@@ -141,6 +145,16 @@ export class MinecraftMemory {
                 this.data.homeCampaign = parsed.homeCampaign && typeof parsed.homeCampaign === 'object' &&
                     !Array.isArray(parsed.homeCampaign) ? parsed.homeCampaign : null;
                 this.data.players = Array.isArray(parsed.players) ? parsed.players.slice(-MAX_PLAYERS) : [];
+                // WRITTEN BUT NEVER READ BACK is worse than never stored: the first
+                // record of the session flushed an empty array over a full one, so
+                // "where have i already looked" and "which ground is claimed" reset
+                // at every restart while both looked persisted on disk. these are the
+                // two ledgers that stop her re-checking the same ground forever and
+                // ping-ponging between two "unclaimed land" spots.
+                this.data.visited = Array.isArray(parsed.visited) ? parsed.visited.slice(-MAX_VISITED_SPOTS) : [];
+                this.data.claims = parsed.claims && typeof parsed.claims === 'object' && !Array.isArray(parsed.claims)
+                    ? parsed.claims
+                    : {};
                 // older memory files predate the tally; start it at zero rather
                 // than inventing a history she never lived.
                 const t = parsed.tally && typeof parsed.tally === 'object' ? parsed.tally : {};
@@ -151,7 +165,18 @@ export class MinecraftMemory {
                 };
             }
         } catch (err) {
-            if (err.code !== 'ENOENT') console.warn(`[minecraft-memory] unable to load memory: ${err.message}`);
+            if (err.code !== 'ENOENT') {
+                console.warn(`[minecraft-memory] unable to load memory: ${err.message}`);
+                // a truncated file used to escalate into TOTAL loss: the catch left
+                // the empty constructor defaults in place and the next record flushed
+                // them straight over her journal, landmarks, home and settlements.
+                // keep the damaged copy so the history is recoverable by hand.
+                try {
+                    const aside = `${this.filePath}.corrupt-${Date.now()}`;
+                    fs.renameSync(this.filePath, aside);
+                    console.warn(`[minecraft-memory] kept the unreadable file at ${aside}`);
+                } catch { /* nothing left to save */ }
+            }
         }
     }
 
@@ -172,8 +197,19 @@ export class MinecraftMemory {
         this._dirty = false;
         try {
             fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-            const temp = `${this.filePath}.tmp`;
-            fs.writeFileSync(temp, JSON.stringify(this.data, null, 2), 'utf8');
+            // the temp name carries pid+time because a FIXED sibling is shared by
+            // every writer on this path (a restart racing the old process, a test on
+            // the default path), and two interleaved write+rename pairs let one
+            // process rename the other's half-written json over the real file - which
+            // is precisely the corrupt load the guard above now has to clean up.
+            const temp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+            const fd = fs.openSync(temp, 'w');
+            try {
+                fs.writeFileSync(fd, JSON.stringify(this.data, null, 2), 'utf8');
+                fs.fsyncSync(fd);   // rename is only atomic against a file that reached the disk
+            } finally {
+                fs.closeSync(fd);
+            }
             fs.renameSync(temp, this.filePath);
         } catch (err) {
             // Memory is an enhancement, never a reason to stop playing.

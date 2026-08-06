@@ -31,8 +31,12 @@ public class GoalBlockSide implements Goal {
 
     @Override
     public double heuristic(int x, int y, int z) {
-        // How far are we away
-        return Math.min(getDistanceInRightDirection(x, y, z), 0);
+        // A* MINIMISES THIS, so a wrong-side position must cost MORE, not less.
+        // `Math.min(dist, 0)` scored the correct side 0 and the wrong side
+        // NEGATIVE, i.e. the search was actively pulled to the side it is meant to
+        // avoid. zero once she is far enough round, rising the further the wrong
+        // way she is.
+        return Math.max(0, -getDistanceInRightDirection(x, y, z));
     }
 
     private double getDistanceInRightDirection(int x, int y, int z) {

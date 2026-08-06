@@ -82,6 +82,26 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     TrapDoorBlock.OPEN, TrapDoorBlock.HALF
             );
 
+    /**
+     * BURNT: how far inside the hard reach limit a placement must sit before the
+     * builder will commit to it. See the call site in {@code possibleToPlace}.
+     */
+    private static final double PLACEMENT_REACH_MARGIN = 0.15;
+
+    /** BURNT: ticks of fruitless clicking at one cell before it is deferred. */
+    private static final int PLACE_ATTEMPT_LIMIT = 20;
+
+    /**
+     * BURNT: cells that would not accept a block from where she could get to.
+     * Consulted only when CHOOSING what to place, never when counting what is
+     * outstanding, so a deferred block can never make the build read as finished.
+     * Cleared whenever anything at all is successfully placed - a landed block
+     * changes the geometry, so the neighbour it was missing may now exist.
+     */
+    private final HashSet<BetterBlockPos> unplaceable = new HashSet<>();
+    private BetterBlockPos placeAttemptAt;
+    private int placeAttemptTicks;
+
     private HashSet<BetterBlockPos> incorrectPositions;
     private LongOpenHashSet observedCompleted; // positions that are completed even if they're out of render distance and we can't make sure right now
     private String name;
@@ -331,6 +351,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         if (dy == 1 && bcc.bsi.get0(x, y + 1, z).getBlock() instanceof AirBlock) {
                             continue;
                         }
+                        // BURNT: skip a cell that has already eaten a full attempt
+                        // budget, so one unreachable block cannot own the whole build
+                        if (unplaceable.contains(new BetterBlockPos(x, y, z))) {
+                            continue;
+                        }
                         desirableOnHotbar.add(desired);
                         Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
                         if (opt.isPresent()) {
@@ -372,7 +397,16 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 double placeZ = placeAgainstPos.z + aabb.minZ * placementMultiplier.z + aabb.maxZ * (1 - placementMultiplier.z);
                 Rotation rot = RotationUtils.calcRotationFromVec3d(RayTraceUtils.inferSneakingEyePosition(ctx.player()), new Vec3(placeX, placeY, placeZ), ctx.playerRotations());
                 Rotation actualRot = baritone.getLookBehavior().getAimProcessor().peekRotation(rot);
-                HitResult result = RayTraceUtils.rayTraceTowards(ctx.player(), actualRot, ctx.playerController().getBlockReachDistance(), true);
+                // BURNT: accept only placements COMFORTABLY inside reach. the aim
+                // points come from aabbSideMultipliers and can sit 0.1 blocks off a
+                // face corner, so validating at exactly the clip length accepts
+                // targets right on the boundary - and any difference between this ray
+                // and the one the click actually uses (eye height, a rotation packet
+                // one tick stale) then turns "placeable" into a permanent miss with
+                // no error anywhere. the margin costs a fraction of a block of
+                // working range and removes the whole marginal-reach class.
+                HitResult result = RayTraceUtils.rayTraceTowards(ctx.player(), actualRot,
+                        ctx.playerController().getBlockReachDistance() - PLACEMENT_REACH_MARGIN, true);
                 if (result != null && result.getType() == HitResult.Type.BLOCK && ((BlockHitResult) result).getBlockPos().equals(placeAgainstPos) && ((BlockHitResult) result).getDirection() == against.getOpposite()) {
                     OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, actualRot);
                     if (hotbar.isPresent()) {
@@ -568,7 +602,31 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
             }
             stopProtectItemOfMissing();
-            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            // BURNT: CLICKING IS NOT PROGRESS. this branch cancels the path and
+            // stands her still to click, and a click that silently does nothing
+            // (BlockPlaceHelper drops it with no log when the crosshair misses) left
+            // her frozen against one block forever - the only escapes were 12s/45s
+            // timer ladders one layer up, each of which restarts the builder from
+            // the SAME square and reproduces it. count the ticks spent on one
+            // placement, and once it is clearly not landing, give the block up for
+            // now: the builder moves to another cell, which moves HER, and the
+            // sub-block position that was the whole problem changes as a result.
+            BetterBlockPos placing = BetterBlockPos.from(toPlace.get().placeAgainst.relative(toPlace.get().side));
+            if (!placing.equals(placeAttemptAt)) {
+                placeAttemptAt = placing;
+                placeAttemptTicks = 0;
+            }
+            if (++placeAttemptTicks > PLACE_ATTEMPT_LIMIT) {
+                System.out.println("[baritone builder] giving up on " + placing + " for now - "
+                        + PLACE_ATTEMPT_LIMIT + " ticks of clicking with nothing placed (out of reach?)");
+                unplaceable.add(placing);
+                placeAttemptAt = null;
+                placeAttemptTicks = 0;
+                // deliberately NOT returning here: fall through so assemble() gets to
+                // set a real goal and she is allowed to walk again.
+            } else {
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
         }
 
         if (!AltoClefSettings.getInstance().isInteractionPaused() && Baritone.settings().allowInventory.value) {
@@ -662,6 +720,12 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         // we care about this position
                         BetterBlockPos pos = new BetterBlockPos(x, y, z);
                         if (valid(bcc.bsi.get0(x, y, z), desired, false)) {
+                            // BURNT: something landed, so every deferral is stale -
+                            // the block that just went in is usually the face a
+                            // neighbour was missing. same reasoning as handDeferred.
+                            if (!unplaceable.isEmpty() && incorrectPositions.contains(pos)) {
+                                unplaceable.clear();
+                            }
                             incorrectPositions.remove(pos);
                             observedCompleted.add(BetterBlockPos.longHash(pos));
                         } else {
@@ -1026,6 +1090,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         numRepeats = 0;
         paused = false;
         observedCompleted = null;
+        // BURNT: a new build gets a clean slate - deferrals describe where she was
+        // standing, not the schematic, so they must never outlive the job.
+        unplaceable.clear();
+        placeAttemptAt = null;
+        placeAttemptTicks = 0;
     }
 
     @Override
@@ -1256,6 +1325,13 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 // it should be a real block
                 // is it already that block?
                 if (valid(bsi.get0(x, y, z), sch, false)) {
+                    // BURNT: a finished block is not a door. see the setting's javadoc -
+                    // a finite penalty here is the first step of the break/re-place
+                    // livelock, because the block she mines to get past drops into her
+                    // bag, re-supplies the very cell she emptied, and gets placed back.
+                    if (Baritone.settings().buildNeverBreakCorrectBlocks.value) {
+                        return COST_INF;
+                    }
                     return Baritone.settings().breakCorrectBlockPenaltyMultiplier.value;
                 } else {
                     // can break if it's wrong

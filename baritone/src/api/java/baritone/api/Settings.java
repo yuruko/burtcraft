@@ -1164,6 +1164,22 @@ public final class Settings {
     public final Setting<Double> breakCorrectBlockPenaltyMultiplier = new Setting<>(10d);
 
     /**
+     * BURNT: Never break a block the schematic already agrees with, at any price.
+     * <p>
+     * {@link #breakCorrectBlockPenaltyMultiplier} is a FINITE penalty, so pathing
+     * through a finished wall costs 10x one break - routinely cheaper than walking
+     * round it. That is the whole of the "she destroys the block in front of her to
+     * navigate, picks it up, sees it's one she needs, and places it straight back"
+     * livelock reported from a live build: the drop restocks her, the schematic
+     * re-lists the cell she just emptied, and she rebuilds the hole she is standing
+     * in, forever. Nothing upstream can see it either - the correct-block tally
+     * moves +-1 every cycle, so every stall watchdog reads it as progress.
+     * <p>
+     * Set false to restore vanilla Baritone behaviour.
+     */
+    public final Setting<Boolean> buildNeverBreakCorrectBlocks = new Setting<>(true);
+
+    /**
      * Multiply the cost of placing a block that's incorrect in the builder's schematic by this coefficient
      */
     public final Setting<Double> placeIncorrectBlockPenaltyMultiplier = new Setting<>(2d);

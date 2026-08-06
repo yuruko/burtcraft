@@ -82,6 +82,16 @@ public final class BaritonePlayerContext implements IPlayerContext {
 
     @Override
     public HitResult objectMouseOver() {
-        return RayTraceUtils.rayTraceTowards(player(), playerRotations(), playerController().getBlockReachDistance());
+        // BURNT: cast from the eye she ACTUALLY has. this used the 3-arg overload,
+        // which always assumes a standing eye - but the builder forces SNEAK while
+        // placing and validates reachability against the CROUCHING eye
+        // (BuilderProcess#possibleToPlace -> inferSneakingEyePosition). the two rays
+        // start 0.35 blocks apart and are both hard-clipped at 4.5, so a target that
+        // is 4.47 away to the deciding ray can be 4.52 away to the executing one:
+        // baritone commits to the placement, cancels its path, clicks forever, and
+        // nothing lands. that is the "block is literally 1 pixel too far away, nudge
+        // her forward and she carries on" freeze reported from a live build.
+        return RayTraceUtils.rayTraceTowards(player(), playerRotations(),
+                playerController().getBlockReachDistance(), player().isShiftKeyDown());
     }
 }

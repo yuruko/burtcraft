@@ -255,7 +255,7 @@ const CHAT_AMBIENT_SAMPLE = 0.5;
 // her name every line - the follow-up is just "do you still have iron armor on?".
 // without a window that follow-up fell through to the ambient path (50% dice
 // behind a 75s gap her OWN reply had just reset), so she answered the one line
-// carrying "melba" and went silent on every one after it. these keep an answered
+// that happened to carry her name and went silent on every one after it. these keep an answered
 // person addressed while the back-and-forth is genuinely alive.
 const CHAT_EXCHANGE_MS = 150000;      // how long an answered person stays "talking to her"
 const CHAT_EXCHANGE_MAX_MS = 600000;  // ceiling: a window can be extended, never forever
@@ -2264,6 +2264,10 @@ class MinecraftTool extends EventEmitter {
             if (act && !NON_TASK_ACTIONS.has(act) && this._stopInFlight) {
                 await this._stopInFlight;
             }
+            // an install with no square named resolves one from the floorplan
+            // BEFORE the spawn gate, so the gate judges the ground the block
+            // actually lands on rather than where her body happens to be.
+            if (act === 'install_appliance') params = this._resolveApplianceParams(params);
             // BEFORE ANYTHING ELSE: is she standing in the server's spawn region?
             // Then nothing she picked for herself may touch the world here. This
             // sits at the top of the ONE door every action goes through, so it
@@ -3009,7 +3013,11 @@ class MinecraftTool extends EventEmitter {
         this._recoveringPin = true;
         this._lastPinRecoveryAt = now;
         const heldSec = Math.round((now - this._pinnedAnchorAt) / 1000);
-        const failed = this.activeGoal?.action || this.currentAction || null;
+        // the REQUESTED verb, not the rewritten one. `go_home` is flattened to
+        // `move` before the pending record exists, so blacklisting `action` here
+        // suppressed every walk she has (frontier, crowd drift, bed nook, spawn
+        // march) while leaving the doomed `go_home` free to be re-issued.
+        const failed = this.activeGoal?.requestedAction || this.activeGoal?.action || this.currentAction || null;
         const pinnedOn = failed || this.currentTask || 'whatever i was doing';
         this.log('warn', `pinned: ${heldSec}s inside ${PINNED_RADIUS} blocks, still taking hits from ${g.nearbyHostiles} hostile(s) - breaking ${pinnedOn}`);
         try {
@@ -3027,6 +3035,9 @@ class MinecraftTool extends EventEmitter {
         }
         this.activeGoal = null;
         this.currentTask = 'getting out of a spot that was killing me';
+        // evidence only: this path runs its own stop-and-retreat below, and a
+        // concurrent break-out would just cancel it.
+        this._noteStallHere({ breakOut: false });
         (async () => {
             try { await this.executeAction('stop', {}, { priority: 'urgent', source: 'pinned', timeoutMs: 30000 }); } catch { /* may not be running */ }
             // real distance, not a short hop - a few blocks just re-enters the same mobs'
@@ -3962,7 +3973,11 @@ class MinecraftTool extends EventEmitter {
         // THE OBSESSION, on request. matched before the generic craft/mine rules
         // below so "make bread" doesn't fall through to a raw craft of the word
         // and "get coal" reads as a fuel run rather than plain ore mining.
-        if (/\b(bake|make|bread)\b/.test(t) && /\bbread\b/.test(t)) {
+        // the verb is tested SEPARATELY from the noun on purpose. listing `bread`
+        // inside the verb alternation made the conjunction collapse to "does this
+        // line say bread", so on a toast-themed stream "lol your bread is on fire"
+        // preempted whatever she was building and started a bake.
+        if (/\b(bake|make|craft|cook|get|bring)\b/.test(t) && /\bbread\b/.test(t)) {
             return { action: 'craft', target: 'bread', params: { amount: 3 } };
         }
         // a named oven kind she should go get and install
@@ -4352,7 +4367,8 @@ class MinecraftTool extends EventEmitter {
         this._lastProtectionEscapeAt = now;
         this._escapingProtection = true;
         this._protectionDenials = [];
-        const failedAction = this.activeGoal?.action || this.currentAction || null;
+        // requested verb, not the rewritten one - see _recoverPinnedByMobs
+        const failedAction = this.activeGoal?.requestedAction || this.activeGoal?.action || this.currentAction || null;
         if (failedAction && !NON_TASK_ACTIONS.has(failedAction)) {
             this._avoidAction = failedAction;
             this._avoidUntil = now + LOOP_AVOID_MS * 2;
@@ -5019,7 +5035,8 @@ class MinecraftTool extends EventEmitter {
         }
         this._lastWaterEscapeAt = now;
         this._waterEscapeInFlight = true;
-        const failed = this.activeGoal?.action || this.currentAction;
+        // requested verb, not the rewritten one - see _recoverPinnedByMobs
+        const failed = this.activeGoal?.requestedAction || this.activeGoal?.action || this.currentAction;
         // never blacklist the escape's own move: that armed _avoidAction against
         // the one action that gets her out of the sea.
         if (failed && !NON_TASK_ACTIONS.has(failed) && this.activeGoal?.source !== 'water-escape') {
@@ -5245,6 +5262,12 @@ class MinecraftTool extends EventEmitter {
                 // bounded and self-clearing, but say so out loud - a quiet return
                 // here is the one shape that could read as a freeze.
                 this.log('warn', 'in the spawn region and the walk out was refused; waiting rather than working here');
+            } else {
+                // no step at all: the 10s pacing cooldown, standing in water, or no
+                // outward bearing that isn't sea. ALWAYS SAY SO - a silent return on
+                // a branch that also refuses every other kind of work is the exact
+                // shape that reads as a freeze on stream.
+                this.log('info', 'in the spawn region with no step out available this tick; not working here');
             }
             return;
         }
@@ -5253,8 +5276,14 @@ class MinecraftTool extends EventEmitter {
         // skeleton with no pickaxe and no food. one prep goal beats one more death.
         const prep = this._survivalPrep();
         if (prep) {
-            this._survivalPrepCooldowns.set(prep.key, Date.now());
+            // charge the 4-minute cooldown only for prep that actually WENT OUT.
+            // a blacklisted `craft` (20s stall limit, so this is routine) used to
+            // spend one prep key per tick doing nothing, and by the time the
+            // blacklist lifted she had no sword, no pickaxe and no food queued for
+            // another four minutes. the rain pull and the homestead arc below both
+            // hand their cooldown back the same way.
             if (this._safeExecute(prep.action, prep.params, prep.say)) {
+                this._survivalPrepCooldowns.set(prep.key, Date.now());
                 this.lastAutonomousAt = Date.now();
                 return;
             }
@@ -5302,7 +5331,17 @@ class MinecraftTool extends EventEmitter {
         // A relocation search may deliberately wait one short cooldown for a fresh
         // site observation. Generic boredom/explore must not carry her hundreds of
         // blocks away while that bounded nearby search is in progress.
-        if (this._homeRelocation) return;
+        //
+        // SUPPRESS THE LONG PICKS, NOT THE FLOOR. this was a bare `return`, which
+        // also skipped _executeLastResort() - the branch whose whole job is that
+        // standing still is only ever a decision. a relocation that finds no
+        // candidate returns null every 45s and can run for HOME_RELOCATION_MAX_MS
+        // (20 min), so the one state most likely to strand her was the one state
+        // with no floor under it.
+        if (this._homeRelocation) {
+            if (this._executeLastResort({ local: true })) this.lastAutonomousAt = Date.now();
+            return;
+        }
         // bread tendency: burnt loves bread. with downtime and wheat on hand she
         // gravitates to baking a loaf (she collects + eats bread). fires ~45% of
         // idle ticks when she has the makings; then the wheat's spent and she moves on.
@@ -5534,9 +5573,18 @@ class MinecraftTool extends EventEmitter {
         // that means go_home has already been judged unreachable, and the march
         // is exactly the right answer again.
         const home = this._home();
-        if (!this._homeRelocation && home && home.position &&
+        // ...but only if the walk home is actually going to be ISSUED. _safeExecute
+        // refuses go_home while it is blacklisted (any watchdog, 2min) or during the
+        // relocation backoff (15min), and this branch returns BEFORE the march tiers -
+        // so a single stalled walk home used to mean every tick for the next two
+        // minutes returned go_home, had it refused, and moved her nowhere, in the one
+        // place she is not allowed to stand. walking out is always still available.
+        const homeWalkable = !this._homeRelocation && home && home.position &&
             this._dimMatches(home.dimension, this.gameState.dimension) &&
-            !this._inSpawnRegion(home.position.x, home.position.z)) {
+            !this._inSpawnRegion(home.position.x, home.position.z) &&
+            !(this._avoidAction === 'go_home' && now < (this._avoidUntil || 0)) &&
+            !(this._homeDistance() >= HOME_RELOCATION_MIN_DISTANCE && now < this._homeRelocationBackoffUntil);
+        if (homeWalkable) {
             if (now - (this._homesteadCooldowns.get('leave_spawn_region') || 0) < SPAWN_ESCAPE_COOLDOWN_MS) return null;
             this._homesteadCooldowns.set('leave_spawn_region', now);
             return {
@@ -5546,8 +5594,17 @@ class MinecraftTool extends EventEmitter {
             };
         }
         if (now - (this._homesteadCooldowns.get('leave_spawn_region') || 0) < SPAWN_ESCAPE_COOLDOWN_MS) return null;
-        // the ocean lesson outranks this: a hop out of spawn is not worth a swim
-        if (this._justLeftWater()) return null;
+        // THE OCEAN LESSON IS ENFORCED PER-CANDIDATE, NOT BY STANDING STILL.
+        // this used to bail on _justLeftWater(), which stays true for five minutes
+        // after touching water - and `overWater` fires for a river crossing, a
+        // pier, or a baritone bridge. so one stream inside the region parked her
+        // for five minutes, and because the tick RETURNS on this step and a null
+        // step logs nothing, it was five minutes of motionless bot with no line in
+        // the log explaining it. _pickLandingSpot already refuses wet routes, wet
+        // endpoints and drowned bearings, so the blanket lockout only ever removed
+        // the one movement she is permitted here. still stand down while she is
+        // actually IN the water - the water watchdog owns that case.
+        if (this._isInWater()) return null;
         const reach = Math.max(HOME_SEARCH_MIN_DISTANCE + 1, region.radius + SPAWN_ESCAPE_MARGIN);
         const here = this._spawnDepth(p.x, p.z);
         const depth = (x, z) => this._spawnDepth(x, z);
@@ -5815,6 +5872,35 @@ class MinecraftTool extends EventEmitter {
         if (!kind || planned.length) return null;
         const spare = toasterOpenFloor(settlement).find(free);
         return spare ? { ...spare, kind, level: 0, unplanned: true } : null;
+    }
+
+    // ONLY THE AUTONOMY KNEW WHERE THE BLOCKS GO. `install_appliance` is on her
+    // tool schema, so her brain calls it the moment she decides to put the chest
+    // in - and with no x/y/z the bridge threw "appliance position must be finite
+    // numbers" and the step died on the spot (live, 2026-08-05: two refusals in a
+    // row, then "the chest can wait until tomorrow"). the floorplan already knows
+    // which square is next; asking it here means every caller gets the same answer
+    // the homestead arc would have given, and a genuine "nowhere to put it" comes
+    // back as a sentence she can act on instead of a translate error.
+    _resolveApplianceParams(params = {}) {
+        const p = { ...params };
+        if ([p.x, p.y, p.z].every(Number.isFinite)) return p;
+        const world = this._worldId();
+        const settlement = (p.settlementId ? this.memory.getSettlement(p.settlementId) : null)
+            || this.memory.listSettlements(world).find((s) => s.contains(this.gameState.position, 6))
+            || this.memory.getMainSettlement?.(world)
+            || null;
+        if (!settlement) {
+            throw new Error('no toaster to install it in yet - build_settlement first, or give exact coordinates');
+        }
+        const kind = String(p.target || '').toLowerCase().replace(/^minecraft:/, '').replace(/\s+/g, '_') || null;
+        const slot = this._nextApplianceSlot(settlement, kind);
+        if (!slot) {
+            throw new Error(kind
+                ? `every ${kind.replace(/_/g, ' ')} square in the floorplan is already filled`
+                : 'the floorplan is fully furnished - nothing left to install');
+        }
+        return { ...p, target: slot.kind, x: slot.x, y: slot.y, z: slot.z, settlementId: settlement.id };
     }
 
     _installInSettlement(settlement, kind = null, say = null, resolved = null) {
@@ -6863,7 +6949,11 @@ class MinecraftTool extends EventEmitter {
      * whatever just declined, and always available. Called whenever a tick would
      * otherwise end with her standing still.
      */
-    _executeLastResort() {
+    // `local:true` drops the open-ended picks, for callers that need a floor under
+    // her without undoing a bounded search in progress (a relocation hunt is
+    // deliberately confined near the old home - an `explore` would carry her out
+    // of the box it is searching).
+    _executeLastResort({ local = false } = {}) {
         const candidates = Number(this.gameState.nearbyHostiles) > 0
             ? [
                 { action: 'defend', params: {}, say: 'that plan wedged. clearing the immediate problem instead' },
@@ -6873,7 +6963,7 @@ class MinecraftTool extends EventEmitter {
                 { action: 'explore', params: {}, say: 'that plan wedged. moving on instead of staring at it' },
                 { action: 'collect', params: { target: 'oak_log', amount: 4 }, say: 'that plan wedged. doing a small wood run instead' }
             ];
-        for (const candidate of candidates) {
+        for (const candidate of (local ? candidates.filter((c) => c.action !== 'explore') : candidates)) {
             if (candidate.action === this._avoidAction && Date.now() < (this._avoidUntil || 0)) continue;
             if (this._safeExecute(candidate.action, candidate.params, candidate.say)) {
                 this.lastAutonomousAt = Date.now();
@@ -6943,9 +7033,17 @@ class MinecraftTool extends EventEmitter {
      * So count aborts BY PLACE. Several in a row inside a few blocks is not bad
      * luck with tasks, it is terrain she cannot leave by asking politely.
      */
-    _noteStallHere() {
+    // returns true when it took over recovery (stopped the runner and issued an
+    // escape of its own), so the caller does not fire a second stop that would
+    // cancel the hop it just started.
+    // `breakOut:false` records the evidence without acting on it - for callers
+    // that already run their own stop-and-walk escape (pinned, protection, water),
+    // where a second concurrent escape would just cancel the first. the anchor is
+    // deliberately LEFT STANDING at threshold in that case, so the next abort here
+    // that is allowed to act still finds a full streak waiting for it.
+    _noteStallHere({ breakOut = true } = {}) {
         const p = this._point(this.gameState.position);
-        if (!p) return;
+        if (!p) return false;
         const now = Date.now();
         const anchor = this._stallAnchor;
         if (anchor && now - anchor.at < STUCK_WINDOW_MS &&
@@ -6955,9 +7053,11 @@ class MinecraftTool extends EventEmitter {
         } else {
             this._stallAnchor = { x: p.x, z: p.z, at: now, count: 1 };
         }
-        if (this._stallAnchor.count < STUCK_STREAK) return;
+        if (this._stallAnchor.count < STUCK_STREAK) return false;
+        if (!breakOut) return false;
         this._stallAnchor = null;
         this._breakOutOfStuckSpot(p);
+        return true;
     }
 
     /**
@@ -6970,14 +7070,22 @@ class MinecraftTool extends EventEmitter {
      * cannot be pathed. Never a full-size venture; this is a door, not a journey.
      */
     _breakOutOfStuckSpot(p) {
-        // the ground itself is suspect now, so the site picker must stop offering it
-        this._recordSiteRejection(p, ['terrain too steep']);
-        this._rememberDestination(p);
+        // PICK THE ESCAPE BEFORE CONDEMNING THE GROUND. recording the rejection
+        // first marked the whole 64-block cell as bad terrain and remembered `p`
+        // as a recent destination (140-block exclusion) - and the escape then
+        // searched 12..64 blocks, i.e. entirely inside the two areas it had just
+        // ruled out, so the strict pass could never return anything.
         const known = this._nearestDryCell(p);
         const spot = (known && Math.hypot(known.x - p.x, known.z - p.z) <= STUCK_ESCAPE_MAX
             ? { x: known.x, y: this._safeTravelY(p), z: known.z }
             : null)
             || this._pickLandingSpot(p, 12, STUCK_ESCAPE_MAX);
+        // and mark the wedge as a WEDGE, not as a terrain verdict she never took:
+        // the cause may have been a mob, a fence or an unreachable goto, none of
+        // which say anything about the ground. `_recordSiteRejection` is permanent
+        // and would condemn 4096m2 - including her own homestead cell if she ever
+        // wedges while building there.
+        this._rememberDestination(p);
         this.recentEvents.record('got wedged on one spot and had to break out of it');
         try {
             this.memory.record('recovery', 'wedged in one spot - every job failed there', {
@@ -6987,16 +7095,52 @@ class MinecraftTool extends EventEmitter {
         if (!spot) {
             // nothing reachable that she knows of. say so rather than pretending -
             // the honest fallback is altoclef's own wander, which at least moves.
+            // it goes through the same stop as the hop below, because `explore` is
+            // a task action and the busy gate refuses it just as readily.
             this._pushCommentary("i can't get off this square. every single thing i start dies right here.");
-            this._safeExecute('explore', {}, null);
+            (async () => {
+                try {
+                    await this.executeAction('stop', {}, { priority: 'urgent', source: 'recovery', timeoutMs: 30000 });
+                } catch { /* may not be running */ }
+                try {
+                    await this.executeAction('explore', {}, { priority: 'low', source: 'recovery', waitForCompletion: false });
+                } catch (err) {
+                    this.log('warn', `break-out explore failed: ${err.message}`);
+                }
+            })();
             return;
         }
-        // bypass the action backoff: `move` is very likely the thing that just got
-        // blacklisted, and it is also the only thing that can help.
-        this._avoidAction = null;
-        this._avoidUntil = 0;
-        this._safeExecute('move', { ...spot, target: 'anywhere but this exact square' },
-            "three jobs in a row died on this one spot. it's not the jobs. getting off it.");
+        // STOP FIRST, THEN WALK - the same shape as the pinned/protection/water
+        // escapes. this used to be a bare _safeExecute('move'), issued from inside
+        // _recoverStalledGoal AFTER it had set `currentTask = recovering from ...`
+        // and while the aborted goal's pending record was still live. all three
+        // count as a live task, so the busy gate rejected the escape every single
+        // time, _safeExecute swallowed the rejection into a debug line, and the
+        // whole detector did nothing but wipe the backoff on its way past.
+        this._pushCommentary("three jobs in a row died on this one spot. it's not the jobs. getting off it.");
+        (async () => {
+            try {
+                await this.executeAction('stop', {}, { priority: 'urgent', source: 'recovery', timeoutMs: 30000 });
+            } catch { /* may not be running */ }
+            // clear the backoff only for the hop itself: `move` is very likely what
+            // just got blacklisted and is also the only thing that can help. wiping
+            // it outright disarmed the "don't re-pick the stalled action" guard that
+            // the stall watchdog had armed six lines earlier.
+            const heldAction = this._avoidAction;
+            const heldUntil = this._avoidUntil;
+            if (heldAction === 'move') { this._avoidAction = null; this._avoidUntil = 0; }
+            try {
+                await this.executeAction('move', { ...spot, target: 'anywhere but this exact square' },
+                    { priority: 'low', source: 'recovery', waitForCompletion: false });
+            } catch (err) {
+                this.log('warn', `break-out move failed: ${err.message}`);
+            } finally {
+                if (heldAction === 'move' && Date.now() < heldUntil) {
+                    this._avoidAction = heldAction;
+                    this._avoidUntil = heldUntil;
+                }
+            }
+        })();
     }
 
     _recoverStalledGoal() {
@@ -7036,7 +7180,9 @@ class MinecraftTool extends EventEmitter {
         this.currentTask = `recovering from stalled ${description}`;
         // "trying something else" is only an answer when the JOB was the problem.
         // count the failures that happen on one patch of ground - see _noteStallHere.
-        this._noteStallHere();
+        // the break-out runs its own stop-then-walk. firing this one too would
+        // cancel the escape hop the moment it was issued.
+        if (this._noteStallHere()) return true;
         this._pushCommentary(`i'm stuck on ${description}. aborting and trying something else.`);
         this.executeAction('stop', {}, { priority: 'urgent', source: 'recovery', waitForCompletion: false }).catch((err) => {
             this.log('warn', `failed to stop stalled goal: ${err.message}`);
@@ -7080,6 +7226,11 @@ class MinecraftTool extends EventEmitter {
         this._avoidUntil = now + LOOP_AVOID_MS;
         this.activeGoal = null;
         this.currentTask = `breaking out of a loop (${description})`;
+        // an orbit IS a job dying on one patch of ground. the by-place counter only
+        // ever heard from the stall watchdog, which cannot fire here by definition -
+        // she is moving, so lastProgressAt never ages out. three wander-storms or
+        // three orbits at one spot were three correct aborts and no wedge verdict.
+        if (this._noteStallHere()) return true;
         this._pushCommentary(this._loopBreakLine(description, confined, Math.round((confined ? confinedMs : runningMs) / 60000)));
         // stop; the next autonomy tick picks something different (looped action filtered out)
         this.executeAction('stop', {}, { priority: 'urgent', source: 'loop-recovery', waitForCompletion: false })

@@ -164,6 +164,8 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
     /** Last surveyed block tally, and when it last actually changed. */
     private String progressKey = "";
     private long progressAt;
+    /** Best completion score seen this build - the kick budget only resets on a new best. */
+    private int progressBest = Integer.MIN_VALUE;
     /** Where she was standing when she last moved, and when that was. */
     private BlockPos builderMotionPos;
     private long builderMotionAt;
@@ -258,6 +260,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         builderKicks = 0;
         progressKey = "";
         progressAt = 0L;
+        progressBest = Integer.MIN_VALUE;
         restocking = false;
         handModeUntil = 0L;
         handTarget = null;
@@ -315,7 +318,15 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
                 // run; only being STOCKED ends it. Without the latch every tick
                 // re-asked the same question, so the gather died at 25 and she
                 // built four blocks before starting the walk over again.
-                int stocked = Math.min(STONE_STOCKED_AT, current.smoothStoneRemaining());
+                // ...and the band must never CLOSE. capping the upper edge at "how
+                // much is still outstanding" collapses it to zero width exactly when
+                // the deficit is small: with one block left, stocked == 1, so a single
+                // block in the bag both starts the run (1 < 24) and ends it (1 >= 1) on
+                // the same tick. that is the "runs out of blocks near the end and never
+                // goes to fetch any" case - she latches and unlatches forever instead of
+                // walking to the quarry. the floor keeps the two edges apart.
+                int stocked = Math.max(STONE_RESTOCK_AT + 1,
+                        Math.min(STONE_STOCKED_AT, current.smoothStoneRemaining()));
                 if (stone < STONE_RESTOCK_AT) restocking = true;
                 if (restocking && stone >= stocked) restocking = false;
                 // the walk to the quarry belongs to ONE restock. see walkToQuarry.
@@ -993,7 +1004,17 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         if (progressAt != 0L && key.equals(progressKey)) return;
         progressKey = key;
         progressAt = System.currentTimeMillis();
-        builderKicks = 0;
+        // FORGIVE THE BUILDER ONLY WHEN IT GAINED GROUND. a changed key means the
+        // site changed, which an oscillation does every single cycle - 41 -> 40 ->
+        // 41 is three fresh keys and zero progress. resetting the kick budget on
+        // that handed the builder infinite credit in exactly the state the budget
+        // exists to catch. the clock above still moves (the world IS changing, so
+        // this is not a stall), but the kick budget now needs a new best.
+        int score = current.progressScore();
+        if (progressBest == Integer.MIN_VALUE || score > progressBest) {
+            progressBest = score;
+            builderKicks = 0;
+        }
     }
 
     /**
@@ -1342,6 +1363,20 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
                 // as progress here or the stall watchdog condemns a builder that is
                 // visibly chopping down a wood.
                 + "/" + applianceCorrect + "/" + yardRemaining;
+        }
+
+        /**
+         * How much of the site is DONE, as one number. A key that merely CHANGED
+         * says the world moved; this says it moved forward. The break/re-place
+         * livelock moves wallCorrect +-1 forever, which is a fresh key every
+         * cycle - so every watchdog downstream of noteProgress read a bot
+         * rebuilding the same hole as a bot making progress, and the escapes that
+         * exist for exactly this (hand mode, BLOCKED_PHASE) could never fire.
+         */
+        int progressScore() {
+            return floorCorrect + wallCorrect + roofCorrect + slotCorrect
+                + entranceCorrect + torchCorrect + applianceCorrect
+                - clearRemaining - yardRemaining;
         }
 
         /** Short human-readable "what is left" for the stall warning. */

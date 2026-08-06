@@ -10,6 +10,7 @@ import adris.altoclef.tasks.movement.EnterNetherPortalTask;
 import adris.altoclef.tasks.movement.EscapeFromLavaTask;
 import adris.altoclef.tasks.movement.GetToBlockTask;
 import adris.altoclef.tasks.movement.SafeRandomShimmyTask;
+import adris.altoclef.tasksystem.Task;
 import adris.altoclef.tasksystem.TaskRunner;
 import adris.altoclef.util.ItemTarget;
 import adris.altoclef.util.helpers.LookHelper;
@@ -157,7 +158,18 @@ public class WorldSurvivalChain extends SingleTaskChain {
     }
 
     private boolean isStuckInNetherPortal(AltoClef mod) {
-        return WorldHelper.isInNetherPortal(mod) && !mod.getUserTaskChain().getCurrentTask().thisOrChildSatisfies(task -> task instanceof EnterNetherPortalTask);
+        if (!WorldHelper.isInNetherPortal(mod)) {
+            return false;
+        }
+        // getCurrentTask() is null whenever no user task is running - and since this
+        // chain opted into runsWhileIdle(), that is now a state it is ticked in. a
+        // job finishing while she stands in a portal (a @gamer run reaching the
+        // nether, or a plain @stop) therefore threw an NPE out of getPriority, out
+        // of tickReflexes, out of AltoClef.onClientTick - killing defense, food, MLG
+        // and the respawn press together, every tick. EventBus only catches
+        // ClassCastException, so it escaped into Minecraft's own tick.
+        Task current = mod.getUserTaskChain().getCurrentTask();
+        return current == null || !current.thisOrChildSatisfies(task -> task instanceof EnterNetherPortalTask);
     }
 
     @Override

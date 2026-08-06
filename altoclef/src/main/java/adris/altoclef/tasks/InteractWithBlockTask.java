@@ -297,7 +297,16 @@ public class InteractWithBlockTask extends Task {
             return _wanderTask;
         }
 
-        int reachDistance = 0;
+        // A REACH OF ZERO IS NOT A REACH. this only feeds the one branch of
+        // createGoalForInteract that pairs GoalNear with GoalBlockSide - and
+        // GoalNear(pos, 0) is satisfied ONLY by standing inside `pos`, while
+        // GoalBlockSide(pos, side, 1) demands two blocks clear of it on that side.
+        // the conjunction is unsatisfiable, so every side-specific interact handed
+        // baritone a goal it could never reach and she simply never approached:
+        // wall torches only ever got lit when she happened to already be stood in
+        // the right square ("couldn't get her to do torches", live). the other two
+        // branches ignore this value entirely, so widening it cannot affect them.
+        int reachDistance = 3;
         Goal moveGoal = createGoalForInteract(_target, reachDistance, _direction, _interactOffset, _walkInto);
         ICustomGoalProcess proc = mod.getClientBaritone().getCustomGoalProcess();
 

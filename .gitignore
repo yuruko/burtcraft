@@ -1,6 +1,8 @@
 # --- secrets (never commit) ---
-# minecraft/xbox refresh token minted by msa_auth.mjs. grants account access.
-.msa_auth.json
+# minecraft/xbox refresh tokens minted by msa_auth.mjs. grant account access.
+# the glob is REQUIRED: a named profile writes .msa_auth.<name>.json, so a bare
+# `.msa_auth.json` covered the default account and left every extra one exposed.
+.msa_auth*.json
 .env
 *.pem
 
