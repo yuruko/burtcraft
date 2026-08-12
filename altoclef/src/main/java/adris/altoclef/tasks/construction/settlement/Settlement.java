@@ -7,6 +7,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -126,6 +127,77 @@ public abstract class Settlement {
     public int yardMinZ() { return minZ() - YARD_MARGIN; }
     public int yardMaxZ() { return maxZ() + YARD_MARGIN; }
 
+    /**
+     * How far apart the ground torches in the yard stand.
+     *
+     * A torch is light level 14 and block light drops 1 per block travelled, so a
+     * spot goes dark at 14 blocks. On a ten-block grid the worst place to stand -
+     * dead centre of four torches - is 5+5 away, which is light 4. That leaves
+     * three whole blocks of slack for ground that is not perfectly level, and
+     * hostile mobs need light ZERO, not low light. Tighter than this is just more
+     * walking; the yard is already the thing being lit, not the horizon.
+     */
+    public static final int PERIMETER_LIGHT_SPACING = 10;
+
+    /**
+     * WHERE THE YARD GETS ITS TORCHES.
+     *
+     * The floorplan's thirty-six wall torches light the INSIDE of the house, which
+     * stops things spawning in her kitchen and does nothing whatsoever about the
+     * ten metres of cleared, unlit ground she put around it. That ground is a mob
+     * farm with a view: the log has zombies at the wall, a creeper flee-loop, and
+     * two villagers killed within a minute of each other, all at the homestead.
+     *
+     * So the yard is lit on a grid, and the grid is DERIVED from the yard the same
+     * way {@link #quarryMouth()} is derived from the anchor - never stored. A
+     * remembered list would be a second copy of settlement geometry to drift out
+     * of sync with the first, which is the mistake the floorplan already taught us
+     * once, and this way an existing homestead gets its lights the moment the new
+     * jar loads with nothing to migrate.
+     *
+     * Torches stand at floorY + 1, on the ground at floorY: the yard-clearing job
+     * empties everything ABOVE the floor course, so that is the one height in the
+     * yard guaranteed to be air with something underneath it. Which is also why
+     * this work comes after the yard is clear - lighting a forest is placing
+     * torches on leaves.
+     *
+     * The house's own footprint is skipped; it has its own torches inside and its
+     * walls are not ground.
+     */
+    public List<BlockPos> perimeterLightPositions() {
+        List<BlockPos> spots = new ArrayList<>();
+        int y = floorY() + 1;
+        for (int x : lightStops(yardMinX(), yardMaxX())) {
+            for (int z : lightStops(yardMinZ(), yardMaxZ())) {
+                if (x >= minX() && x <= maxX() && z >= minZ() && z <= maxZ()) continue;
+                spots.add(new BlockPos(x, y, z));
+            }
+        }
+        return spots;
+    }
+
+    /**
+     * Evenly spaced stops across a span, both ends included, no gap wider than
+     * {@link #PERIMETER_LIGHT_SPACING}.
+     *
+     * Stepping from one edge and stopping when the next step would overshoot
+     * leaves the far edge of the yard - a whole unlit strip on two sides of the
+     * house - so the count is rounded UP and the stops distributed across it
+     * instead. Rounding each stop to a whole block can shorten one gap by a block;
+     * it can never lengthen one past the spacing, which is the only property the
+     * lighting depends on.
+     */
+    private static int[] lightStops(int min, int max) {
+        int span = max - min;
+        if (span <= 0) return new int[] { min };
+        int steps = Math.max(1, (int) Math.ceil((double) span / PERIMETER_LIGHT_SPACING));
+        int[] stops = new int[steps + 1];
+        for (int i = 0; i <= steps; i++) {
+            stops[i] = min + (int) Math.round((double) span * i / steps);
+        }
+        return stops;
+    }
+
     /** How far past the yard the quarry mouth sits. See {@link #quarryMouth()}. */
     public static final int QUARRY_OFFSET = 6;
 
@@ -219,6 +291,282 @@ public abstract class Settlement {
         return !adris.altoclef.external.ExternalControlServer.isPlacedByPeople(state);
     }
 
+    /**
+     * THE TRENCH: a dry moat around the whole encampment, outside the lit yard.
+     *
+     * The yard's torch grid means nothing spawns INSIDE the perimeter any more, so
+     * the only creeper left is one that spawned in the dark somewhere else and
+     * walked in. Four is the number that stops it: a mob's pathfinder refuses a
+     * drop of more than three, so at four she is not a wall it climbs but a route
+     * it never considers. Two wide because a mob clears a one-block gap in its
+     * stride, and a one-wide trench is a kerb.
+     *
+     * It sits OUTSIDE the yard rather than at its edge, because
+     * {@link #perimeterLightPositions()} puts torches on yardMinX/yardMaxX exactly
+     * - a trench there would dig out the lighting that made the yard safe.
+     */
+    public static final int TRENCH_DEPTH = 4;
+    public static final int TRENCH_WIDTH = 2;
+
+    public int trenchMinX() { return yardMinX() - TRENCH_WIDTH; }
+    public int trenchMaxX() { return yardMaxX() + TRENCH_WIDTH; }
+    public int trenchMinZ() { return yardMinZ() - TRENCH_WIDTH; }
+    public int trenchMaxZ() { return yardMaxZ() + TRENCH_WIDTH; }
+
+    /** The solid course under the void - the one row she must NOT dig through. */
+    public int trenchFloorY() { return floorY() - TRENCH_DEPTH; }
+
+    /**
+     * Is this column part of the ring? The yard and the house are not.
+     *
+     * The single gate for the whole feature: every other trench predicate runs
+     * through here, so a settlement with no trench has no trench geometry, no
+     * schematic opinion below its floor, and no placement veto.
+     */
+    public boolean inTrenchColumn(BlockPos pos) {
+        if (!trenchEnabled) return false;
+        int x = pos.getX(), z = pos.getZ();
+        if (x < trenchMinX() || x > trenchMaxX() || z < trenchMinZ() || z > trenchMaxZ()) return false;
+        return x < yardMinX() || x > yardMaxX() || z < yardMinZ() || z > yardMaxZ();
+    }
+
+    /**
+     * THE CAUSEWAY IS A BRIDGE, NOT A DAM.
+     *
+     * One crossing, on the +Z face, because that is the way to
+     * {@link #quarryMouth()} and every stone restock walks it. One is enough for
+     * everything else too: the yard is ten blocks of open ground, so once she is
+     * inside the ring she reaches any wall of the house without crossing again.
+     *
+     * Solid at the floor course ONLY, with the void continuing underneath. A
+     * causeway dug down to the trench floor would be a dam, cutting the ring into
+     * segments - and then a fall into the far segment is a trap, because the one
+     * staircase is on the other side of a four-block wall. Left as a bridge, the
+     * trench floor runs unbroken all the way round and she can always walk to the
+     * stairs from wherever she fell in.
+     */
+    public boolean isTrenchCauseway(BlockPos pos) {
+        return pos.getY() == floorY()
+            && pos.getX() == anchor.getX()
+            && pos.getZ() > yardMaxZ() && pos.getZ() <= trenchMaxZ();
+    }
+
+    /** Where the fence gate stands: the outer lip, so nothing can step onto the bridge. */
+    public BlockPos causewayGate() {
+        return new BlockPos(anchor.getX(), floorY() + 1, trenchMaxZ());
+    }
+
+    /** First column of the stair run. */
+    private int stairX() { return anchor.getX() + 2; }
+
+    /**
+     * OFF UNTIL SOMEONE ASKS. A trench is roughly 1250 block breaks, and switching
+     * it on by default would have every homestead already standing read as
+     * incomplete on the next survey and start digging unannounced.
+     */
+    private boolean trenchEnabled = false;
+    public boolean trenchEnabled() { return trenchEnabled; }
+    public void setTrenchEnabled(boolean enabled) { this.trenchEnabled = enabled; }
+
+    /**
+     * HOW DEEP SHE IS ALLOWED TO DIG RIGHT NOW - the layer gate, and the reason
+     * she can always get back out.
+     *
+     * Handed the whole four courses at once, the builder works by proximity and
+     * will sink one four-deep pit wherever it happens to start. If that pit is not
+     * the stair run, she is standing at the bottom of a hole she cannot jump out
+     * of and cannot pillar out of, because bridging is vetoed - the trap the veto
+     * itself creates. Opening one course at a time keeps the whole ring level, so
+     * the stairs are never more than a course deeper than the ground beside them
+     * and the way out exists at every moment of the dig.
+     *
+     * Full depth by default: a settlement nobody is actively building has no
+     * reason to describe itself as half-dug.
+     */
+    private int trenchDepthAllowed = TRENCH_DEPTH;
+    public int trenchDepthAllowed() { return trenchDepthAllowed; }
+    public void setTrenchDepthAllowed(int courses) {
+        this.trenchDepthAllowed = Math.max(0, Math.min(TRENCH_DEPTH, courses));
+    }
+
+    /**
+     * The top of the solid ground beneath a ring column.
+     *
+     * Normally the trench floor. In the stair run it climbs a block at a time, so
+     * the steps fall out of the same arithmetic that carves the void instead of
+     * being a second description of the same geometry.
+     *
+     * SHE WILL END UP DOWN THERE whether or not she means to: from the lip, the
+     * far bottom corner is about six blocks from her eyes and her reach is 4.5, so
+     * the bottom course cannot be dug from above. The staircase is not a
+     * convenience, it is the only way the job is possible - and the only way out
+     * if she falls, since bridging is vetoed and four blocks is too tall to jump.
+     */
+    public int trenchFinalGroundY(int x, int z) {
+        if (z == yardMaxZ() + 1 && x >= stairX() && x < stairX() + TRENCH_DEPTH) {
+            return floorY() - 1 - (x - stairX());
+        }
+        return trenchFloorY();
+    }
+
+    /**
+     * The finished shape, clamped to whatever course the layer gate has opened.
+     *
+     * Clamping the STAIRS by the same rule is what keeps them usable mid-dig: at
+     * two courses open the run is a single step down to a two-deep floor, at four
+     * it is the full flight. The exit is never a thing she finishes later.
+     */
+    public int trenchGroundY(int x, int z) {
+        return Math.max(trenchFinalGroundY(x, z), floorY() - trenchDepthAllowed);
+    }
+
+    /** The air she has to carve: everything above this column's floor, up to grade. */
+    public boolean inTrenchVoid(BlockPos pos) {
+        if (!inTrenchColumn(pos)) return false;
+        if (isTrenchCauseway(pos)) return false;
+        return pos.getY() > trenchGroundY(pos.getX(), pos.getZ()) && pos.getY() <= floorY();
+    }
+
+    /**
+     * Where nothing may ever be placed. The void MINUS its bottom course, and the
+     * difference is load-bearing in both directions.
+     *
+     * {@code WorldHelper.canPlace} asks this before every placement, so a veto
+     * covering the full depth would refuse her own trench torches - they stand one
+     * above each column's floor - and an unlit ring is the one outcome that makes
+     * the whole job a net loss.
+     *
+     * Exempting only that course still closes the crossing: the three above it
+     * stay vetoed, so a pillar gets exactly one block tall and stops, and three
+     * blocks is too far to jump. Nothing ever asks to fill the course anyway,
+     * because the seal beneath it is already solid ground she can walk on.
+     */
+    public boolean inTrenchNoPlaceZone(BlockPos pos) {
+        return inTrenchVoid(pos) && pos.getY() > trenchGroundY(pos.getX(), pos.getZ()) + 1;
+    }
+
+    /**
+     * Torches on the trench floor, on the same grid rule as the yard.
+     *
+     * Without these the trench is a four-block-deep unlit ditch ringing the base -
+     * which at night is a spawn platform for exactly the creepers it was dug to
+     * keep out, only now they are inside the line. Placed one above each column's
+     * own floor so a torch in the stair run lands on the step rather than inside
+     * the rock holding it up.
+     */
+    public List<BlockPos> trenchLightPositions() {
+        List<BlockPos> spots = new ArrayList<>();
+        if (!trenchEnabled) return spots;
+        int innerZLow = yardMinZ() - 1, innerZHigh = yardMaxZ() + 1;
+        int innerXLow = yardMinX() - 1, innerXHigh = yardMaxX() + 1;
+        for (int x : lightStops(trenchMinX(), trenchMaxX())) {
+            spots.add(new BlockPos(x, trenchGroundY(x, innerZLow) + 1, innerZLow));
+            spots.add(new BlockPos(x, trenchGroundY(x, innerZHigh) + 1, innerZHigh));
+        }
+        for (int z : lightStops(yardMinZ(), yardMaxZ())) {
+            spots.add(new BlockPos(innerXLow, trenchGroundY(innerXLow, z) + 1, z));
+            spots.add(new BlockPos(innerXHigh, trenchGroundY(innerXHigh, z) + 1, z));
+        }
+        return spots;
+    }
+
+    /**
+     * SHE MUST NEVER BRIDGE HER OWN MOAT.
+     *
+     * {@code MovementTraverse} prices a gap crossing as walk + place whenever it
+     * can find something to place against, so by default a path straight over the
+     * trench is simply cheaper than walking round to the gate - and one dirt block
+     * turns the whole ring back into open ground. Vetoing placement inside the
+     * void puts that route beyond the PATHFINDER rather than beyond the rules:
+     * {@code CalculationContext} consults this before a cost is ever assigned, so
+     * the bridge is not a thing she declines to do, it is not a thing she can see.
+     *
+     * Registered through {@code protectStructurePlacement}, NOT {@code
+     * avoidBlockPlace}, for the reason spelled out on {@code _structureAvoiders}:
+     * the plain avoider lists are snapshotted by BotBehaviour and cleared on every
+     * pop, so a veto registered by the build task dies the moment the build ends -
+     * which is precisely when a plain {@code @goto} would price the shortcut.
+     *
+     * The causeway, the steps and the floor seal are all EXEMPT, or the trench
+     * could never be finished: every one of them is a block she has to place
+     * inside the ring.
+     */
+    public void protectTrenchFromBridging() {
+        baritone.altoclef.AltoClefSettings.getInstance()
+            .protectStructurePlacement(protectionId() + "/trench", this::inTrenchNoPlaceZone);
+    }
+
+    /**
+     * A stable name for this settlement in the protection registry, so resuming
+     * a build re-states the same rule instead of stacking another copy of it
+     * onto the pathing thread's per-block check.
+     */
+    public String protectionId() {
+        return kind() + "@" + anchor.getX() + "," + anchor.getY() + "," + anchor.getZ();
+    }
+
+    /**
+     * THE HOUSE IS NOT A SHORTCUT.
+     *
+     * Baritone prices a wall as ordinary stone, so cutting through the toaster is
+     * routinely a couple of blocks cheaper than walking to the door - and she did
+     * exactly that, repeatedly, to her own home.
+     *
+     * The guard for this already existed, but it was registered on a BotBehaviour
+     * frame in {@code ToasterBuildTask.onStart} and popped in {@code onStop}. That
+     * protects the house only while she is BUILDING it, which is the one time she
+     * is not trying to walk past it. Registering here instead
+     * ({@link baritone.altoclef.AltoClefSettings#protectStructure}) puts the rule
+     * somewhere the behaviour stack cannot wipe, so it holds during `@goto`, a
+     * mining trip, a flee, and while nothing is running at all.
+     *
+     * ONLY FINISHED SHELL IS PROTECTED, which is what keeps the builder working:
+     * a shell position holding the WRONG block still gets cleared and re-laid, the
+     * interior still gets swept, and the entrance and toast slots still get opened
+     * out - none of those hold shell material, so none of them match.
+     */
+    public void protectFromMining(java.util.function.Supplier<net.minecraft.world.level.BlockGetter> world) {
+        baritone.altoclef.AltoClefSettings.getInstance().protectStructure(protectionId(), pos -> {
+            // Geometry first: this runs on every candidate block break in the
+            // world, and six int comparisons reject everything but this site.
+            if (!inOuterPrism(pos)) return false;
+            if (!isFloor(pos) && !isRoof(pos) && !isWall(pos)) return false;
+            if (isEntrance(pos) || isToastSlot(pos)) return false;
+            // Runs on BARITONE'S PATHING THREAD, which outlives the world by a
+            // moment while the game is closing - an unguarded world read there
+            // threw an NPE straight out of the path finder (2026-08-05 08:37:35).
+            // No world means no opinion; protecting nothing is safe when
+            // everything is being torn down anyway.
+            net.minecraft.world.level.BlockGetter level = world == null ? null : world.get();
+            if (level == null) return false;
+            return isShellMaterial(level.getBlockState(pos));
+        });
+    }
+
+    /**
+     * HOW MUCH OF THE PLAN IS IN SCOPE RIGHT NOW.
+     *
+     * {@link ToasterTier} says the tier is read off the world and never stored,
+     * and that is the right rule - but {@link #applianceSlots()} is the thing
+     * that has to shrink and it has no world handle to read. So the stage lives
+     * here as a CACHE, not as memory: ToasterBuildTask recomputes it from the
+     * world on every survey (about once a second) and only ever moves it
+     * forward within a session. Nothing persists it, so a house she demolished
+     * is back at SHELL the moment anyone looks at it.
+     *
+     * FULL by default, which is exactly today's behaviour for every settlement
+     * that is not built from the layered plan: the old extruded geometry has no
+     * stages and never reads this.
+     */
+    private ToasterTier.Stage stage = ToasterTier.Stage.FULL;
+
+    public ToasterTier.Stage stage() { return stage; }
+
+    /** @param stage the stage the world is currently at; null is ignored. */
+    public void setStage(ToasterTier.Stage stage) {
+        if (stage != null) this.stage = stage;
+    }
+
     /** Intentional walk-through opening; subclasses decide its silhouette. */
     public abstract boolean isEntrance(BlockPos pos);
 
@@ -251,10 +599,36 @@ public abstract class Settlement {
             || block instanceof BedBlock;
     }
 
+    /**
+     * THE SHELL UPGRADE TARGET, or null while she is just building a house.
+     *
+     * Normally ANY shell stone counts as finished, which is what stops her
+     * tearing down a sound cobblestone wall to re-place it in smooth stone. But
+     * that same rule makes an upgrade impossible to express: with cobble reading
+     * as correct forever, "make the shell iron" is a job with nothing outstanding
+     * in it, and she stands in a finished house holding iron blocks.
+     *
+     * So an upgrade names ONE block, and while it is named only that block is
+     * correct. The anti-oscillation guarantee moves rather than disappears: it
+     * used to come from "anything stone is its own answer", and now it comes from
+     * the target being STICKY - see {@link ToasterTier#buildingMaterial}, which
+     * only climbs a rung when she is holding a full stack of the better block, so
+     * the answer cannot flicker every time a furnace finishes.
+     */
+    private Block shellUpgradeTarget = null;
+
+    public Block shellUpgradeTarget() { return shellUpgradeTarget; }
+
+    /** @param target the block the shell must become, or null to accept any shell stone again. */
+    public void setShellUpgradeTarget(Block target) {
+        this.shellUpgradeTarget = target;
+    }
+
     /** Does this block already count as finished shell? */
     public boolean isShellMaterial(BlockState state) {
         if (state == null) return false;
         Block block = state.getBlock();
+        if (shellUpgradeTarget != null) return block == shellUpgradeTarget;
         return block == material || SHELL_STONE.contains(block);
     }
 
@@ -275,6 +649,7 @@ public abstract class Settlement {
         if (inYard(worldPos)) {
             return isYardObstruction(current) ? Blocks.AIR.defaultBlockState() : current;
         }
+        if (inTrenchColumn(worldPos)) return trenchState(worldPos, current, available);
         if (!inOuterPrism(worldPos)) return current;
         if (isEntrance(worldPos) || isToastSlot(worldPos)) return Blocks.AIR.defaultBlockState();
         if (isFloor(worldPos) || isRoof(worldPos) || isWall(worldPos)) {
@@ -282,6 +657,46 @@ public abstract class Settlement {
         }
         if (isInterior(worldPos)) {
             return preserveInterior(current) ? current : Blocks.AIR.defaultBlockState();
+        }
+        return current;
+    }
+
+    /**
+     * What the ring should hold, course by course.
+     *
+     * The void reuses {@link #isYardObstruction} rather than inventing a second
+     * rule, which makes the trench literally "yard, below grade" - and inherits
+     * the refusals that matter most down here for free. A fluid answers CURRENT,
+     * so a spring or an aquifer in the ring reads as already-correct and drops out
+     * of the tally instead of becoming a cell she can never satisfy: a wet segment
+     * is still a segment nothing walks across, and this is the shape that has
+     * stalled every other never-ending job in this file.
+     */
+    private BlockState trenchState(BlockPos worldPos, BlockState current, List<BlockState> available) {
+        int y = worldPos.getY();
+        // Above grade the ring is felled exactly like the yard. Not cosmetic: sand
+        // and gravel left leaning over an open trench pour into it, and a tally
+        // that refills itself every pass is the snow trap with a longer fuse.
+        if (y > floorY() && y <= roofY()) {
+            return isYardObstruction(current) ? Blocks.AIR.defaultBlockState() : current;
+        }
+        // Checked before the void, which also covers floorY.
+        if (isTrenchCauseway(worldPos)) return shellState(current, available);
+        int ground = trenchGroundY(worldPos.getX(), worldPos.getZ());
+        if (y == ground) {
+            // THE SEAL. A four-deep ring will open caves, and an unsealed breach
+            // turns the trench from a wall into a tunnel that delivers mobs inside
+            // the perimeter - strictly worse than never having dug it.
+            //
+            // Only ever laid at the FINISHED depth. Sealing whatever rock the layer
+            // gate is currently resting on would be laying a floor she is about to
+            // dig back out on the next course.
+            if (ground != trenchFinalGroundY(worldPos.getX(), worldPos.getZ())) return current;
+            boolean hollow = current.isAir() || !current.getFluidState().isEmpty();
+            return hollow ? shellState(current, available) : current;
+        }
+        if (y > ground && y <= floorY()) {
+            return isYardObstruction(current) ? Blocks.AIR.defaultBlockState() : current;
         }
         return current;
     }
@@ -298,6 +713,11 @@ public abstract class Settlement {
      */
     public BlockState shellState(BlockState current, List<BlockState> available) {
         if (isShellMaterial(current)) return current;
+        // an upgrade names exactly one block, so there is nothing to choose: the
+        // spot holds the wrong thing and the answer is the target. offering her
+        // "whatever stone is in the bag" here is what would put a renovation half
+        // in cobble.
+        if (shellUpgradeTarget != null) return shellUpgradeTarget.defaultBlockState();
         if (available != null && !available.isEmpty()) {
             for (Block stone : SHELL_STONE) {
                 for (BlockState candidate : available) {

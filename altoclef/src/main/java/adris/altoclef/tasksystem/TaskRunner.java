@@ -21,7 +21,7 @@ public class TaskRunner {
     /**
      * While false, not even the survival chains get a turn.
      *
-     * This is the F1 handoff: when the operator takes the keyboard, the bot must be inert,
+     * This is the F1 handoff: when the operator takes the keyboard, burnt must be inert,
      * not merely jobless - a defense chain that keeps fighting for the mouse is
      * worse than one that sleeps. Everything else that "stops" her is now just
      * an empty job queue, and reflexes survive it.
@@ -69,7 +69,7 @@ public class TaskRunner {
      * chain and `tick()` then returned immediately, so between jobs nothing
      * defended her, nothing ate, nothing pressed respawn. She was a mannequin
      * from the moment a task ended until the next command arrived, however long
-     * burnt-side took to think of one, and a spider only needs seven seconds.
+     * host-side took to think of one, and a spider only needs seven seconds.
      *
      * So the reflexes keep their turn. Only chains that say they survive idling
      * run here, and only the highest-priority one, exactly as when on duty -

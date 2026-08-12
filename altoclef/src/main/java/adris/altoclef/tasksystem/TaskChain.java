@@ -1,6 +1,7 @@
 package adris.altoclef.tasksystem;
 
 import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,7 +33,27 @@ public abstract class TaskChain {
 
     public void tick(AltoClef mod) {
         _cachedTaskChain.clear();
-        onTick(mod);
+        // the tree starts here, so the frame counter starts at zero here too.
+        Task.resetDepth();
+        try {
+            onTick(mod);
+        } catch (TaskCycleException e) {
+            // a cyclic task tree is not a task that failed, it is a job that can
+            // never terminate. log the loop and drop the whole chain - host-side
+            // hears the abort and picks something else, which is strictly better
+            // than the client dying on stream.
+            Debug.logError("[cycle] chain '" + getName() + "': " + e.getMessage());
+            onCycleDetected(mod);
+        }
+    }
+
+    /**
+     * how this chain gets out of a cyclic tree. the default drops the work.
+     * a chain that owes somebody an answer (see UserTaskChain) overrides this
+     * so the abort is REPORTED rather than just happening.
+     */
+    protected void onCycleDetected(AltoClef mod) {
+        stop(mod);
     }
 
     public void stop(AltoClef mod) {

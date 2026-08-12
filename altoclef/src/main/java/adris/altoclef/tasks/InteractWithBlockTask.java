@@ -14,6 +14,7 @@ import adris.altoclef.util.helpers.LookHelper;
 import adris.altoclef.util.helpers.StorageHelper;
 import adris.altoclef.util.helpers.WorldHelper;
 import adris.altoclef.util.progresscheck.MovementProgressChecker;
+import adris.altoclef.util.slots.PlayerSlot;
 import adris.altoclef.util.slots.Slot;
 import adris.altoclef.util.time.TimerGame;
 import baritone.api.pathing.goals.Goal;
@@ -180,7 +181,35 @@ public class InteractWithBlockTask extends Task {
         } else {
             if (sideMatters) {
                 // Make sure we're on the right side of the block.
-                Goal sideGoal = new GoalBlockSide(target, interactSide, 1);
+                //
+                // A VERTICAL SIDE IS THE SPACE SHE STANDS IN, NOT ONE SHE STANDS
+                // BESIDE, so it cannot carry the same buffer as a wall.
+                //
+                // `target` has ALREADY been offset onto the face by this point. For
+                // a wall that lands beside the block and a buffer of 1 asks her to
+                // stand one further out - correct, and reachable. For UP it lands on
+                // the square she has to be standing ON, and the same buffer then
+                // demands `y > target.y + 1`: two blocks of clear air above her own
+                // feet. Unsatisfiable on flat ground, and A* only discovers that by
+                // exhausting the entire cached region - 4.5 MILLION movements
+                // considered, no path, per attempt, per spot, forever. Live, that
+                // was every yard light, floor torch and trench light on the
+                // homestead: 8- and 16-block paths reported, never walked, the
+                // rotation timing each spot out at 97% built for hours.
+                //
+                // Stock never hit it because every stock UP caller (bucket, sign,
+                // nether portal, crop planting) passes walkInto=true and returns
+                // above; the callers that reach here with a vertical side are all
+                // burtcraft's - torches, the causeway gate, tilling.
+                //
+                // -1 is the buffer that means "at or above the face": the goal
+                // becomes `y >= target.y`, i.e. stood on the ground the torch goes
+                // on, which is exactly where a player stands to click a top face.
+                // It widens the DOWN case the same way rather than narrowing it
+                // (stock demanded three blocks of clearance underneath), so no
+                // position that used to satisfy this goal stops satisfying it.
+                int buffer = interactSide.getAxis().isVertical() ? -1 : 1;
+                Goal sideGoal = new GoalBlockSide(target, interactSide, buffer);
                 return new GoalAnd(sideGoal, new GoalNear(target.offset(interactOffset), reachDistance));
             } else {
                 // TODO: Cleaner method of picking which side to approach from. This is only here for the lava stuff.
@@ -414,10 +443,33 @@ public class InteractWithBlockTask extends Task {
         Optional<Rotation> reachable = getCurrentReach();
         if (reachable.isPresent()) {
             if (LookHelper.isLookingAt(mod, _target)) {
-                if (_toUse != null) {
-                    mod.getSlotHandler().forceEquipItem(_toUse, false);
-                } else {
+                if (_toUse == null) {
                     mod.getSlotHandler().forceDeequipRightClickableItem();
+                } else if (!_toUse.isEmpty()) {
+                    // THE CLICK MUST NOT OUTRUN THE EQUIP. forceEquipItem does not
+                    // put the stack in her hand: it sets the selected slot to hotbar
+                    // 1 IMMEDIATELY and then asks the server to SWAP the stack into
+                    // that slot, which lands a tick or two later - and it returns
+                    // false outright when the item is in no screen slot. the press
+                    // used to go out on the same tick either way, so the right-click
+                    // was spent holding whatever hotbar 1 happened to contain, and
+                    // when that slot was empty she stood at the wall clicking it
+                    // BARE-HANDED. nothing places, the survey still owes the spot,
+                    // and TORCH_ATTEMPT_MS rotates her onto the next one and back
+                    // again - 79 "will not take a torch" and 4 actual torches in 20
+                    // minutes, live. every other placement caller in this codebase
+                    // already gates its click on this; this one did not.
+                    //
+                    // an ItemTarget that is EMPTY (not null) is a plain right-click
+                    // with no item at all - chests, doors, crafting tables - so it
+                    // must fall through both branches, ungated, exactly as before.
+                    mod.getSlotHandler().forceEquipItem(_toUse, false);
+                    if (!_toUse.matches(StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot()).getItem())) {
+                        // not in hand YET. waiting is free: a genuine shortage was
+                        // already turned into a gather task at the top of onTick,
+                        // and _moveChecker still expires if this never resolves.
+                        return ClickResponse.WAIT_FOR_CLICK;
+                    }
                 }
                 mod.getInputControls().tryPress(_interactInput);
                 if (mod.getInputControls().isHeldDown(_interactInput)) {

@@ -1,6 +1,7 @@
 package adris.altoclef.tasks;
 
 import adris.altoclef.AltoClef;
+import adris.altoclef.tasks.container.DoStuffInContainerTask;
 import adris.altoclef.tasks.container.PickupFromContainerTask;
 import adris.altoclef.tasks.movement.DefaultGoToDimensionTask;
 import adris.altoclef.tasks.movement.PickupDroppedItemTask;
@@ -150,17 +151,18 @@ public abstract class ResourceTask extends Task implements ITaskCanForce {
         // Check for chests and grab resources from them.
         if (_currentContainer == null) {
             List<ContainerCache> containersWithItem = mod.getItemStorage().getContainersWithItem(Arrays.stream(_itemTargets).reduce(new Item[0], (items, target) -> ArrayUtils.addAll(items, target.getMatches()), ArrayUtils::addAll));
-            if (!containersWithItem.isEmpty()) {
-                ContainerCache closest = containersWithItem.stream().min(StlHelper.compareValues(container -> container.getBlockPos().distToCenterSqr(mod.getPlayer().position()))).get();
-                if (closest.getBlockPos().closerToCenterThan(mod.getPlayer().position(), mod.getModSettings().getResourceChestLocateRange())) {
-                    _currentContainer = closest;
-                }
+            Optional<ContainerCache> closest = containersWithItem.stream()
+                    .filter(container -> !containerIsAlreadyOurs(container.getBlockPos()))
+                    .min(StlHelper.compareValues(container -> container.getBlockPos().distToCenterSqr(mod.getPlayer().position())));
+            if (closest.isPresent() && closest.get().getBlockPos().closerToCenterThan(mod.getPlayer().position(), mod.getModSettings().getResourceChestLocateRange())) {
+                _currentContainer = closest.get();
             }
         }
         if (_currentContainer != null) {
             Optional<ContainerCache> container = mod.getItemStorage().getContainerAtPosition(_currentContainer.getBlockPos());
             if (container.isPresent()) {
-                if (Arrays.stream(_itemTargets).noneMatch(target -> container.get().hasItem(target.getMatches()))) {
+                if (Arrays.stream(_itemTargets).noneMatch(target -> container.get().hasItem(target.getMatches()))
+                        || containerIsAlreadyOurs(_currentContainer.getBlockPos())) {
                     _currentContainer = null;
                 } else {
                     // We have a current chest, grab from it.
@@ -201,6 +203,20 @@ public abstract class ResourceTask extends Task implements ITaskCanForce {
             }
         }
         return onResourceTick(mod);
+    }
+
+    /**
+     * A container one of our own subtasks is mid-job inside is NOT loot.
+     * <p>
+     * The smelt tasks receive their own output (see DoSmeltIn*Task.containerSubTask),
+     * so treating the furnace we're smelting in as a lootable chest tears the smelt
+     * task down and re-opens the screen for every ingot that pops out - which reads
+     * as the container UI flickering nonstop, and thrashes the task tree for nothing.
+     */
+    private boolean containerIsAlreadyOurs(BlockPos containerPos) {
+        return thisOrChildSatisfies(task -> task.isActive()
+                && task instanceof DoStuffInContainerTask container
+                && container.isWorkingInContainer(containerPos));
     }
 
     @Override

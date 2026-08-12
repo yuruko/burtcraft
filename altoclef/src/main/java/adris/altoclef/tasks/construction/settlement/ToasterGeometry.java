@@ -14,8 +14,8 @@ import java.util.Map;
 /**
  * THE FLOORPLAN.
  *
- * One ascii map decides where every fixture in a toaster lives. The controller's
- * node side parses byte-identical strings (core/settlements.js), so
+ * One ascii map decides where every fixture in a toaster lives. Burnt's node
+ * side parses byte-identical strings (node/tools/minecraft_settlements.js), so
  * the shell built in here and the gallery she is sent to fill can never drift
  * apart - which is exactly how the old layout went wrong, with a js grid and a
  * java grid that had quietly stopped agreeing about where appliance 18 goes.
@@ -23,10 +23,10 @@ import java.util.Map;
  * <pre>
  *   W = shell wall      T = wall torch      C = chest
  *   F = furnace         S = smoker          B = bed
- *   ' ' on the top row  = the walk-through
+ *   K = crafting table  ' ' on the top row  = the walk-through
  * </pre>
  *
- * Every T/C/F/S is a COLUMN OF THREE - one on the ground, one above that, one
+ * Every T/C/F/S/K is a COLUMN OF THREE - one on the ground, one above that, one
  * above that. Banks of appliances up the walls is what makes the inside read as
  * a toaster instead of a shed with a furnace in it.
  *
@@ -42,7 +42,11 @@ public final class ToasterGeometry {
 
     private static final String[] HOMESTEAD_PLAN = {
         "WWWWWW  WWWWWW",
-        "WSFTCT  TCTFSW",
+        // one of the two chest stacks by the door is a crafting table stack: she
+        // crafts far more often than she needs a sixth chest, and walking out of
+        // her own house to reach a workbench is the kind of thing that reads as
+        // broken on stream. three chests is still 81 slots.
+        "WSFTKT  TCTFSW",
         "WT          TW",
         "WF          FW",
         "WT          TW",
@@ -68,7 +72,8 @@ public final class ToasterGeometry {
      * ever fits are a chest, a furnace and a smoker rather than eighteen
      * furnaces and then, eventually, somewhere to put anything.
      */
-    private static final List<Block> INSTALL_WAVE = List.of(Blocks.CHEST, Blocks.FURNACE, Blocks.SMOKER);
+    private static final List<Block> INSTALL_WAVE =
+        List.of(Blocks.CHEST, Blocks.FURNACE, Blocks.SMOKER, Blocks.CRAFTING_TABLE);
 
     /** One appliance block: where it goes, what it is, and which course it is on. */
     public static final class Slot {
@@ -82,9 +87,17 @@ public final class ToasterGeometry {
             this.level = level;
         }
 
+        /**
+         * EVERY fixture the map can hold needs a case here. The trailing
+         * "furnace" is a DEFAULT, so a new plan character that forgets one is
+         * not a compile error - it is a slot Burnt is told to fill with a
+         * furnace while the survey goes on judging it against the block the
+         * plan really wants, and the gallery rotates on it forever.
+         */
         public String kind() {
             if (block == Blocks.CHEST) return "chest";
             if (block == Blocks.SMOKER) return "smoker";
+            if (block == Blocks.CRAFTING_TABLE) return "crafting_table";
             return "furnace";
         }
     }
@@ -173,6 +186,7 @@ public final class ToasterGeometry {
                     case 'C' -> columns.add(new FixtureCell(dx, dz, Blocks.CHEST));
                     case 'F' -> columns.add(new FixtureCell(dx, dz, Blocks.FURNACE));
                     case 'S' -> columns.add(new FixtureCell(dx, dz, Blocks.SMOKER));
+                    case 'K' -> columns.add(new FixtureCell(dx, dz, Blocks.CRAFTING_TABLE));
                     default -> throw new IllegalStateException("toaster plan has unknown fixture '" + cell + "' at " + dx + "," + dz);
                 }
             }

@@ -5,7 +5,7 @@ import adris.altoclef.commandsystem.Arg;
 import adris.altoclef.commandsystem.ArgParser;
 import adris.altoclef.commandsystem.Command;
 import adris.altoclef.commandsystem.CommandException;
-import adris.altoclef.tasks.construction.PlaceBlockTask;
+import adris.altoclef.tasks.construction.AcquireAndPlaceBlockTask;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
@@ -27,6 +27,9 @@ public final class PlaceAtCommand extends Command {
         Identifier id = Identifier.tryParse(name.contains(":") ? name : "minecraft:" + name);
         Block block = id == null ? null : BuiltInRegistries.BLOCK.getValue(id);
         if (block == null || block == Blocks.AIR) throw new CommandException("unknown block: " + name);
-        mod.runUserTask(new PlaceBlockTask(pos, block), this::finish);
+        // ...AcquireAndPlace, not PlaceBlockTask: the appliance gallery is fed by a
+        // survey that reports which SQUARE is empty, and nothing in that pipeline
+        // ever checks she is carrying the thing that goes in it.
+        mod.runUserTask(new AcquireAndPlaceBlockTask(block, pos), this::finish);
     }
 }

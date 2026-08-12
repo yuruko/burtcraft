@@ -17,7 +17,12 @@ public final class ToasterBuildCommand extends Command {
         super("toaster_build", "Builds a smooth-stone toaster homestead or outpost",
             new Arg(String.class, "homestead/outpost"),
             new Arg(Integer.class, "x"), new Arg(Integer.class, "y"), new Arg(Integer.class, "z"),
-            new Arg(Integer.class, "width"), new Arg(Integer.class, "depth"), new Arg(Integer.class, "height"));
+            new Arg(Integer.class, "width"), new Arg(Integer.class, "depth"), new Arg(Integer.class, "height"),
+            // OPTIONAL, AND OFF WHEN ABSENT. An older bridge sends seven arguments
+            // and must keep meaning "no trench" - a settlement that silently
+            // acquired a 1250-block dig from a version skew would be the worst
+            // possible way to find out this shipped.
+            new Arg(Integer.class, "trench", 0, 7));
     }
 
     @Override
@@ -27,12 +32,14 @@ public final class ToasterBuildCommand extends Command {
         int width = parser.get(Integer.class);
         int depth = parser.get(Integer.class);
         int height = parser.get(Integer.class);
+        boolean trench = parser.get(Integer.class) != 0;
         try {
             Settlement settlement = switch (role) {
                 case "homestead" -> new ToasterHomestead("the homestead", anchor, width, depth, height);
                 case "outpost" -> new ToasterOutpost("toaster outpost", anchor, width, depth, height);
                 default -> throw new IllegalArgumentException("role must be homestead or outpost");
             };
+            settlement.setTrenchEnabled(trench);
             mod.runUserTask(new ToasterBuildTask(settlement), this::finish);
         } catch (IllegalArgumentException ex) {
             throw new CommandException(ex.getMessage());

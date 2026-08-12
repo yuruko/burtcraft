@@ -92,8 +92,27 @@ export function appraiseMinecraftState(gameState = {}) {
         - (rainedOn ? 5 : 0) - (stormedOn ? 4 : 0)
         - (dangerousDimension ? 7 : 0) - immediateHazard * 42
     );
+    // beauty is a small standing term, not an event. observe() pulls toward this
+    // appraisal continuously, so a sunset she is standing in nudges fun for as
+    // long as she is standing in it and then stops - no decay clock of its own.
+    // ⚠ the phase strings are the companion's (skyColorPhase in
+    // ExternalControlServer); absent means the jar cannot tell, and every term
+    // below is then simply 0 rather than assumed.
+    const skyPhase = String(gameState.skyColorPhase || '').toLowerCase();
+    const moonPhase = finite(gameState.moonPhase, -1);
+    // the sky has to be visible or she is looking at a ceiling.
+    const canSeeIt = gameState.skyVisible === true;
+    const isGoldenHour = canSeeIt && (skyPhase === 'golden_hour' || skyPhase === 'sunset');
+    const isStarryNight = canSeeIt && (skyPhase === 'night' || skyPhase === 'predawn')
+        && !rainedOn && moonPhase >= 0;
+    // vanilla indexes the moon atlas full-first, so 0 IS the full moon.
+    const isFullMoon = moonPhase === 0;
+
     const fun = clamp(
         52 + (rareOreNearby ? 9 : 0) + (dangerousDimension ? 5 : 0)
+        + (isGoldenHour ? 8 : 0)
+        + (isStarryNight ? 12 : 0)
+        + (isFullMoon && gameState.timeOfDay === 'night' ? 6 : 0)
         - (health < 0.35 ? 15 : 0) - (hunger < 0.25 ? 9 : 0)
         - (rainedOn ? 7 : 0)
         - immediateHazard * 10

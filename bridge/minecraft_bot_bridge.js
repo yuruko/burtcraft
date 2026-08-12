@@ -34,21 +34,32 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
     toasterHomesteadDimensions, toasterOutpostDimensions
-} from '../core/settlements.js';
+} from '../../../node/tools/minecraft_settlements.js';
+// the ornaments she stands in her own yard. IMPORTED, never restated: this list
+// and `PLACEABLE_BLOCKS` in minecraft_tool.js are two enforcement points for one
+// rule, and hand-copying it is precisely how nine of the ten ornaments ended up
+// accepted here and refused there. (module import only - nothing is constructed.)
+import { COMFORT_KINDS } from '../../../node/tools/minecraft_memory.js';
 
 const SUPPORTED_ACTIONS = new Set([
     'move', 'get', 'mine', 'collect', 'craft', 'follow', 'stop', 'idle',
     'defend', 'attack', 'speedrun', 'eat', 'hunt', 'equip', 'deposit',
-    'stash', 'give', 'inventory', 'coords', 'locate', 'cover_lava',
-    'explore', 'chat', 'place', 'build_settlement', 'install_appliance',
-    'look', 'boat', 'hud'
+    'stash', 'give', 'inventory', 'coords', 'locate', 'cover_lava', 'stock_food',
+    'explore', 'chat', 'place', 'place_block', 'build_settlement', 'build_plan',
+    'farm', 'install_appliance', 'withdraw', 'peek',
+    'look', 'boat', 'hud', 'protect_settlement', 'tic'
 ]);
 // These controls may run alongside a real AltoClef goal. They must never take
 // ownership of gameState.currentTask or an instant completion will make a mine,
 // follow, or speedrun look idle while it is still running.
 // 'hud' is text on a screen, not a goal - if it claimed currentTask, every intent
 // update would instantly complete and make a running mine/follow/speedrun read as idle.
-const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'inventory', 'coords', 'look', 'boat', 'hud']);
+// 'protect_settlement' hands the pathfinder a rule and returns - it starts no
+// goal, so it must not own currentTask either.
+// 'tic' is a one-second fidget (a crouch spam, a hop, a punch at the camera). It
+// starts no goal and moves her nowhere, so like 'hud' it must never own currentTask -
+// its instant completion would make a running mine or follow read as idle.
+const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'inventory', 'coords', 'look', 'boat', 'hud', 'protect_settlement', 'tic']);
 // (the table of legal footprints that used to live here is gone on purpose -
 // see the build_settlement case: the relay resolves the size from the floorplan
 // now instead of refusing anything that disagrees with a copy of it.)
@@ -575,6 +586,15 @@ class MinecraftBotBridge extends EventEmitter {
                 return p.now === true || p.hasFood === true
                     ? { command: 'eat_now' }
                     : { command: `food ${amount(p.amount, 3)}` };
+            // the SAME `@food <n>` gather, deliberately under a different action
+            // name. `eat` is in the tool's SAFETY_ACTIONS, so it skips the busy
+            // gate and the stale-state check - which is right for "she is starving,
+            // interrupt whatever this is" and exactly wrong for a downtime stock-up
+            // that should queue behind real work. it is also what she SAYS: a long
+            // forage announced as "eating" is the documented freeze where she went
+            // quiet for minutes while claiming to take a bite. n is a food SCORE
+            // (nutrition x count), not an item count - bread is 5 a loaf.
+            case 'stock_food': return { command: `food ${amount(p.amount, 20)}` };
             // boat: altoclef crafts one (@get boat) but cannot ride it, so
             // mount/dismount are companion-side. no auto-sailing - baritone has
             // no boat pathing, so she'd just drift.
@@ -583,15 +603,37 @@ class MinecraftBotBridge extends EventEmitter {
             // facing, not travelling: "turn around", "look at me". handled by the
             // companion directly - altoclef has no look command.
             case 'look': {
+                if (p.away === true) return { command: 'look_away' };
                 if (p.turn === 'around') return { command: 'look_turn 180' };
                 if (Number.isFinite(Number(p.pitch))) return { command: `look_pitch ${Math.round(Number(p.pitch))}` };
                 const who = String(p.target || '').trim();
                 if (!who || !/^[A-Za-z0-9_]{1,16}$/.test(who)) throw new Error('look needs a valid player name');
-                return { command: `look_at ${who}` };
+                // HOW LONG SHE HOLDS IT. the companion re-asserts the rotation every
+                // tick for this long, because a single write is overwritten by
+                // altoclef's own look control before anybody sees it - which is why
+                // "look at me while you talk to me" never used to do anything.
+                // clamped companion-side too; this is the readable half.
+                const hold = Number(p.hold);
+                return {
+                    command: Number.isFinite(hold) && hold > 0
+                        ? `look_at ${who} ${Math.min(15, hold).toFixed(1)}`
+                        : `look_at ${who}`
+                };
             }
             // the in-game intent line. burnt already base64'd the json payload, because
             // AltoClef's CommandExecutor splits on ';' - free-form text can never be
             // concatenated into a command. re-validate the alphabet rather than trust it.
+            // a fidget: crouch spam, a hop, or the front-camera air punch. the KIND is
+            // whitelisted here rather than passed through, because everything reaching
+            // the companion is a command string and an unvalidated one would be a way
+            // to smuggle a second command past this translator.
+            case 'tic': {
+                const kind = String(p.kind || '').trim().toLowerCase();
+                if (!['crouch', 'jump', 'flex'].includes(kind)) {
+                    throw new Error(`tic kind must be crouch, jump or flex (got "${kind}")`);
+                }
+                return { command: `tic ${kind}` };
+            }
             case 'hud': {
                 const payload = String(p.payload || '');
                 if (payload && !/^[A-Za-z0-9+/=]{1,4096}$/.test(payload)) {
@@ -606,7 +648,44 @@ class MinecraftBotBridge extends EventEmitter {
             case 'equip':
                 if (itemList) return { command: `equip ${itemList}` };
                 return p.target ? { command: `equip ${item(p.target)}` } : null;
-            case 'deposit':  return { command: `deposit${itemList ? ' ' + itemList : ''}` };
+            // raw names: this list is what she is CARRYING, not what she wants.
+            case 'deposit': {
+                const held = this._itemList(p.items, { raw: true });
+                return { command: `deposit${held ? ' ' + held : ''}` };
+            }
+            // TAKE HER OWN STUFF BACK OUT OF A CHEST. deposit has existed since
+            // the beginning and there was NO way back - a one-way door, which is
+            // why the pantry could fill up with five hundred loaves she then went
+            // out and farmed replacements for.
+            //
+            // ⚠ RAW NAMES, NEVER THE ORE->PRODUCT ALIAS MAP, for exactly the
+            // reason `deposit` uses raw ones: a withdraw names what is ALREADY IN
+            // THE CHEST. aliased, "take my raw_iron" asks the companion for
+            // `iron_ingot`, an item that is not in there, so nothing comes out and
+            // a stocked shelf stays invisible forever.
+            //
+            // ⚠ AND THE COUNT IS AN INCREMENT - how many MORE she should end up
+            // holding - which the companion converts to a hold target itself
+            // (held + take). PickupFromContainerTask.isFinished is a `>=` count
+            // check, so a raw target she already meets finishes instantly having
+            // moved nothing: the hold-target treadmill this stack has been bitten
+            // by twice (see the bread pipeline). do not pre-add her carried count.
+            case 'withdraw': {
+                const what = this._rawItemName(p.item || p.target || '');
+                if (!what) throw new Error('withdraw needs to know which item to take out of the chest');
+                return { command: `withdraw ${what} ${amount(p.amount, 1)}` };
+            }
+
+            // OPEN A CONTAINER JUST TO READ IT. the only way to seed or refresh a
+            // pantry entry, and what she does instead of guessing when a reading
+            // has expired - which matters beyond tidiness, because sizing a
+            // withdraw off a stale reading can ask for more than the chest holds
+            // and PickupFromContainerTask has no give-up.
+            case 'peek': {
+                const at = this._worldPoint(p, 'peek position');
+                return { command: `peek ${at.x} ${at.y} ${at.z}` };
+            }
+
             case 'stash': {
                 const start = p.start;
                 const end = p.end;
@@ -655,16 +734,61 @@ class MinecraftBotBridge extends EventEmitter {
                 // can disagree with its own caller about a constant is not
                 // validation, it is a second source of truth.
                 //
-                // There is exactly one homestead footprint and one outpost
-                // footprint now, so asking for a homestead IS asking for that size.
-                const plan = role === 'outpost' ? toasterOutpostDimensions() : toasterHomesteadDimensions();
+                // ...BUT THERE IS MORE THAN ONE HOMESTEAD FOOTPRINT AGAIN, so the
+                // PLAN VERSION HAS TO REACH THE WIRE.
+                //
+                // resolving every homestead to the LATEST floorplan was right while
+                // there was only one. now a legacy v1 house asking for its own
+                // 14x9x8 came back as the layered 13x21x11 at the same anchor - the
+                // relay silently re-pointing a build at a bigger plan centred on the
+                // house she already lives in. that is the exact outcome planVersion
+                // exists to prevent, and the warning below would have narrated it
+                // going wrong ("...the floorplan is 13x21x11 - building that").
+                //
+                // the resolve-don't-validate rule above still holds: the version
+                // picks WHICH floorplan, and that floorplan still owns the size. an
+                // absent version means latest, so an older burnt-side that sends no
+                // version keeps working.
+                const planVersion = Number.isFinite(Number(p.planVersion)) ? Number(p.planVersion) : undefined;
+                const plan = role === 'outpost'
+                    ? toasterOutpostDimensions()
+                    : toasterHomesteadDimensions(planVersion);
                 const dims = [plan.width, plan.depth, plan.height];
                 const asked = ['width', 'depth', 'height'].map((key) => Number(p[key]));
                 if (asked.every(Number.isFinite) && asked.join('x') !== dims.join('x')) {
                     this.log('warn', `build_settlement asked for a ${asked.join('x')} ${role}; `
                         + `the floorplan is ${dims.join('x')} - building that`);
                 }
-                return { command: `toaster_build ${role} ${at.x} ${at.y} ${at.z} ${dims.join(' ')}` };
+                // THE MOAT, AS AN 8TH ARG THAT IS ALWAYS SENT.
+                //
+                // ⚠ NEVER OMITTED, not even when off. The java Settlement rebuilds
+                // `trenchEnabled` off the wire on every build, and an absent arg is
+                // the OLD behaviour rather than "leave it as it was" - so the once
+                // burnt-side forgets to say yes is the build that fills the ditch
+                // back in. An explicit 0 says "no moat" in the same breath as a 1
+                // says "dig one", and there is no third answer to guess at.
+                const trench = p.trench === true || p.trench === 1 ? 1 : 0;
+                return { command: `toaster_build ${role} ${at.x} ${at.y} ${at.z} ${dims.join(' ')} ${trench}` };
+            }
+
+            // "this building is mine, never mine through it". node re-states its
+            // whole settlement list every time she joins a world, because the game
+            // only learns a house exists while it is being BUILT - and a finished
+            // house is never built again. see minecraft_tool _rearmStructureProtection.
+            case 'protect_settlement': {
+                const role = String(p.role || 'homestead').toLowerCase() === 'outpost' ? 'outpost' : 'homestead';
+                const at = this._worldPoint(p, 'settlement anchor');
+                if (!at) return null;
+                // the footprint is the floorplan's, exactly as build_settlement
+                // resolves it - a protected box that disagreed with the built one
+                // would guard the wrong blocks.
+                const plan = role === 'outpost' ? toasterOutpostDimensions() : toasterHomesteadDimensions();
+                // not detached: the companion intercepts this verb and sends its
+                // own ack + finished, exactly like `hud`.
+                return {
+                    command: `protect_settlement ${role} ${at.x} ${at.y} ${at.z} `
+                        + `${plan.width} ${plan.depth} ${plan.height}`
+                };
             }
 
             case 'install_appliance': {
@@ -678,6 +802,85 @@ class MinecraftBotBridge extends EventEmitter {
                 }
                 const at = this._worldPoint(p, 'appliance position');
                 return { command: `place_at ${at.x} ${at.y} ${at.z} ${kind}` };
+            }
+
+            // BUILD ONE OF THE PROCEDURAL BLUEPRINTS.
+            //
+            // No footprint is sent, unlike build_settlement. The plan owns its own
+            // size, and a caller that can name a size is a caller that can disagree
+            // with the plan - which is how a fixture map ends up addressing blocks
+            // outside the house.
+            case 'build_plan': {
+                const id = String(p.blueprint || p.target || '').trim().toLowerCase().replace(/[ -]+/g, '_');
+                if (!/^[a-z0-9_]{1,40}$/.test(id)) throw new Error('build_plan needs a blueprint id');
+                const at = this._worldPoint(p, 'build_plan position');
+                return { command: `build_plan ${id} ${at.x} ${at.y} ${at.z}` };
+            }
+
+            // MAKE A WHEAT FIELD, or grow one that is already there.
+            //
+            // altoclef reads the coordinates as a SET - it falls back to where she
+            // stands unless all three arrive - so this either sends x y z radius or
+            // sends neither. Half a position would silently become "here".
+            case 'farm': {
+                const mode = String(p.mode || p.target || 'create').trim().toLowerCase();
+                if (mode !== 'create' && mode !== 'expand') {
+                    throw new Error('farm needs create or expand');
+                }
+                const radius = this._amount(p.radius, 4);
+                if (this._isPoint(p)) {
+                    const at = this._worldPoint(p, 'farm position');
+                    return { command: `farm ${mode} ${at.x} ${at.y} ${at.z} ${radius}` };
+                }
+                return { command: `farm ${mode}` };
+            }
+
+            // A BLOCK AT A COORDINATE, deliberately NOT install_appliance.
+            //
+            // Lighting a quarry shaft and lighting a yard both need an exact
+            // position, and `place` (PlaceBlockNearbyTask) has none. The obvious
+            // move is to widen install_appliance's kind list to accept a torch -
+            // but an appliance is a PLANNED FIXTURE that gets written to the
+            // settlement's appliance ledger and counted against
+            // `appliancesRequired`. Filing 40 quarry torches as appliances would
+            // make the gallery permanently unfinished, and the survey would go on
+            // demanding a furnace in a hole in the ground.
+            case 'place_block': {
+                const block = item(p.block || p.target);
+                // oak_fence/oak_fence_gate are the trench's causeway furniture, not
+                // building material: the gate stands on the outer lip of the one
+                // crossing so nothing can step onto the bridge, and the fence is
+                // what closes off the lip either side of it. Same rule as the
+                // torches - a fitting at an exact coordinate that must never be
+                // filed as an appliance.
+                // THE TRIMMINGS are the third category and they keep the rule
+                // rather than bending it: an ornament in the yard is a fitting at
+                // an exact coordinate that must never be filed as an appliance,
+                // which is precisely what the torches and the causeway gate are.
+                // They are still not building material and still never touch the
+                // schematic.
+                //
+                // ⚠ EVERY ORNAMENT is also in `ExternalControlServer.isPlacedByPeople`,
+                // which is what the yard clear's "may never clear" predicate reads.
+                // One that is NOT on that list is an ornament the yard clear is
+                // entitled to smash and the wishlist will put straight back - a
+                // loop, not a decoration. That property is asserted over
+                // COMFORT_KINDS in tmp/mc_armory_test.mjs.
+                //
+                // ⚠ it is NOT true of the lighting/shoring half and never was:
+                // `soul_torch`, `cobblestone` and `dirt` are absent from that java
+                // predicate, so shoring she leaves inside her own yard IS fair game
+                // for the yard clear. That is pre-existing and only costs a re-dig;
+                // it is written down here so the next person does not read the
+                // ornament rule as covering the whole list.
+                if (![...COMFORT_KINDS,
+                    'torch', 'wall_torch', 'soul_torch', 'lantern',
+                    'ladder', 'cobblestone', 'dirt', 'oak_planks',
+                    'oak_fence', 'oak_fence_gate'].includes(block)) {
+                    throw new Error(`place_block does not carry "${block}" - it is for lighting, shoring and trimmings, not building`);
+                }
+                const at = this._worldPoint(p, 'place_block position');
+                return { command: `place_at ${at.x} ${at.y} ${at.z} ${block}` };
             }
 
             case 'inventory': return { command: `inventory${p.item || p.target ? ' ' + item(p.item || p.target) : ''}` };
@@ -746,16 +949,32 @@ class MinecraftBotBridge extends EventEmitter {
         return dimension;
     }
 
-    _itemList(items) {
+    // `raw` skips the ore->product alias map in _itemName.
+    //
+    // ⚠ THE ALIASES ARE FOR ASKING, NOT FOR NAMING WHAT SHE HOLDS. the map turns
+    // "get me iron" into `iron_ingot` because that is what a person means by a
+    // request - correct for get/craft. a DEPOSIT list is the opposite direction:
+    // it describes the stack already in her bag, so aliasing it tells altoclef to
+    // bank `iron_ingot` when she is carrying `raw_iron`, an item she does not
+    // have. the ore then never leaves the bag and the bag stays full forever.
+    _itemList(items, { raw = false } = {}) {
         if (!Array.isArray(items) || !items.length) return '';
         const parts = items
             .filter((entry) => entry && typeof entry.item === 'string' && entry.item.trim())
             .slice(0, 16)
             .map((entry) => {
                 const count = Number.isInteger(entry.count) && entry.count > 0 ? ` ${entry.count}` : '';
-                return `${this._itemName(entry.item)}${count}`;
+                return `${raw ? this._rawItemName(entry.item) : this._itemName(entry.item)}${count}`;
             });
         return parts.length ? `[${parts.join(', ')}]` : '';
+    }
+
+    // same validation as _itemName, none of the renaming.
+    _rawItemName(name) {
+        if (!name) return '';
+        const n = String(name).toLowerCase().replace(/^minecraft:/, '').trim();
+        if (!/^[a-z0-9_:-]{1,80}$/.test(n)) throw new Error('item names must use a Minecraft item identifier');
+        return n;
     }
 
     _isPoint(point) {

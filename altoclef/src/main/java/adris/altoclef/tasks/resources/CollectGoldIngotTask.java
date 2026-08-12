@@ -40,8 +40,11 @@ public class CollectGoldIngotTask extends ResourceTask {
     protected Task onResourceTick(AltoClef mod) {
         if (WorldHelper.getCurrentDimension() == Dimension.OVERWORLD) {
             if (mod.getModSettings().shouldUseBlastFurnace()) {
+                // reachable, not merely seen - see CollectIronIngotTask for why
+                // "a blast furnace exists somewhere" is the wrong question.
                 if (mod.getItemStorage().hasItem(Items.BLAST_FURNACE) ||
-                        mod.getBlockTracker().anyFound(Blocks.BLAST_FURNACE) ||
+                        mod.getBlockTracker().getNearestTracking(mod.getPlayer().position(),
+                                blockPos -> WorldHelper.canReach(mod, blockPos), Blocks.BLAST_FURNACE).isPresent() ||
                         mod.getEntityTracker().itemDropped(Items.BLAST_FURNACE)) {
                     return new SmeltInBlastFurnaceTask(new SmeltTarget(new ItemTarget(Items.GOLD_INGOT, _count), new ItemTarget(Items.RAW_GOLD, _count)));
                 }

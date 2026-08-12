@@ -176,7 +176,6 @@ public class MovementDiagonal extends Movement {
             if (ascend) {
                 return;
             }
-            // BURNT: a dry path may only enter water across a narrow crossing.
             if (!context.canCrossSmallWater(x, y, z, destX, destZ)) {
                 return;
             }

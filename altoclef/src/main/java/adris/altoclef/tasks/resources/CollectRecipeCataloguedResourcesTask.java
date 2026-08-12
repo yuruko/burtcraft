@@ -46,7 +46,9 @@ public class CollectRecipeCataloguedResourcesTask extends Task {
             // null = empty which is always met.
             if (target == null) continue;
 
-            int weNeed = target.getTargetCount() - mod.getItemStorage().getItemCount(target.getOutputItem());
+            // craftable, NOT getItemCount: an open furnace's fuel/input slots are the
+            // BLOCK's, not ours, and counting them flips this decision every tick.
+            int weNeed = target.getTargetCount() - mod.getItemStorage().getItemCountCraftable(target.getOutputItem());
 
             if (weNeed > 0) {
                 CraftingRecipe recipe = target.getRecipe();
@@ -83,7 +85,7 @@ public class CollectRecipeCataloguedResourcesTask extends Task {
             int count = catalogueCount.get(catalogueMaterialName);
             if (count > 0) {
                 ItemTarget itemTarget = new ItemTarget(catalogueMaterialName, count);
-                if (!StorageHelper.itemTargetsMet(mod, itemTarget)) {
+                if (mod.getItemStorage().getItemCountCraftable(itemTarget.getMatches()) < count) {
                     setDebugState("Getting " + itemTarget);
                     return TaskCatalogue.getItemTask(catalogueMaterialName, count);
                 }
@@ -92,7 +94,7 @@ public class CollectRecipeCataloguedResourcesTask extends Task {
         for (Item item : itemCount.keySet()) {
             int count = itemCount.get(item);
             if (count > 0) {
-                if (mod.getItemStorage().getItemCount(item) < count) {
+                if (mod.getItemStorage().getItemCountCraftable(item) < count) {
                     setDebugState("Getting " + item.getDescriptionId());
                     return TaskCatalogue.getItemTask(item, count);
                 }

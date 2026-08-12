@@ -51,18 +51,51 @@ public class ItemStorageTracker extends Tracker {
     }
 
     /**
-     * Gets the number of items in the player's inventory OR if the player is USING IT in a conversion process
-     * (ex. crafting table slots/furnace input, stuff the player is use )
+     * The slots a craft in progress stages its OWN materials into: our 2x2 grid, or
+     * an open crafting table.
+     * <p>
+     * Unlike {@link #getCurrentConversionSlots()} this excludes the furnace family's
+     * fuel/input slots, which belong to the BLOCK rather than to us.
      */
-    public int getItemCount(Item... items) {
-        int inConversionSlots = Arrays.stream(getCurrentConversionSlots()).mapToInt(slot -> {
+    private static Slot[] getCraftingStagingSlots() {
+        if (StorageHelper.isPlayerInventoryOpen()) {
+            return PlayerSlot.CRAFT_INPUT_SLOTS;
+        } else if (StorageHelper.isBigCraftingOpen()) {
+            return CraftingTableSlot.INPUT_SLOTS;
+        }
+        return new Slot[0];
+    }
+
+    private static int countInSlots(Slot[] slots, Item... items) {
+        return Arrays.stream(slots).mapToInt(slot -> {
             ItemStack stack = StorageHelper.getItemStackInSlot(slot);
             if (ArrayUtils.contains(items, stack.getItem())) {
                 return stack.getCount();
             }
             return 0;
         }).reduce(0, Integer::sum);
-        return _inventory.getItemCount(true, false, items) + inConversionSlots;
+    }
+
+    /**
+     * Gets the number of items in the player's inventory OR if the player is USING IT in a conversion process
+     * (ex. crafting table slots/furnace input, stuff the player is use )
+     */
+    public int getItemCount(Item... items) {
+        return _inventory.getItemCount(true, false, items) + countInSlots(getCurrentConversionSlots(), items);
+    }
+
+    /**
+     * Items we can actually feed into a craft: the player inventory, plus whatever we
+     * have already staged in our own crafting grid.
+     * <p>
+     * Use this instead of {@link #getItemCount} when deciding whether an ingredient
+     * still needs collecting. getItemCount also counts an open FURNACE's fuel and
+     * input slots, so a recipe collector believes it is holding coal the instant a
+     * furnace screen happens to be open - and since opening that screen is HOW it
+     * collects the coal, the two beliefs chase each other, one full flip per tick.
+     */
+    public int getItemCountCraftable(Item... items) {
+        return _inventory.getItemCount(true, false, items) + countInSlots(getCraftingStagingSlots(), items);
     }
 
     public int getItemCount(ItemTarget... targets) {

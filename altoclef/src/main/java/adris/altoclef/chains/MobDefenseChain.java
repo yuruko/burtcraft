@@ -85,16 +85,36 @@ public class MobDefenseChain extends SingleTaskChain {
     private static final double DISENGAGE_KEEP_DISTANCE = 16;
     /**
      * How many separate escapes inside FLEE_CHURN_WINDOW_MS mean running is not
-     * working. See fightBecauseFleeingIsNotWorking. Four is enough to be sure it
-     * is a treadmill and not just a bad night, and short enough that nobody
-     * watching has to sit through more than about a minute of it.
+     * working. See fightBecauseFleeingIsNotWorking. TWO, not the original four: a
+     * second escape from the same thing already IS the treadmill, and four of them
+     * cost about forty seconds of on-stream running before she was allowed to swing
+     * at one pillager (2026-08-06). A flee that works is still only ever one flee -
+     * the count reaches two precisely when the first one did not work.
      */
-    private static final int FLEE_CHURN_LIMIT = 4;
+    private static final int FLEE_CHURN_LIMIT = 2;
     private static final long FLEE_CHURN_WINDOW_MS = 90_000L;
     /** Below this, running is the right answer however badly it is going. */
     private static final float FLEE_CHURN_MIN_HEALTH = 7;
     /** A crowd is a real reason to run; this only overrules running from a few. */
     private static final int FLEE_CHURN_MAX_MOBS = 2;
+    /**
+     * How long a committed kill may hold the chain before we admit it is not
+     * happening and give her real work the tick back. Generous - crossing
+     * COMBAT_RISK_DISTANCE and killing an ordinary mob is a handful of seconds, so
+     * anything approaching this is a fight that has gone wrong - but bounded,
+     * because a mob she can never reach must not own the chain all night.
+     */
+    private static final double FIGHT_HOLD_SECONDS = 30;
+    /**
+     * How far the committed target may drift before the fight is declared over.
+     *
+     * MUST EXCEED THE RANGE THE FIGHT WAS PICKED AT (DISENGAGE_KEEP_DISTANCE). It
+     * used to be COMBAT_RISK_DISTANCE, which is the same 16 - so a skeleton chosen
+     * at 15.9 blocks failed the hold the instant it drifted to 16.1, and the whole
+     * commitment lasted one tick. A latch whose release threshold equals its
+     * trigger threshold is not a latch; it is a coin flip on sensor noise.
+     */
+    private static final double FIGHT_HOLD_DISTANCE = 24;
     // below this, running really is the right call even from one zombie
     private static final float STAND_AND_FIGHT_MIN_HEALTH = 8;
     // how long a chosen defensive answer is held before a sibling answer may replace
@@ -138,6 +158,34 @@ public class MobDefenseChain extends SingleTaskChain {
     private CustomBaritoneGoalTask _runAwayTask;
     /** Start times of recent escapes, pruned to FLEE_CHURN_WINDOW_MS. */
     private final java.util.ArrayDeque<Long> _fleeEpisodes = new java.util.ArrayDeque<>();
+    /**
+     * The mob she actually said she would kill - the ENTITY, not just its class, so
+     * the commitment can be checked against something that can die and walk away.
+     * See fightStillStands.
+     */
+    private Entity _fightTargetEntity;
+    private final TimerGame _fightHold = new TimerGame(FIGHT_HOLD_SECONDS);
+    /** True while the anti-treadmill override is deliberately standing its ground. */
+    private boolean _fightingItOut = false;
+    /**
+     * THE LEDGER MUST NOT COUNT THE REBOUNDS THE LEDGER CAUSED.
+     *
+     * installKill() puts a KillEntitiesTask in the chain slot. beginOrAdoptFlee()
+     * decides "is this a new escape?" by looking at what is IN that slot - so the
+     * very next flee, which exists only because the override's own kill task was
+     * torn down, failed the adopt test and was recorded as fresh evidence that
+     * running is not working. Each fight/flee round trip therefore added one
+     * episode, escapes could never fall back under FLEE_CHURN_LIMIT, and the
+     * override re-fired forever. Observed live on 2026-08-08 as
+     * "running from Skeleton isn't working (N escapes)" with N climbing 2 -> 14
+     * monotonically in about five seconds, at roughly 2Hz.
+     *
+     * So once the override has fired, subsequent escapes from the same episode-set
+     * are REBOUNDS, not independent evidence, and are not counted. This latch
+     * outlives _fightingItOut deliberately: _fightingItOut drops on the flicker
+     * that starts the rebound, which is precisely when the miscount happened.
+     */
+    private boolean _overrideEngaged = false;
 
     private float _cachedLastPriority;
 
@@ -296,7 +344,12 @@ public class MobDefenseChain extends SingleTaskChain {
         setTask(_runAwayTask);
         // only a genuinely NEW escape is an episode - an adopted one is the same
         // run continuing, and counting it would trip the churn rule on one flee.
-        noteFleeEpisode();
+        //
+        // and a REBOUND is not new either. once the override has taken the fight,
+        // the flee that follows it exists because the override's kill task was
+        // displaced from this slot, not because running failed again. counting it
+        // is what let the ledger feed itself. see _overrideEngaged.
+        if (!_overrideEngaged) noteFleeEpisode();
     }
 
     /** Remember that she started running, so it can be judged on whether it worked. */
@@ -337,6 +390,35 @@ public class MobDefenseChain extends SingleTaskChain {
      * creeper, a warden-class mob, a crowd, or being nearly dead.
      */
     private Task fightBecauseFleeingIsNotWorking(AltoClef mod) {
+        // THE DECISION HAS TO OUTLIVE THE TICK THAT MADE IT.
+        //
+        // the first version cleared _fleeEpisodes right here, and that destroyed the
+        // only evidence the override rests on: one tick later recentFleeCount() was 0,
+        // this method declined, and the `overmatched` arm below forceMode(FLEE)'d the
+        // kill task straight back off her. on 2026-08-06 that read, in the log, as
+        // "killing it instead" and a fresh nigerundayoo IN THE SAME SECOND - three
+        // times, against one pillager, which lived through all of it. so the ledger
+        // stays put and the decision gets a latch of its own.
+        if (_fightingItOut) {
+            // the crowd test gets the same hysteresis the distance test does: entry
+            // refuses at > FLEE_CHURN_MAX_MOBS, so survival must tolerate one more or
+            // a mob drifting in and out of combatThreats() drops the commitment on
+            // exactly the boundary that granted it.
+            if (mod.getPlayer().getHealth() > FLEE_CHURN_MIN_HEALTH
+                    && combatThreats(mod, _fightTargetEntity).size() <= FLEE_CHURN_MAX_MOBS + 1
+                    && fightStillStands(mod)) {
+                Task running = getCurrentTask();
+                if (running != null && !running.stopped()) return running;
+                return installKill(mod, _fightTargetEntity);
+            }
+            _fightingItOut = false;
+            // it died, or it left. running is no longer failing, so a ledger of failed
+            // escapes no longer describes anything - and THIS is the safe place to drop
+            // it, because nothing is about to re-read it to justify a fight.
+            if (_fightTargetEntity == null || !_fightTargetEntity.isAlive()) {
+                clearFleeLedger();
+            }
+        }
         int escapes = recentFleeCount();
         if (escapes < FLEE_CHURN_LIMIT) return null;
         // at death's door running really is right, however badly it is going.
@@ -349,20 +431,98 @@ public class MobDefenseChain extends SingleTaskChain {
         if (combatThreats(mod, threat).size() > FLEE_CHURN_MAX_MOBS) return null;
         Debug.logMessage("running from " + threat.getClass().getSimpleName()
             + " isn't working (" + escapes + " escapes); killing it instead");
+        _fightingItOut = true;
+        _overrideEngaged = true;
+        return installKill(mod, threat);
+    }
+
+    /**
+     * Drop the escape ledger AND the rebound latch together.
+     *
+     * They describe one situation - "running from this thing is not working" - so
+     * one may never outlive the other. Keeping the ledger while clearing the latch
+     * re-arms the override on stale evidence; clearing the ledger while keeping the
+     * latch makes the next genuine treadmill invisible.
+     */
+    private void clearFleeLedger() {
         _fleeEpisodes.clear();
-        forceMode(DefenseMode.FIGHT);
+        _overrideEngaged = false;
+    }
+
+    /**
+     * SHE SAID SHE WOULD KILL THIS THING, SO SHE IS STILL IN A FIGHT.
+     * <p>
+     * The engagement latch holds the chain for a threat within SAFE_KEEP_DISTANCE (8),
+     * and that range was chosen so a zombie loitering sixteen blocks away could not
+     * pin her all night. But the branch that DECIDES to fight uses a 15-block range
+     * for ranged mobs - a skeleton, pillager, witch or piglin - so she would commit
+     * to killing something at 15, and then on the very next tick fail the latch's
+     * 8-block test the instant EntityTracker's aggression flag or line-of-sight
+     * raycast blinked. The chain then dropped to 0, UserTaskChain (50) took the tick
+     * back, and she turned around and walked two hundred blocks toward a furnace with
+     * a crossbow pointed at her.
+     * <p>
+     * Live on 2026-08-06 that was thirty-six aborted kills on ONE pillager in two
+     * minutes, at about 1Hz, each one a full task-tree teardown and a fresh baritone
+     * path. Every ranged mob in the game was unkillable by construction: the range at
+     * which she picks a fight was longer than the range at which she is allowed to
+     * still be in one.
+     * <p>
+     * So a fight is a COMMITMENT, like fleeing already was. It holds until the target
+     * is dead, has left COMBAT_RISK_DISTANCE, or FIGHT_HOLD_SECONDS says it is plainly
+     * not happening - and not one tick less.
+     */
+    private boolean fightStillStands(AltoClef mod) {
+        if (_defenseMode != DefenseMode.FIGHT) return false;
+        if (_fightTargetEntity == null || !_fightTargetEntity.isAlive()) return false;
+        if (_fightHold.elapsed()) return false;
+        double distanceSq = _fightTargetEntity.distanceToSqr(mod.getPlayer());
+        return distanceSq <= FIGHT_HOLD_DISTANCE * FIGHT_HOLD_DISTANCE;
+    }
+
+    /**
+     * Point every piece of fight state at ONE mob and hand back the task that kills
+     * it. Does not install the task: callers differ on whether they already own the
+     * slot, and defaultAnswer's caller installs it itself.
+     */
+    private Task commitToKilling(AltoClef mod, Entity target) {
+        if (target == null) return null;
+        forceMode(DefenseMode.FIGHT);   // clears the old target, so remember AFTER it
         _runAwayTask = null;
-        _committedFightTarget = threat.getClass();
+        rememberFightTarget(target);
+        return new KillEntitiesTask(target.getClass());
+    }
+
+    /** commitToKilling, for the callers that do own the slot. */
+    private Task installKill(AltoClef mod, Entity target) {
+        Task kill = commitToKilling(mod, target);
+        if (kill == null) return null;
+        // clear FIRST - setTask() is a no-op whenever the replacement .equals() the
+        // incumbent, which is how a finished task keeps the seat elsewhere in this file.
         setTask(null);
-        Task kill = new KillEntitiesTask(threat.getClass());
         setTask(kill);
         return kill;
+    }
+
+    /**
+     * Only a genuinely NEW target restarts the deadline. Re-confirming the same mob
+     * every tick - which pickFightTarget does by design - must not extend the hold
+     * forever, or FIGHT_HOLD_SECONDS bounds nothing at all.
+     */
+    private void rememberFightTarget(Entity target) {
+        if (target == null) return;
+        if (_fightTargetEntity != target) {
+            _fightTargetEntity = target;
+            _fightHold.reset();
+        }
+        _committedFightTarget = target.getClass();
     }
 
     private void forceMode(DefenseMode mode) {
         if (_defenseMode != mode) {
             _defenseMode = mode;
             _committedFightTarget = null;
+            _fightTargetEntity = null;
         }
         _defenseCommitment.reset();
     }
@@ -370,6 +530,13 @@ public class MobDefenseChain extends SingleTaskChain {
     private void releaseDefenseMode() {
         _defenseMode = DefenseMode.NONE;
         _committedFightTarget = null;
+        _fightTargetEntity = null;
+        _fightingItOut = false;
+        // the ledger is evidence about a fight that no longer has a target. leaving it
+        // behind while dropping the latch is what let the override re-fire on stale
+        // counts the instant this ran (it is reachable from the eat branch, the MLG
+        // branch and the priority-0 fallthrough - i.e. constantly).
+        clearFleeLedger();
     }
 
     /**
@@ -384,7 +551,10 @@ public class MobDefenseChain extends SingleTaskChain {
     private Class<?> pickFightTarget(AltoClef mod, List<Entity> toDealWith) {
         if (_committedFightTarget != null) {
             for (Entity e : toDealWith) {
-                if (e.getClass() == _committedFightTarget && e.isAlive()) return _committedFightTarget;
+                if (e.getClass() == _committedFightTarget && e.isAlive()) {
+                    rememberFightTarget(e);
+                    return _committedFightTarget;
+                }
             }
         }
         Entity closest = null;
@@ -396,7 +566,7 @@ public class MobDefenseChain extends SingleTaskChain {
                 closest = e;
             }
         }
-        _committedFightTarget = (closest != null ? closest : toDealWith.get(0)).getClass();
+        rememberFightTarget(closest != null ? closest : toDealWith.get(0));
         return _committedFightTarget;
     }
 
@@ -783,7 +953,14 @@ public class MobDefenseChain extends SingleTaskChain {
                     }
                     return 65;
                 } else {
-                    // We can't deal with it
+                    // We can't deal with it...
+                    // ...unless the override has already judged running a failure. it
+                    // has to sit above THIS branch too: canSafelyFight is exactly the
+                    // opinion that started the treadmill, and an override only one
+                    // caller respects is not an override (this file's own words, two
+                    // hundred lines up). without this, commitTo() let the fight stand
+                    // for DEFENSE_COMMIT_SECONDS and then handed it back to the flee.
+                    if (_fightingItOut && fightStillStands(mod)) return 75;
                     if (commitTo(mod, DefenseMode.FLEE)) {
                         beginOrAdoptFlee(mod);
                     }
@@ -838,9 +1015,14 @@ public class MobDefenseChain extends SingleTaskChain {
         // dark - she would never mine, travel or build again. only a fight she is actually
         // in, or a mob genuinely on top of her, gets to own the slot. the wider range is
         // still honoured while fleeing, where letting go early strands her mid-escape.
+        // the fourth term is the ranged-mob hole: the branch above picks fights with
+        // skeletons, pillagers, witches and piglins from FIFTEEN blocks, which is
+        // outside every range this latch was holding. see fightStillStands - without
+        // it she commits to a kill and abandons it on the next tick, forever.
         boolean stillInIt = tookDamageRecently()
                 || nearestThreat(mod, SAFE_KEEP_DISTANCE) != null
-                || (_defenseMode == DefenseMode.FLEE && nearestThreat(mod, DISENGAGE_KEEP_DISTANCE) != null);
+                || (_defenseMode == DefenseMode.FLEE && nearestThreat(mod, DISENGAGE_KEEP_DISTANCE) != null)
+                || fightStillStands(mod);
         if (_engaged && stillInIt) {
             // an answer is mid-flight - let it finish, do not re-decide.
             if (!currentTaskDone(mod)) return ENGAGED_PRIORITY;
@@ -1121,10 +1303,7 @@ public class MobDefenseChain extends SingleTaskChain {
                 && canSafelyFight(mod, combatThreats(mod, inReach))
                 && !(inReach instanceof Creeper)
                 && !isScaryToPickAFightWith(inReach)) {
-            forceMode(DefenseMode.FIGHT);
-            _runAwayTask = null;
-            _committedFightTarget = inReach.getClass();
-            return new KillEntitiesTask(inReach.getClass());
+            return commitToKilling(mod, inReach);
         }
         // NEVER install an escape from nothing.
         //

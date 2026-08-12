@@ -4,7 +4,9 @@ import net.minecraft.client.tutorial.TutorialSteps;
 import adris.altoclef.AltoClef;
 import adris.altoclef.commandsystem.CommandExecutor;
 import adris.altoclef.eventbus.EventBus;
+import adris.altoclef.eventbus.events.BlockBrokenEvent;
 import adris.altoclef.eventbus.events.ChatMessageEvent;
+import adris.altoclef.eventbus.events.PlayerCollidedWithEntityEvent;
 import adris.altoclef.eventbus.events.TaskFinishedEvent;
 import adris.altoclef.tasks.misc.EatNowTask;
 import adris.altoclef.tasks.construction.ToasterBuildTask;
@@ -31,6 +33,7 @@ import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.CarpetBlock;
+import net.minecraft.world.level.block.CropBlock;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.FenceBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
@@ -148,6 +151,14 @@ public class ExternalControlServer implements ClientModInitializer {
     // which silently hid the tail of a loaded inventory from burnt entirely.
     private static final int INV_MAX_TYPES = 36;
 
+    // upper bounds on the container readout (see the `containers` block in
+    // pollState). the cache is unbounded and the poll runs every ~2s, so both
+    // caps exist to keep the packet small rather than to hide anything -
+    // nearest containers and biggest stacks first, which is the order a
+    // "what have i got stored" question is actually asking about.
+    private static final int CONTAINERS_MAX = 24;
+    private static final int CONTAINER_ITEMS_MAX = 24;
+
     private final Gson gson = new Gson();
     private final Object writeLock = new Object();
 
@@ -190,6 +201,15 @@ public class ExternalControlServer implements ClientModInitializer {
     private volatile int lastHunger = -1;
     private volatile boolean wasDead = false;
     private volatile boolean lastWasNight = false;
+    // the entity id of the last kill already reported, so one dying mob is one event
+    // rather than one per 2-second poll for as long as the corpse is around
+    private volatile int lastReportedKillId = Integer.MIN_VALUE;
+    // block/pickup events are per-swing and per-item, so they are throttled to a
+    // trickle: host-side they only move counters and the rolling `recently:` line,
+    // and a mining trip must not drown the eight slots that hold real memories.
+    private volatile long lastBlockEventAt = 0L;
+    private volatile long lastPickupEventAt = 0L;
+    private volatile long lastAchievementAt = 0L;
     private volatile long lastLowHungerEventAt = 0L;
     private volatile long lastCreeperEventAt = 0L;
     private volatile long lastHostileEventAt = 0L;
@@ -201,6 +221,22 @@ public class ExternalControlServer implements ClientModInitializer {
     private volatile String lastWeather = "";
     private volatile int lastNearbyHostiles = 0;
     private volatile int lastDiamondCount = -1;
+    /**
+     * WHO IS ON THE SERVER, not who is standing next to her.
+     *
+     * Server chat is global, so everyone logged in can read what she says - but
+     * the only roster the companion published was a 32-block entity sweep. Out at
+     * a homestead 3000 blocks from spawn that reads zero, and host-side that
+     * meant "nobody is listening" for a room that was actually full.
+     *
+     * Diffing it is also the honest way to hear a join: the join LINE is a system
+     * message shaped exactly like plugin chat, so it used to arrive as somebody
+     * saying the words "joined the game" and she answered it as a sentence
+     * ("left the game. dramatic exit for someone who wasn't even holding a
+     * torch", live). The tab list needs no format guessing and works on a server
+     * whose join message is in another language.
+     */
+    private volatile java.util.Set<String> lastOnlineNames = null;
 
     @Override
     public void onInitializeClient() {
@@ -208,6 +244,17 @@ public class ExternalControlServer implements ClientModInitializer {
         try {
             EventBus.subscribe(TaskFinishedEvent.class, this::onTaskFinished);
             EventBus.subscribe(ChatMessageEvent.class, this::onChatMessage);
+            // ⚠ THREE MORE EVENTS BURNT-SIDE ALREADY HANDLED AND NOTHING EMITTED.
+            // `block_broken`, `item_collected` and `entity_killed` each have a handler,
+            // a stats counter and a `recently:` label in minecraft_tool.js, and were
+            // dead code end to end - so "how much have you mined today" and "what did
+            // you just pick up" had no answer, and combat was silent.
+            //
+            // These two only move counters and the rolling recent line (no written cue,
+            // deliberately - a line per block would be unbearable), so they are
+            // throttled hard at the source rather than shipped per swing.
+            EventBus.subscribe(BlockBrokenEvent.class, this::onBlockBroken);
+            EventBus.subscribe(PlayerCollidedWithEntityEvent.class, this::onCollidedWithEntity);
         } catch (Throwable t) {
             log("event subscribe failed: " + t);
         }
@@ -233,6 +280,13 @@ public class ExternalControlServer implements ClientModInitializer {
                     keepAwakeTick(mc);
                     tutorialGuardTick(mc);
                     autoThirdPersonTick(mc);
+                    // AFTER the camera tick: a running flex owns the view, and
+                    // autoThirdPersonTick respects the lease it borrowed.
+                    ticTick(mc);
+                    // ...and after the tic, because a flex is a whole-body gesture
+                    // that owns the rotation for its duration. holding somebody's
+                    // eye is the smaller move and yields to it.
+                    gazeTick(mc);
                     // end an expired container showcase even if the task that opened it
                     // never calls closeScreen() again - an open screen blocks movement,
                     // so the linger must always have a floor under it.
@@ -272,6 +326,29 @@ public class ExternalControlServer implements ClientModInitializer {
                         JsonObject d = new JsonObject();
                         d.addProperty("text", text.length() > 160 ? text.substring(0, 160) : text);
                         sendEvent("protection_denied", d);
+                        return;
+                    }
+                    // ⚠ ADVANCEMENTS ARRIVE AS A SYSTEM MESSAGE, which is the one hook
+                    // that needs no new mixin. `achievement` has a written cue, a
+                    // `recently:` label, an affect delta and a RAG milestone write
+                    // host-side, and nothing ever emitted it - so every toast on
+                    // screen was invisible to her. Matching the rendered sentence
+                    // works in singleplayer and on vanilla-ish servers alike.
+                    java.util.regex.Matcher adv = ADVANCEMENT_NOTICE.matcher(text);
+                    if (adv.find()) {
+                        String who = adv.group(1);
+                        String name = adv.group(2);
+                        String me = mcPlayerName();
+                        // somebody ELSE's advancement is not hers to celebrate
+                        if (me == null || who == null || who.equalsIgnoreCase(me)) {
+                            long nowAdv = System.currentTimeMillis();
+                            if (nowAdv - lastAchievementAt > 3000L) {
+                                lastAchievementAt = nowAdv;
+                                JsonObject d = new JsonObject();
+                                d.addProperty("name", name);
+                                sendEvent("achievement", d);
+                            }
+                        }
                         return;
                     }
                     // plugin-formatted chat rides the system channel on most
@@ -386,21 +463,28 @@ public class ExternalControlServer implements ClientModInitializer {
         // the operator plays is worse than one asleep.
         adris.altoclef.tasksystem.TaskRunner.setReflexesAllowed(!manualControl);
         if (manualControl) {
-            // stop whatever the bot is doing and let go of every forced key
+            // stop whatever the bot is doing and let go of every forced key.
+            //
+            // ⚠ NAME THE REASON FIRST. The running task's finish callback fires inside
+            // this stop, and without a reason it reports plain success - so pressing F1
+            // in the middle of "get diamond 3" made her announce that she got the
+            // diamonds. See UserTaskChain.cancelWith / sendTaskOutcome.
             try {
                 CommandExecutor exec = AltoClef.getCommandExecutor();
-                if (exec != null) exec.executeWithPrefix("stop", () -> { }, ex -> { });
+                AltoClef mod = exec != null ? exec.getMod() : null;
+                if (mod != null) mod.getUserTaskChain().cancelWith(mod, "the operator took the keyboard (f1)");
+                else if (exec != null) exec.executeWithPrefix("stop", () -> { }, ex -> { });
             } catch (Throwable ignored) { }
             releaseAllInputs(mc);
             if (p != null) {
                 p.sendOverlayMessage(net.minecraft.network.chat.Component.literal(
-                    "keyboard/mouse: YOURS - f1 hands it back to burnt"));
+                    "keyboard/mouse: YOURS - f1 hands it back to the bot"));
             }
             log("manual control ON (f1) - external commands blocked");
         } else {
             if (p != null) {
                 p.sendOverlayMessage(net.minecraft.network.chat.Component.literal(
-                    "controls handed back to burnt"));
+                    "controls handed back to the bot"));
             }
             log("manual control OFF (f1) - bot may act again");
         }
@@ -456,7 +540,12 @@ public class ExternalControlServer implements ClientModInitializer {
         mc.execute(() -> {
             try {
                 CommandExecutor exec = AltoClef.getCommandExecutor();
-                if (exec != null) exec.executeWithPrefix("stop", () -> { }, ex -> { });
+                AltoClef mod = exec != null ? exec.getMod() : null;
+                // ⚠ same as F1: an unexplained cancel reports SUCCESS to whatever is
+                // left of the bridge, and if it reconnects before the frame drains she
+                // is told the job finished. Losing the controller is not finishing.
+                if (mod != null) mod.getUserTaskChain().cancelWith(mod, "the bridge disconnected mid-task");
+                else if (exec != null) exec.executeWithPrefix("stop", () -> { }, ex -> { });
             } catch (Throwable t) {
                 log("control-loss stop failed: " + t.getMessage());
             }
@@ -465,6 +554,31 @@ public class ExternalControlServer implements ClientModInitializer {
     }
 
     // run an altoclef @command, tying its onFinish/onError back to the bridge id
+    /**
+     * FINISHED, OR GAVE UP? The command's own finish callback is the ONLY frame burnt
+     * reads for an outcome, and it used to be an unconditional `finished`.
+     *
+     * `UserTaskChain.onTaskFinish` runs this callback before it publishes
+     * `TaskFinishedEvent`, so the abort reason is already on the chain by the time we
+     * are called - and the later event carrying that reason is not only unread
+     * node-side, it is also dropped as a duplicate by the 3-second completion gate
+     * this frame has just armed. So a cyclic task tree, an F1 takeover and a bridge
+     * disconnect all reported SUCCESS: she closed the goal, announced the job done,
+     * and nothing ever retried it.
+     */
+    private void sendTaskOutcome(String id) {
+        String aborted = null;
+        try {
+            CommandExecutor exec = AltoClef.getCommandExecutor();
+            AltoClef mod = exec != null ? exec.getMod() : null;
+            if (mod != null) aborted = mod.getUserTaskChain().getAbortReason();
+        } catch (Throwable ignored) {
+            // an unreadable reason must not turn a real finish into an error
+        }
+        if (aborted != null && !aborted.isEmpty()) sendError(id, "aborted: " + aborted);
+        else sendFinished(id);
+    }
+
     // ---- keep the game rendering ---------------------------------------------
     // minecraft 1.21.2+ drops to TEN FPS once it decides the player is afk
     // (InactivityFpsLimit.AFK, ~60s with no real keyboard/mouse input). baritone
@@ -546,7 +660,7 @@ public class ExternalControlServer implements ClientModInitializer {
             java.util.List<String> lines = new java.util.ArrayList<>(6);
             java.util.List<Integer> colours = new java.util.ArrayList<>(6);
             if (manualControl) {
-                lines.add("manual - operator has the keyboard");
+                lines.add("manual - you have the keyboard");
                 colours.add(0xFFFFC65B);
             } else {
                 // a stale line claiming she is mid-task is worse than no line at all
@@ -614,6 +728,230 @@ public class ExternalControlServer implements ClientModInitializer {
         } catch (Throwable ignored) { }
     }
 
+    // ---- is this crop worth stopping for ------------------------------------
+    // CAN SHE TAKE ANYTHING FROM THIS BLOCK RIGHT NOW. AltoClef will not break an
+    // immature crop (one seed back for one seed spent), so an unripe field is not
+    // food - it is scenery on a timer. host-side that distinction is the whole
+    // difference between "my wheat spot" and a place she walks to and stands in.
+    //
+    // berries are read through the generic age property rather than the bush class,
+    // because a class name is a version dependency and a blockstate property is not.
+    private static final int BERRIES_PICKABLE_AGE = 2;
+    // what counts as walking food. mooshrooms included (they are cows); horses,
+    // wolves and cats are not on the menu and never appear here.
+    private static final java.util.Set<String> FOOD_ANIMALS = java.util.Set.of(
+            "cow", "mooshroom", "pig", "sheep", "chicken", "rabbit");
+    // what makes built ground a VILLAGE rather than somebody's base. deliberately
+    // narrow: a wandering trader roams the whole world and an iron golem can be
+    // player-built, so neither of them is evidence of a village. villagers are.
+    private static final java.util.Set<String> VILLAGE_ENTITIES = java.util.Set.of(
+            "villager", "villager_v2");
+
+    // THE MUNDANE SET IS AN INVERTED RARITY LIST, AND THAT IS THE WHOLE POINT.
+    // A list of "notable" mobs has to be extended every time a new one ships,
+    // and the failure mode of forgetting is that the interesting thing is
+    // invisible - which is exactly the bug this exists to fix. Naming the
+    // handful she genuinely sees every day instead means anything new is
+    // notable until it proves boring. Registry paths, never instanceof: the
+    // entity classes move between versions and a key does not.
+    private static final java.util.Set<String> MUNDANE_CREATURES = java.util.Set.of(
+            "zombie", "skeleton", "spider", "creeper", "cow", "pig", "sheep",
+            "chicken", "bat", "squid", "rabbit");
+    // worth saying out loud on their own, no matter how close or how often.
+    private static final java.util.Set<String> BOSS_CREATURES = java.util.Set.of(
+            "ender_dragon", "wither", "warden", "elder_guardian");
+    private static final int CREATURES_MAX = 6;
+    private static final int CREATURE_TYPES_MAX = 16;
+    // ⚠ THE NOTABLE VERDICT IS SENT, NOT THE INPUTS TO IT. host-side owns
+    // novelty (it owns the bestiary) but must not own a second copy of the
+    // mundane set - two lists of mob names in two languages is the floorplan
+    // parity problem again, and the drift is silent. Anything that clears the
+    // "not something she sees every day" bar is worth host-side asking whether
+    // it is also a first.
+    private static final int NOTABLE_SCORE = 3;
+    // inside this, a hostile is a thing happening to her rather than scenery.
+    private static final double DANGER_CLOSE = 8.0;
+    // a mob has to be meaningfully off her level before "above/below" earns the
+    // words - a skeleton on a ledge is a different problem to one on the floor.
+    private static final double ELEVATION_NOTE = 3.0;
+
+    // WHICH WAY, relative to where she is actually looking. "3 hostiles" is a
+    // stat readout; "a creeper four blocks behind me" is something happening to
+    // a person, and behind is the one she cannot see for herself. This is the
+    // yaw that would face the target minus the yaw she has, wrapped to
+    // -180..180: negative is her left, positive is her right (facing +Z, east
+    // sits on her left hand). Static and dependency-light so the offline probe
+    // can call the real thing rather than a copy of it.
+    /**
+     * Everything the sweep can honestly say about one person standing near her.
+     *
+     * ⚠ NOTHING HERE IS SERVER STATE. A client mod cannot see another player's
+     * health, hunger, inventory or what a mob is targeting - so this reads only
+     * synced entity data: position, rotation, pose, the entity flags, the
+     * equipped main hand, and the positions of mobs the client already has. Any
+     * field that would need the server is deliberately absent rather than
+     * guessed, because a number she cannot have is worse than a number she does
+     * not report.
+     *
+     * `threats` is computed against the SAME entity list the sweep already
+     * fetched, so counting mobs around each person costs no new query.
+     */
+    static NearbyPerson describePerson(LocalPlayer me, Player other, float yaw,
+                                       java.util.List<net.minecraft.world.entity.Entity> sweep) {
+        double dx = other.getX() - me.getX();
+        double dz = other.getZ() - me.getZ();
+        double dist = me.distanceTo(other);
+
+        // ARE THEY LOOKING AT HER? their look vector against the direction from
+        // them to her. this is the whole social signal that was missing - "he is
+        // stood there watching me" is a scene and "1 players" is not.
+        boolean watching = false;
+        if (dist <= WATCHING_MAX_DIST && dist > 0.01) {
+            net.minecraft.world.phys.Vec3 look = other.getLookAngle();
+            net.minecraft.world.phys.Vec3 toHer = new net.minecraft.world.phys.Vec3(
+                    me.getX() - other.getX(),
+                    (me.getY() + me.getEyeHeight()) - (other.getY() + other.getEyeHeight()),
+                    me.getZ() - other.getZ()).normalize();
+            watching = look.dot(toHer) >= WATCHING_DOT;
+        }
+
+        // IS SOMETHING ON THEM? a person with two zombies on him is the clearest
+        // "help me" in the game and nobody has to type it.
+        int threats = 0;
+        for (net.minecraft.world.entity.Entity e : sweep) {
+            if (!(e instanceof Monster)) continue;
+            if (e.distanceTo(other) <= PERSON_THREAT_RADIUS) threats++;
+        }
+
+        String holding = "";
+        try {
+            net.minecraft.world.item.ItemStack held = other.getMainHandItem();
+            if (held != null && !held.isEmpty()) {
+                holding = BuiltInRegistries.ITEM.getKey(held.getItem()).getPath();
+            }
+        } catch (Throwable ignored) { }
+
+        String name = "";
+        try { name = other.getGameProfile().name(); } catch (Throwable ignored) { }
+        String display = "";
+        try { display = other.getName().getString(); } catch (Throwable ignored) { }
+
+        return new NearbyPerson(name, display, dist,
+                relativeDirection(dx, dz, yaw), other.getY() - me.getY(),
+                watching, other.isCrouching(), other.isOnFire(),
+                other.hurtTime > 0, threats, holding);
+    }
+
+    static String relativeDirection(double dx, double dz, float yaw) {
+        double angleTo = Math.toDegrees(Math.atan2(-dx, dz));
+        double rel = net.minecraft.util.Mth.wrapDegrees(angleTo - yaw);
+        if (Math.abs(rel) <= 45.0) return "ahead";
+        if (Math.abs(rel) >= 135.0) return "behind";
+        return rel < 0 ? "left" : "right";
+    }
+
+    // one creature as the state packet describes it. `id` is carried so two
+    // identical mobs at an identical distance stay two mobs through the ranking
+    // below; it is not serialized.
+    record NearbyCreature(int id, String path, double dist, String dir, double dy,
+                          boolean hostile, boolean baby, boolean tame, boolean aggro,
+                          String name, int score) { }
+
+    /**
+     * A PERSON standing near her, as opposed to a creature.
+     *
+     * The 32-block sweep has always walked past players and kept nothing but a
+     * headcount and a name list - which is why nothing host-side could ever say
+     * where somebody was, whether they were watching her, or whether they were in
+     * trouble. Every field below comes out of the sweep that was already running.
+     *
+     * ⚠ TWO NAMES, ON PURPOSE. `name` is the game profile (what
+     * `nearbyPlayerNames` has always carried, so nothing downstream shifts under
+     * it) and `display` is the rendered one, which is what rank plugins put in
+     * CHAT. Burnt matches a speaker against this list, and on a server where
+     * those differ she was comparing two different strings for the same human.
+     */
+    record NearbyPerson(String name, String display, double dist, String dir, double dy,
+                        boolean watching, boolean sneaking, boolean onFire, boolean hurt,
+                        int threats, String holding) { }
+
+    /** How many people ride in the readout. More than this and it is a crowd, not a scene. */
+    static final int PEOPLE_MAX = 6;
+    /** Hostiles this close to somebody else are ON them, not merely in the same field. */
+    static final double PERSON_THREAT_RADIUS = 8.0;
+    /**
+     * How square-on somebody has to be for "they are looking at me".
+     *
+     * The dot product of their unit look vector and the unit vector from them to
+     * her. 0.93 is about 21 degrees - narrow enough that walking past while
+     * scanning the horizon does not read as eye contact, wide enough that it
+     * survives the jitter of a person who is actually looking at you.
+     */
+    static final double WATCHING_DOT = 0.93;
+    /** ...and past this it is not eye contact, it is a coincidence of geometry. */
+    static final double WATCHING_MAX_DIST = 16.0;
+
+    // ⚠ THE NEAREST HOSTILE IS NOT NEGOTIABLE. Ranking on notability alone drops
+    // a plain zombie in favour of a wandering trader, and the zombie is the one
+    // about to hit her - the danger readout would then go quiet exactly when a
+    // mundane mob was killing her. So it is seeded first and the interesting
+    // ones fill whatever is left, then the whole list is ordered nearest-first
+    // because that is the order she would notice them in.
+    static java.util.List<NearbyCreature> selectCreatures(java.util.List<NearbyCreature> all, int max) {
+        java.util.List<NearbyCreature> picked = new java.util.ArrayList<>();
+        if (max <= 0) return picked;
+        all.stream().filter(NearbyCreature::hostile)
+                .min(java.util.Comparator.comparingDouble(NearbyCreature::dist))
+                .ifPresent(picked::add);
+        all.stream()
+                .sorted(java.util.Comparator.<NearbyCreature>comparingInt(c -> -c.score())
+                        .thenComparingDouble(NearbyCreature::dist))
+                .forEach(c -> {
+                    if (picked.size() < max && !picked.contains(c)) picked.add(c);
+                });
+        picked.sort(java.util.Comparator.comparingDouble(NearbyCreature::dist));
+        return picked;
+    }
+
+    // How much this creature is worth her attention, before novelty (which only
+    // host-side knows - it owns the bestiary). Ties break on distance at the
+    // call site, so this only has to rank kinds against each other.
+    static int creatureNotability(String path, boolean named, boolean baby,
+                                  boolean tame, boolean hostile, boolean aggro, double dist) {
+        int score = 0;
+        // ⚠ BIG ENOUGH TO BE ACTUALLY DOMINANT, not merely large. every other
+        // term here stacks (not-mundane + named + tame + baby + close + aggro
+        // = 15), and at +8 a nametagged baby pet could out-rank a WARDEN and
+        // push it out of a six-slot readout. the one mob that must never be
+        // crowded out was the one that could be.
+        if (BOSS_CREATURES.contains(path)) score += 20;
+        if (!MUNDANE_CREATURES.contains(path)) score += 3;
+        if (named) score += 4;      // somebody took the trouble to name it
+        if (tame) score += 2;
+        if (baby) score += 1;
+        if (hostile && dist <= DANGER_CLOSE) score += 2;
+        // something that has decided about her outranks something that has not,
+        // whatever species it is.
+        if (aggro) score += 3;
+        return score;
+    }
+
+    private static boolean isHarvestable(BlockState state) {
+        try {
+            if (state.getBlock() instanceof CropBlock crop) return crop.isMaxAge(state);
+            if (state.is(Blocks.SWEET_BERRY_BUSH)) {
+                for (var prop : state.getProperties()) {
+                    if (!prop.getName().equals("age")) continue;
+                    if (prop instanceof net.minecraft.world.level.block.state.properties.IntegerProperty ip) {
+                        return state.getValue(ip) >= BERRIES_PICKABLE_AGE;
+                    }
+                }
+                return false;
+            }
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
     // ---- how big is the room -------------------------------------------------
     // returns the edge length of the largest clear cube she is standing in, measured
     // from her feet upward (the floor is not counted - a room is supposed to have one).
@@ -622,6 +960,42 @@ public class ExternalControlServer implements ClientModInitializer {
     // hall ever walks the full radius. capped so this can never become a survey.
     private static final int CLEAR_SCAN_MAX_RADIUS = 22;      // edge 45
     private static final double CLEAR_SHELL_SOLID_TOLERANCE = 0.10;
+
+    /**
+     * ⚠ CACHED, because the early-out reasons about tunnels and the COMMON CASE is
+     * open sky.
+     *
+     * The shell test stops as soon as a shell is >10% solid, and it samples
+     * `dy = 1 .. 2r` - above her head only, the floor excluded by design. So
+     * anywhere with open sky (a plain, a desert, her own cleared yard - i.e. exactly
+     * the ground she settles on) NO shell is ever solid and it walks all 22 radii:
+     * ~76,000 `getBlockState` calls and ~470,000 loop iterations, inside one
+     * `mc.execute` frame, every 2 seconds, on the render thread. That is a visible
+     * framerate cost on stream.
+     *
+     * Same cache as `homeSite` right below, for the same reason and with the same
+     * shape: a reading is good for SITE_CACHE_MS or until she has moved
+     * SITE_CACHE_MOVE blocks. Walking costs what it always did; standing still
+     * costs a fifth.
+     */
+    private static int cachedClearEdge = -1;
+    private static BlockPos cachedClearEdgeAt;
+    private static long cachedClearEdgeAtMs;
+
+    private static int clearEdge(Minecraft mc) {
+        if (mc.player == null || mc.level == null) return 0;
+        BlockPos feet = mc.player.blockPosition();
+        long now = System.currentTimeMillis();
+        if (cachedClearEdge >= 0 && cachedClearEdgeAt != null
+            && now - cachedClearEdgeAtMs < SITE_CACHE_MS
+            && cachedClearEdgeAt.distSqr(feet) <= (double) SITE_CACHE_MOVE * SITE_CACHE_MOVE) {
+            return cachedClearEdge;
+        }
+        cachedClearEdge = measureClearEdge(mc);
+        cachedClearEdgeAt = feet;
+        cachedClearEdgeAtMs = now;
+        return cachedClearEdge;
+    }
 
     private static int measureClearEdge(Minecraft mc) {
         if (mc.player == null || mc.level == null) return 0;
@@ -675,6 +1049,277 @@ public class ExternalControlServer implements ClientModInitializer {
     private static final double VANITY_FRONT_CHANCE = 0.4;
     private static long nextVanityAt = 0L;
     private static long vanityUntil = 0L;
+
+    // ---- tics ----------------------------------------------------------------
+    /**
+     * THE FIDGETING. Crouch spam, a hop, and the front-camera air punch.
+     *
+     * A bot that stands perfectly still between actions reads as a bot. Real players
+     * fidget - they bunny-hop while thinking, spam sneak at nothing, and flip the camera
+     * round to look at themselves and throw a punch. These are those, and they are
+     * PURELY cosmetic: no tic ever presses attack or use, moves her anywhere, or touches
+     * pitch/yaw.
+     *
+     * ⚠ WHO DECIDES vs WHO PERFORMS. The decision (how often, which one, is it safe
+     * right now) lives host-side in `_ticStep` - it is the half that knows whether a
+     * mouse-click job is running, whether a person is talking, and what the operator set
+     * the frequency to, and it is the half a human can tune without a rebuild. This end
+     * only PLAYS a named tic over a handful of ticks, and refuses outright if the client
+     * is in a state where it would be unsafe or invisible.
+     *
+     * ⚠ NEVER TOUCHES YAW. `autoThirdPersonTick` above says why: the mining camera snap
+     * is load-bearing (DestroyBlockTask force-attacks before alignment). The "look at
+     * the camera" beat is done with THIRD_PERSON_FRONT, which turns the CAMERA rather
+     * than her head, so it is safe even mid-task and needs nothing restored but the view.
+     */
+    private static final boolean TICS_ENABLED = !"0".equals(System.getenv("BURTCRAFT_TICS"));
+    private static String ticKind = null;
+    private static int ticAge = 0;               // ticks since the tic started
+    private static int ticLength = 0;
+    private static boolean ticTookCamera = false;
+
+    /** true when the tic was accepted; false means the client said no. */
+    private static boolean startTic(Minecraft mc, String kind) {
+        if (!TICS_ENABLED || kind == null) return false;
+        if (ticKind != null) return false;                    // one at a time
+        if (manualControl) return false;                      // the operator's hands
+        if (mc.player == null || mc.level == null) return false;
+        if (mc.screen != null) return false;                  // a chest/craft screen is open
+        LocalPlayer p = mc.player;
+        // mid-swing or mid-use is exactly when a fidget would break something
+        if (p.isUsingItem()) return false;
+        if (mc.gameMode != null && mc.gameMode.isDestroying()) return false;
+        switch (kind) {
+            case "crouch":
+                // sneaking only slows her, so this is safe while walking too
+                if (!p.onGround() || p.isInWater() || p.isInLava()) return false;
+                ticLength = 26;
+                break;
+            case "jump":
+                // ⚠ IDLE-ONLY, deliberately: a forced jump mid-path can land her off a
+                // ledge or wreck a parkour move baritone had planned. host-side only
+                // offers this one while she is standing still; this is the second lock.
+                if (!p.onGround() || p.isInWater() || p.isInLava() || p.isPassenger()) return false;
+                if (isMovingNow(p)) return false;
+                ticLength = 22;
+                break;
+            case "flex":
+                // camera + arm only. safe anywhere that is not mining or using.
+                ticLength = 34;
+                ticTookCamera = false;
+                if (mc.options.getCameraType() == CameraType.FIRST_PERSON) {
+                    mc.options.setCameraType(CameraType.THIRD_PERSON_FRONT);
+                    ticTookCamera = true;
+                }
+                // borrow the vanity camera's lease so it does not fight us for the view
+                // while the flex is running (see autoThirdPersonTick).
+                vanityUntil = System.currentTimeMillis() + 4000L;
+                break;
+            default:
+                return false;
+        }
+        ticKind = kind;
+        ticAge = 0;
+        return true;
+    }
+
+    private static boolean isMovingNow(LocalPlayer p) {
+        double dx = p.getX() - p.xOld;
+        double dz = p.getZ() - p.zOld;
+        return (dx * dx + dz * dz) > MOVING_EPSILON;
+    }
+
+    private static void ticTick(Minecraft mc) {
+        if (ticKind == null) return;
+        try {
+            // ⚠ ABANDON ON ANY STATE CHANGE THAT MAKES THE TIC WRONG, mid-performance.
+            // A fidget that keeps running after the operator takes the keyboard, or once a task
+            // starts swinging a pickaxe, is the one way a cosmetic feature becomes a
+            // real one.
+            if (manualControl || mc.player == null || mc.level == null || mc.screen != null
+                || mc.player.isUsingItem()
+                || (mc.gameMode != null && mc.gameMode.isDestroying())) {
+                endTic(mc);
+                return;
+            }
+            LocalPlayer p = mc.player;
+            ticAge++;
+            switch (ticKind) {
+                case "crouch": {
+                    // on/off every 3 ticks: unmistakably a fidget, not a stuck key
+                    boolean down = ((ticAge / 3) % 2) == 0;
+                    mc.options.keyShift.setDown(down);
+                    break;
+                }
+                case "jump": {
+                    // two hops, each one tick of key and a beat of air
+                    boolean press = ticAge == 1 || ticAge == 12;
+                    mc.options.keyJump.setDown(press);
+                    break;
+                }
+                case "flex": {
+                    // three punches at the camera, spaced so they read as separate
+                    if (ticAge == 6 || ticAge == 16 || ticAge == 26) {
+                        p.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+                    }
+                    break;
+                }
+                default: break;
+            }
+            if (ticAge >= ticLength) endTic(mc);
+        } catch (Throwable ignored) {
+            try { endTic(mc); } catch (Throwable ignored2) { }
+        }
+    }
+
+    /** hand everything back, whatever the tic was and however it ended. */
+    private static void endTic(Minecraft mc) {
+        String kind = ticKind;
+        ticKind = null;
+        ticAge = 0;
+        ticLength = 0;
+        try {
+            // ⚠ ALWAYS release, even for a tic that never pressed these: an abandoned
+            // crouch would otherwise leave her sneaking for the rest of the session,
+            // which looks like a bug and halves her walking speed.
+            mc.options.keyShift.setDown(false);
+            mc.options.keyJump.setDown(false);
+        } catch (Throwable ignored) { }
+        if ("flex".equals(kind)) {
+            try {
+                if (ticTookCamera && mc.options.getCameraType() == CameraType.THIRD_PERSON_FRONT) {
+                    mc.options.setCameraType(CameraType.FIRST_PERSON);
+                }
+            } catch (Throwable ignored) { }
+            ticTookCamera = false;
+            // give the borrowed lease back, and don't let the vanity camera fire the
+            // instant we let go - that would read as one long camera stunt.
+            vanityUntil = 0;
+            nextVanityAt = System.currentTimeMillis() + VANITY_MIN_GAP_MS;
+        }
+    }
+
+    // ─── THE GAZE ─────────────────────────────────────────────────────────────
+    // who she is currently holding eye contact with, and until when.
+    private static String gazeTarget = null;
+    private static long gazeUntil = 0L;
+    /** Default hold. Long enough to read as "she turned and looked at you", short enough not to be a stare. */
+    static final long GAZE_DEFAULT_MS = 2500L;
+    /** Ceiling, so a malformed request can never pin her head for the rest of the session. */
+    static final long GAZE_MAX_MS = 15000L;
+    /** How fast the head comes round, in degrees per tick. Instant snapping reads as a machine. */
+    static final float GAZE_TURN_RATE = 22.0f;
+
+    static void startGaze(String who, long holdMs) {
+        gazeTarget = who;
+        gazeUntil = System.currentTimeMillis() + Math.max(0L, Math.min(GAZE_MAX_MS, holdMs));
+    }
+
+    static void endGaze() {
+        gazeTarget = null;
+        gazeUntil = 0L;
+    }
+
+    /**
+     * HOLD SOMEBODY'S EYE while she is talking to them.
+     *
+     * `look_at` used to be a single `setYRot` and nothing else, which is fine for
+     * "burnt turn around" and useless for the thing people actually notice: she
+     * says a sentence to you and is facing a wall the whole time. One write is
+     * gone by the next client tick - AltoClef's own look control, or Baritone's,
+     * writes rotation constantly - so a gesture that lasts has to be re-asserted
+     * every tick until it expires.
+     *
+     * ⚠⚠ AND IT MUST NOT FIGHT THE PATHFINDER. Baritone steers by rotation: two
+     * writers on `yRot` in the same tick is not a compromise, it is a bot
+     * stuttering down a hill on stream while her head snaps back and forth. So
+     * the gaze SUSPENDS itself while a path is running rather than contending for
+     * the field - the clock keeps ticking, and if she stops moving before it
+     * expires the gaze resumes on its own. In practice that produces exactly the
+     * right behaviour: standing at her house, somebody talks to her, she turns
+     * and looks at them; caught mid-walk, she keeps walking.
+     *
+     * Turning is RATE-LIMITED for the same reason the tics exist - a head that
+     * snaps 180 degrees in one frame reads as a machine, a head that swings round
+     * over a few ticks reads as a person hearing their name.
+     */
+    private static void gazeTick(Minecraft mc) {
+        if (gazeTarget == null) return;
+        try {
+            if (mc.player == null || mc.level == null) { endGaze(); return; }
+            // the operator's own view is theirs - the same rule the camera follows
+            if (manualControl) { endGaze(); return; }
+            if (System.currentTimeMillis() > gazeUntil) { endGaze(); return; }
+            // a whole-body gesture outranks holding an eye
+            if (ticKind != null) return;
+            // ⚠ the pathfinder owns rotation while it is steering. yield, do not
+            // contend - and do NOT end the gaze, because she may stop in time.
+            if (isPathing()) return;
+
+            LocalPlayer me = mc.player;
+            Player who = null;
+            for (Player other : mc.level.players()) {
+                if (other == me) continue;
+                if (matchesPlayerName(other, gazeTarget)) { who = other; break; }
+            }
+            // they walked off or logged out. that is an ending, not an error.
+            if (who == null) { endGaze(); return; }
+
+            double dx = who.getX() - me.getX();
+            double dy = (who.getY() + who.getEyeHeight()) - (me.getY() + me.getEyeHeight());
+            double dz = who.getZ() - me.getZ();
+            double flat = Math.sqrt(dx * dx + dz * dz);
+            if (flat < 0.01 && Math.abs(dy) < 0.01) return;
+            float wantYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+            float wantPitch = (float) -Math.toDegrees(Math.atan2(dy, flat));
+
+            // shortest way round, capped per tick
+            float dYaw = net.minecraft.util.Mth.wrapDegrees(wantYaw - me.getYRot());
+            float dPitch = wantPitch - me.getXRot();
+            me.setYRot(me.getYRot() + Math.max(-GAZE_TURN_RATE, Math.min(GAZE_TURN_RATE, dYaw)));
+            me.setXRot(Math.max(-90f, Math.min(90f,
+                    me.getXRot() + Math.max(-GAZE_TURN_RATE, Math.min(GAZE_TURN_RATE, dPitch)))));
+        } catch (Throwable ignored) {
+            endGaze();
+        }
+    }
+
+    /**
+     * Is Baritone actually steering right now?
+     *
+     * Reflection-free but defensively wrapped: this runs every tick and a
+     * pathfinder that is mid-reload must never be able to take the gaze - or the
+     * whole client tick - down with it. An exception reads as "yes, something is
+     * driving", which is the safe answer: the gaze stands down rather than
+     * fighting something it cannot see.
+     */
+    private static boolean isPathing() {
+        try {
+            return baritone.api.BaritoneAPI.getProvider().getPrimaryBaritone()
+                    .getPathingBehavior().isPathing();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /**
+     * Match a name against either of the two names a player has.
+     *
+     * A rank plugin renders `[MVP] Aereon42` where the Mojang account is
+     * `ShadowAliceZ`. Burnt learns names from CHAT, which carries the rendered
+     * one, so matching only the game profile means she cannot look at exactly the
+     * people who just spoke to her.
+     */
+    static boolean matchesPlayerName(Player other, String wanted) {
+        if (wanted == null || wanted.isEmpty()) return false;
+        try {
+            if (other.getName().getString().equalsIgnoreCase(wanted)) return true;
+        } catch (Throwable ignored) { }
+        try {
+            if (other.getGameProfile().name().equalsIgnoreCase(wanted)) return true;
+        } catch (Throwable ignored) { }
+        return false;
+    }
 
     private static void autoThirdPersonTick(Minecraft mc) {
         if (!AUTO_THIRD_PERSON) return;
@@ -978,8 +1623,18 @@ public class ExternalControlServer implements ClientModInitializer {
     }
 
     private static void resetAutoCamera() {
+        // ⚠ THE GAZE DIES HERE TOO. this runs on f1 and on world loss, and a gaze
+        // left armed would keep writing rotation while the operator is trying to
+        // play - the same trap the crouch tic left behind when it was not ended.
+        endGaze();
         lookDownTicks = 0;
         lookUpTicks = 0;
+        // ⚠ A TIC MID-PERFORMANCE HAS TO DIE HERE TOO. This runs on f1 and on world
+        // loss, and a crouch tic abandoned with the key held down would leave her
+        // sneaking - at half speed, apparently stuck - for the rest of the session.
+        if (ticKind != null) {
+            try { endTic(Minecraft.getInstance()); } catch (Throwable ignored) { }
+        }
         // hand the camera back cleanly: f1 manual control and world loss both land here,
         // and a vanity shot left running would keep the operator in third person.
         if (vanityUntil > 0) {
@@ -1016,6 +1671,56 @@ public class ExternalControlServer implements ClientModInitializer {
             applyIntent(command.substring(4).trim());
             sendAck(id);
             sendFinished(id);
+            return;
+        }
+        // A FIDGET. Cosmetic, a second or two long, starts no task and moves her
+        // nowhere - so like the hud it never touches the task system. It DOES sit below
+        // nothing and above everything, because the client is the only thing that knows
+        // whether a screen is open or a pickaxe is mid-swing right now.
+        //
+        // Reported as finished either way: a refused fidget is not a fault, and burnt
+        // must never narrate one. `startTic` says no far more often than yes.
+        if (command.regionMatches(true, 0, "tic", 0, 3)) {
+            final String kind = command.length() > 3 ? command.substring(3).trim().toLowerCase() : "";
+            Minecraft mc = Minecraft.getInstance();
+            sendAck(id);
+            mc.execute(() -> {
+                try { startTic(mc, kind); } catch (Throwable ignored) { }
+            });
+            sendFinished(id);
+            return;
+        }
+        // "THIS BUILDING IS MINE - NEVER MINE THROUGH IT."
+        //
+        // Also intercepted before the manual-control guard, and for the same kind
+        // of reason as the hud: this starts no task and moves nothing, it hands
+        // the pathfinder a rule. Refusing it while the operator holds the keyboard would
+        // mean the house comes back unprotected the moment he hands control back.
+        //
+        // Node re-sends its whole settlement list on every world join, because the
+        // game only ever learns a house exists while it is being BUILT - and a
+        // FINISHED house is never built again. That left the completed homestead,
+        // the one building she walks to most, as ordinary stone on the shortest
+        // path home.
+        if (command.regionMatches(true, 0, "protect_settlement ", 0, 19)) {
+            sendAck(id);
+            try {
+                String[] a = command.substring(19).trim().split("\\s+");
+                if (a.length < 7) throw new IllegalArgumentException("need role x y z width depth height");
+                boolean outpost = "outpost".equalsIgnoreCase(a[0]);
+                BlockPos anchor = new BlockPos(Integer.parseInt(a[1]), Integer.parseInt(a[2]), Integer.parseInt(a[3]));
+                int w = Integer.parseInt(a[4]), d = Integer.parseInt(a[5]), h = Integer.parseInt(a[6]);
+                Settlement s = outpost
+                    ? new adris.altoclef.tasks.construction.settlement.ToasterOutpost("protected", anchor, w, d, h)
+                    : new adris.altoclef.tasks.construction.settlement.ToasterHomestead("protected", anchor, w, d, h);
+                // the world is read lazily inside the predicate, on the pathing
+                // thread - do NOT capture a level here, this runs before chunks load.
+                s.protectFromMining(() -> Minecraft.getInstance().level);
+                log("protecting " + s.protectionId() + " from mining");
+                sendFinished(id);
+            } catch (Throwable t) {
+                sendError(id, "bad protect_settlement: " + t.getMessage());
+            }
             return;
         }
         if (manualControl) {
@@ -1086,15 +1791,34 @@ public class ExternalControlServer implements ClientModInitializer {
                     } else if (verb.equals("look_at") && bits.length > 1) {
                         net.minecraft.world.entity.player.Player who = null;
                         for (net.minecraft.world.entity.player.Player p2 : mc.level.players()) {
-                            if (p2 != me && p2.getName().getString().equalsIgnoreCase(bits[1])) { who = p2; break; }
+                            // ⚠ BOTH NAMES. this used to match `getName()` only,
+                            // which is the RENDERED name - so on a server with no
+                            // rank plugin it worked, and on one with a rank plugin
+                            // "look at the person who just spoke" could not find
+                            // the person who just spoke.
+                            if (p2 != me && matchesPlayerName(p2, bits[1])) { who = p2; break; }
                         }
                         if (who == null) { sendError(id, "can't see " + bits[1] + " from here"); return; }
+                        // aim once immediately so the turn starts this tick even if
+                        // she is mid-path (where the gaze itself stands down), then
+                        // HOLD it - see gazeTick. a single write is gone by the next
+                        // tick, which is why "look at me while you talk" never worked.
                         double dx = who.getX() - me.getX();
                         double dy = (who.getY() + who.getEyeHeight()) - (me.getY() + me.getEyeHeight());
                         double dz = who.getZ() - me.getZ();
                         double flat = Math.sqrt(dx * dx + dz * dz);
                         me.setYRot((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
                         me.setXRot((float) -Math.toDegrees(Math.atan2(dy, flat)));
+                        long hold = GAZE_DEFAULT_MS;
+                        if (bits.length > 2) {
+                            try { hold = (long) (Float.parseFloat(bits[2]) * 1000f); } catch (Throwable ignored) { }
+                        }
+                        startGaze(bits[1], hold);
+                        sendFinished(id);
+                    } else if (verb.equals("look_away")) {
+                        // let go of somebody's eye on purpose - the end of a
+                        // conversation, not an error.
+                        endGaze();
                         sendFinished(id);
                     } else {
                         sendError(id, "unknown look command");
@@ -1145,7 +1869,7 @@ public class ExternalControlServer implements ClientModInitializer {
             }
             sendAck(id);
             try {
-                exec.executeWithPrefix(bare, () -> sendFinished(id), ex -> sendError(id, ex.getMessage()));
+                exec.executeWithPrefix(bare, () -> sendTaskOutcome(id), ex -> sendError(id, ex.getMessage()));
             } catch (Throwable t) {
                 sendError(id, "exec failed: " + t.getMessage());
             }
@@ -1180,7 +1904,7 @@ public class ExternalControlServer implements ClientModInitializer {
                     return;
                 }
                 sendAck(id);
-                exec.execute(text, () -> sendFinished(id), ex -> sendError(id, ex.getMessage()));
+                exec.execute(text, () -> sendTaskOutcome(id), ex -> sendError(id, ex.getMessage()));
                 return;
             }
             try {
@@ -1200,6 +1924,20 @@ public class ExternalControlServer implements ClientModInitializer {
     }
 
     // ---- outbound: state + events ---------------------------------------
+
+    /**
+     * altoclef's Dimension enum -> the vanilla dimension id the node side speaks.
+     * the same x/y/z is a different place in each one, so a published container
+     * position without this is ambiguous.
+     */
+    private static String dimensionKey(adris.altoclef.util.Dimension dimension) {
+        if (dimension == null) return "minecraft:overworld";
+        return switch (dimension) {
+            case NETHER -> "minecraft:the_nether";
+            case END -> "minecraft:the_end";
+            default -> "minecraft:overworld";
+        };
+    }
 
     private void pollState() {
         if (this.out == null) return;
@@ -1235,6 +1973,18 @@ public class ExternalControlServer implements ClientModInitializer {
                     boolean multiplayer = sd != null && mc.getSingleplayerServer() == null;
                     gs.addProperty("multiplayer", multiplayer);
                     if (multiplayer && sd.ip != null) gs.addProperty("server", sd.ip);
+                    // WHICH SAVE, when there is no server to name. burnt scopes every
+                    // spatial memory by world id, and that id was the server address -
+                    // so ALL singleplayer worlds shared one identity and one map. two
+                    // saves overwrote each other's coastline, claims and landmarks at
+                    // matching coordinates. the level name is the only thing that tells
+                    // them apart from in here.
+                    if (!multiplayer && mc.getSingleplayerServer() != null) {
+                        try {
+                            String save = mc.getSingleplayerServer().getWorldData().getLevelName();
+                            if (save != null && !save.isEmpty()) gs.addProperty("saveName", save);
+                        } catch (Throwable ignored) { }
+                    }
                 } catch (Throwable ignored) { }
                 gs.addProperty("onGround", p.onGround());
                 gs.addProperty("xpLevel", p.experienceLevel);
@@ -1255,6 +2005,17 @@ public class ExternalControlServer implements ClientModInitializer {
                 // from a cave or overhang. The wider clearEdge survey below answers
                 // "is there room?"; this answers "is it actually outdoors?".
                 try { gs.addProperty("skyVisible", mc.level.canSeeSky(bp.above())); } catch (Throwable ignored) { }
+                // HOW DARK IT IS WHERE SHE IS STANDING, and how far under the surface.
+                // two single lookups apiece - nothing next to the ~8600 block reads
+                // this poll already does - and between them they separate "in a cave",
+                // "in a dark corner of her own house" and "outside at night", which
+                // skyVisible alone cannot: it is false for all three.
+                try { gs.addProperty("lightLevel", mc.level.getMaxLocalRawBrightness(bp)); } catch (Throwable ignored) { }
+                try {
+                    int surface = mc.level.getHeightmapPos(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bp).getY();
+                    gs.addProperty("depthBelowSurface", surface - bp.getY());
+                } catch (Throwable ignored) { }
                 try { gs.add("homeSite", homeSite(mc, p)); } catch (Throwable ignored) { }
                 // OVER water without being IN it. baritone refuses to swim (see the
                 // water settings) so when it must cross an ocean it BRIDGES - and a
@@ -1333,6 +2094,85 @@ public class ExternalControlServer implements ClientModInitializer {
                     lastDiamondCount = diamondCount;
                 } catch (Throwable t) { /* inventory optional */ }
 
+                // WHAT IS IN HER CHESTS.
+                //
+                // altoclef already snapshots a container's entire contents on every
+                // client tick its screen is open, and keeps that snapshot after the
+                // screen closes - but the tally never left the game. so burnt decided
+                // "i need more bread" from her CARRIED inventory alone and farmed
+                // forever past 500 loaves sitting in a chest. this publishes the cache
+                // she already has.
+                //
+                // ⚠ AN ABSENT `containers` KEY MEANS "CANNOT TELL", NEVER "NOTHING IS
+                // STORED". on any failure below the key is omitted entirely - an empty
+                // array is a claim about the world, and a read that just broke is not
+                // entitled to make it.
+                // ⚠ DOUBLE CHESTS DOUBLE-COUNT. the tracker keys off the single block
+                // that was clicked but tallies the whole 54-slot menu onto that one
+                // position, so opening the other half later produces a SECOND entry at
+                // a different position with identical contents. never sum these blind.
+                // ⚠ A SHULKER BOX INSIDE A CHEST is a single `*_shulker_box` item here.
+                // its contents are never inspected and are not represented at all.
+                // ⚠ THE ENDER CHEST IS DELIBERATELY OMITTED. altoclef's ender cache is
+                // one unscoped global - the same contents reachable from every ender
+                // chest in the world - so emitting it at a position would be a lie
+                // about where those items are.
+                // ⚠ getCachedContainers() MUTATES: reading it prunes entries whose
+                // block has since been broken. safe here ONLY because pollState runs
+                // inside mc.execute(), i.e. the same client thread that writes it.
+                try {
+                    CommandExecutor storageExec = AltoClef.getCommandExecutor();
+                    AltoClef storageMod = storageExec != null ? storageExec.getMod() : null;
+                    if (storageMod != null && storageMod.getItemStorage() != null) {
+                        adris.altoclef.util.Dimension here = adris.altoclef.util.helpers.WorldHelper.getCurrentDimension();
+                        java.util.List<adris.altoclef.trackers.storage.ContainerCache> caches =
+                                new java.util.ArrayList<>(storageMod.getItemStorage().getCachedContainers());
+                        // nearest first, and this dimension ahead of any other - a
+                        // chest 40 blocks away matters more than one in the nether.
+                        caches.sort(java.util.Comparator
+                                .<adris.altoclef.trackers.storage.ContainerCache>comparingInt(c -> c.getDimension() == here ? 0 : 1)
+                                .thenComparingDouble(c -> c.getBlockPos().distToCenterSqr(p.position())));
+                        JsonArray containers = new JsonArray();
+                        int emitted = 0;
+                        for (adris.altoclef.trackers.storage.ContainerCache cache : caches) {
+                            if (emitted >= CONTAINERS_MAX) break;
+                            if (cache.getContainerType() == adris.altoclef.trackers.storage.ContainerType.ENDER_CHEST) continue;
+                            BlockPos cpos = cache.getBlockPos();
+                            JsonObject entry = new JsonObject();
+                            entry.addProperty("dim", dimensionKey(cache.getDimension()));
+                            entry.addProperty("x", cpos.getX());
+                            entry.addProperty("y", cpos.getY());
+                            entry.addProperty("z", cpos.getZ());
+                            // PUBLISH THE TYPE. this cache holds furnaces, brewing
+                            // stands, hoppers and dispensers too, and "the chest at X
+                            // has 8 coal" when X is really a furnace's fuel slot is a
+                            // lie burnt would act on.
+                            entry.addProperty("type", cache.getContainerType().name());
+                            entry.addProperty("empty", cache.getEmptySlotCount());
+                            entry.addProperty("full", cache.isFull());
+                            // HOW OLD THESE NUMBERS ARE. a cache is only refreshed
+                            // while its screen is open and survives an unloaded chunk,
+                            // so this can be hours stale - `@peek x y z` re-reads one.
+                            entry.addProperty("at", cache.lastUpdated());
+                            java.util.List<java.util.Map.Entry<net.minecraft.world.item.Item, Integer>> tallies =
+                                    new java.util.ArrayList<>(cache.getItemCounts().entrySet());
+                            // biggest counts first, so a clipped list still answers
+                            // "have i got a lot of X stored".
+                            tallies.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+                            JsonObject itemsObj = new JsonObject();
+                            int listed = 0;
+                            for (java.util.Map.Entry<net.minecraft.world.item.Item, Integer> tally : tallies) {
+                                if (listed++ >= CONTAINER_ITEMS_MAX) break;
+                                itemsObj.addProperty(BuiltInRegistries.ITEM.getKey(tally.getKey()).toString(), tally.getValue());
+                            }
+                            entry.add("items", itemsObj);
+                            containers.add(entry);
+                            emitted++;
+                        }
+                        gs.add("containers", containers);
+                    }
+                } catch (Throwable t) { /* container readout is best-effort - omit rather than lie */ }
+
                 // live altoclef task readout - the "what am i actually doing right now".
                 // the root task carries the high-level goal + phase (e.g. a @gamer run
                 // reads "beating the game.: getting blaze rods"), the deepest task carries
@@ -1384,6 +2224,51 @@ public class ExternalControlServer implements ClientModInitializer {
                     boolean wetHere = false;
                     try { wetHere = mc.level.isRainingAt(bp); } catch (Throwable ignored) { }
                     gs.addProperty("rainingHere", wetHere);
+
+                    // WHAT THE SKY IS DOING. she could tell "day" from "night" and
+                    // nothing else, so the two most photogenic minutes of a minecraft
+                    // day - the sun going down and coming up - were the same fact as
+                    // noon to her. overworld only: the nether has no sky and the end's
+                    // is a fixed void, so a day/night phase there would be a lie.
+                    if ("minecraft:overworld".equals(dimension)) {
+                        // ⚠ THE SAME CLOCK AS `tod` ABOVE. an earlier version read
+                        // getGameTime() here, which is total elapsed ticks and is NOT
+                        // what /time set moves - so on any world where the time had
+                        // ever been set, the moon reported by this line and the sky
+                        // reported by the next disagreed about what day it was.
+                        long clock = mc.level.getOverworldClockTime();
+                        // vanilla: DimensionType.moonPhase(t) = (int)(t / 24000L % 8L),
+                        // and index 0 is the FULL moon (the moon texture atlas is
+                        // ordered full -> waning -> new -> waxing). node decodes the
+                        // index to a name; the number is sent raw so the naming table
+                        // has exactly one home.
+                        gs.addProperty("moonPhase", (int)((clock / 24000L) % 8L));
+
+                        // how long she has before the light goes. sunset starts at
+                        // 12000, a full day is 24000 ticks at 20/s, so a whole day is
+                        // 600s of daylight. clamped at 0 once it is already past.
+                        gs.addProperty("secondsUntilSunset", Math.max(0L, 12000L - tod) / 20L);
+
+                        // ⚠ THESE BOUNDARIES ARE VANILLA'S, NOT ROUND NUMBERS. the day
+                        // starts at sunrise (0), noon is 6000, sunset BEGINS at 12000,
+                        // mobs start spawning around 13000, midnight is 18000, and the
+                        // sun starts coming back up at 23000. a first pass here spread
+                        // the phases evenly across the 24000 and called tod 0-2000
+                        // "night" - i.e. it labelled sunrise and the whole first hour
+                        // of the morning as darkness, which is when she is most often
+                        // outdoors.
+                        String skyColorPhase;
+                        if (tod < 1000L)            skyColorPhase = "sunrise";
+                        else if (tod < 5000L)       skyColorPhase = "morning";
+                        else if (tod < 7000L)       skyColorPhase = "midday";
+                        else if (tod < 11000L)      skyColorPhase = "afternoon";
+                        else if (tod < 12000L)      skyColorPhase = "golden_hour";
+                        else if (tod < 13000L)      skyColorPhase = "sunset";
+                        else if (tod < 14000L)      skyColorPhase = "dusk";
+                        else if (tod < 22000L)      skyColorPhase = "night";
+                        else                        skyColorPhase = "predawn";
+                        gs.addProperty("skyColorPhase", skyColorPhase);
+                    }
                     if (!lastDimension.isEmpty() && !dimension.equals(lastDimension)) {
                         JsonObject changed = new JsonObject();
                         changed.addProperty("dimension", dimension);
@@ -1419,15 +2304,62 @@ public class ExternalControlServer implements ClientModInitializer {
                             playerBox.inflate(32.0), entity -> entity.isAlive());
                         int nearbyHostiles = 0;
                         int nearbyPlayers = 0;
+                        int foodAnimals = 0;
+                        int villagers = 0;
                         boolean creeperNearby = false;
                         java.util.LinkedHashSet<String> uniqueTypes = new java.util.LinkedHashSet<>();
                         java.util.LinkedHashSet<String> playerNames = new java.util.LinkedHashSet<>();
+                        // EVERY KIND SHE IS STANDING NEAR, for the bestiary host-side
+                        // keeps. Deliberately wider than the ranked list below: the cow
+                        // she will never remark on still counts towards "kinds of
+                        // creature i have actually met here", the same way a biome she
+                        // walks through counts towards country she has stood in.
+                        java.util.LinkedHashSet<String> creatureTypes = new java.util.LinkedHashSet<>();
+                        java.util.List<NearbyCreature> creatures = new java.util.ArrayList<>();
+                        java.util.List<NearbyPerson> people = new java.util.ArrayList<>();
+                        float yaw = p.getYRot();
                         for (net.minecraft.world.entity.Entity entity : nearby) {
+                            String path = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath();
+                            // the ranked readout is about CREATURES. arrows, orbs, boats
+                            // and item frames are all "alive" by the filter above and
+                            // none of them is somebody she can react to.
+                            if (entity instanceof net.minecraft.world.entity.LivingEntity living
+                                    && !(entity instanceof Player)) {
+                                if (creatureTypes.size() < CREATURE_TYPES_MAX) creatureTypes.add(path);
+                                double dist = p.distanceTo(entity);
+                                boolean named = entity.hasCustomName();
+                                boolean baby = living.isBaby();
+                                boolean tame = entity instanceof net.minecraft.world.entity.TamableAnimal pet
+                                        && pet.isTame();
+                                boolean isHostile = entity instanceof Monster;
+                                // IS IT ACTUALLY COMING FOR HER, or is it just in the
+                                // room? Different scene, and the count alone cannot
+                                // tell them apart. `getTarget()` would be the exact
+                                // answer and it is server-side - a client mod never
+                                // sees it - but `isAggressive()` rides the synced
+                                // entity flags, so it costs a field read and is true
+                                // for the case that matters: a provoked enderman is a
+                                // moment, an enderman minding its own business is
+                                // scenery.
+                                boolean aggro = entity instanceof net.minecraft.world.entity.Mob mob
+                                        && mob.isAggressive();
+                                creatures.add(new NearbyCreature(
+                                        entity.getId(), path, dist,
+                                        relativeDirection(entity.getX() - p.getX(),
+                                                entity.getZ() - p.getZ(), yaw),
+                                        entity.getY() - p.getY(), isHostile, baby, tame, aggro,
+                                        named ? entity.getCustomName().getString() : "",
+                                        creatureNotability(path, named, baby, tame, isHostile, aggro, dist)));
+                            }
                             if (entity instanceof Player other) {
                                 nearbyPlayers++;
                                 if (playerNames.size() < 8) {
                                     try { playerNames.add(other.getGameProfile().name()); } catch (Throwable ignored) { }
                                 }
+                                // ...and now keep the rest of what the sweep already
+                                // knows about them, instead of throwing it away and
+                                // reporting "1 players".
+                                try { people.add(describePerson(p, other, yaw, nearby)); } catch (Throwable ignored) { }
                             }
                             if (entity instanceof Monster hostile && hostileRange.intersects(hostile.getBoundingBox())) {
                                 nearbyHostiles++;
@@ -1438,12 +2370,98 @@ public class ExternalControlServer implements ClientModInitializer {
                             if (entity instanceof Creeper && creeperRange.intersects(entity.getBoundingBox())) {
                                 creeperNearby = true;
                             }
+                            // DINNER. counted by registry name rather than an Animal
+                            // instanceof, because the animal classes live in per-type
+                            // subpackages that move between versions and a registry key
+                            // does not. a pasture is a food source she can walk back to,
+                            // which is the point: when the fields are bare she still has
+                            // somewhere to go.
+                            if (FOOD_ANIMALS.contains(path)) {
+                                foodAnimals++;
+                            }
+                            // A VILLAGE, told apart from a player's base. surveyBuiltGround
+                            // can see that somebody built here and cannot say WHO - so
+                            // "built ground" covered a village, a spawn town and a
+                            // stranger's house identically, and burnt's only use for any
+                            // of them was to walk away. villagers are what make it a
+                            // village, and that is worth knowing for reasons other than
+                            // avoidance. counted by registry key, never instanceof: the
+                            // entity classes move between versions and a key does not.
+                            // folded into the sweep that already runs - no new scan.
+                            if (VILLAGE_ENTITIES.contains(path)) {
+                                villagers++;
+                            }
                         }
+                        // ⚠ THESE TWO ARRAYS ARE SENT ON EVERY POLL EVEN WHEN EMPTY.
+                        // The bridge merges gameState with Object.assign, so a field
+                        // that simply stops being sent keeps its last value forever -
+                        // which for this data means a creeper that despawned three
+                        // minutes ago is still reported four blocks behind her.
+                        JsonArray creatureArr = new JsonArray();
+                        for (NearbyCreature c : selectCreatures(creatures, CREATURES_MAX)) {
+                            JsonObject co = new JsonObject();
+                            co.addProperty("type", c.path());
+                            co.addProperty("dist", Math.round(c.dist() * 10.0) / 10.0);
+                            co.addProperty("dir", c.dir());
+                            if (Math.abs(c.dy()) >= ELEVATION_NOTE) {
+                                co.addProperty("vert", c.dy() > 0 ? "above" : "below");
+                            }
+                            if (c.score() >= NOTABLE_SCORE) co.addProperty("notable", true);
+                            // sent as its own flag rather than left implicit in the
+                            // score: host-side wants to treat "a warden is here" as a
+                            // scene in its own right, and a threshold on a number that
+                            // may be retuned is not a thing to hang that on.
+                            if (BOSS_CREATURES.contains(c.path())) co.addProperty("boss", true);
+                            if (c.hostile()) co.addProperty("hostile", true);
+                            if (c.aggro()) co.addProperty("aggro", true);
+                            if (c.baby()) co.addProperty("baby", true);
+                            if (c.tame()) co.addProperty("tame", true);
+                            if (!c.name().isEmpty()) co.addProperty("name", c.name());
+                            creatureArr.add(co);
+                        }
+                        gs.add("nearbyCreatures", creatureArr);
+                        JsonArray creatureTypeArr = new JsonArray();
+                        for (String type : creatureTypes) creatureTypeArr.add(type);
+                        gs.add("nearbyCreatureTypes", creatureTypeArr);
                         gs.addProperty("nearbyHostiles", nearbyHostiles);
                         gs.addProperty("nearbyPlayers", nearbyPlayers);
+                        gs.addProperty("foodAnimals", foodAnimals);
+                        gs.addProperty("villagers", villagers);
                         JsonArray playerNameArr = new JsonArray();
                         for (String name : playerNames) playerNameArr.add(name);
                         gs.add("nearbyPlayerNames", playerNameArr);
+                        // WHO IS ACTUALLY STANDING THERE, nearest first - the same
+                        // shape as nearbyCreatures, for the same reason.
+                        //
+                        // ⚠ SENT EVERY POLL EVEN WHEN EMPTY. the bridge merges
+                        // gameState with Object.assign, so a field that stops being
+                        // sent keeps its last value forever: somebody who logged off
+                        // three minutes ago would still read as stood beside her.
+                        people.sort(java.util.Comparator.comparingDouble(NearbyPerson::dist));
+                        JsonArray peopleArr = new JsonArray();
+                        for (NearbyPerson person : people) {
+                            if (peopleArr.size() >= PEOPLE_MAX) break;
+                            JsonObject po = new JsonObject();
+                            po.addProperty("name", person.name());
+                            if (!person.display().isEmpty() && !person.display().equals(person.name())) {
+                                po.addProperty("display", person.display());
+                            }
+                            po.addProperty("dist", Math.round(person.dist() * 10.0) / 10.0);
+                            po.addProperty("dir", person.dir());
+                            // same rule the creature readout uses: only report a
+                            // height difference big enough to be worth a word.
+                            if (Math.abs(person.dy()) >= 3.0) {
+                                po.addProperty("vert", person.dy() > 0 ? "above" : "below");
+                            }
+                            if (person.watching()) po.addProperty("watching", true);
+                            if (person.sneaking()) po.addProperty("sneaking", true);
+                            if (person.onFire()) po.addProperty("onFire", true);
+                            if (person.hurt()) po.addProperty("hurt", true);
+                            if (person.threats() > 0) po.addProperty("threats", person.threats());
+                            if (!person.holding().isEmpty()) po.addProperty("holding", person.holding());
+                            peopleArr.add(po);
+                        }
+                        gs.add("nearbyPeople", peopleArr);
                         JsonArray hostileTypes = new JsonArray();
                         for (String type : uniqueTypes) hostileTypes.add(type);
                         gs.add("nearbyHostileTypes", hostileTypes);
@@ -1453,6 +2471,20 @@ public class ExternalControlServer implements ClientModInitializer {
                             JsonObject hostileEvent = new JsonObject();
                             hostileEvent.addProperty("count", nearbyHostiles);
                             hostileEvent.add("types", hostileTypes);
+                            // WHICH WAY THE NEAREST ONE IS. a count with no bearing
+                            // reads the same whether they are thirty blocks off
+                            // behind a hill or one step behind her, so the reaction
+                            // had nothing to be about. this costs nothing - the sweep
+                            // above already measured every one of them.
+                            creatures.stream().filter(NearbyCreature::hostile)
+                                    .min(java.util.Comparator.comparingDouble(NearbyCreature::dist))
+                                    .ifPresent(closest -> {
+                                        hostileEvent.addProperty("nearestType", closest.path());
+                                        hostileEvent.addProperty("nearestDist",
+                                                Math.round(closest.dist() * 10.0) / 10.0);
+                                        hostileEvent.addProperty("nearestDir", closest.dir());
+                                        if (closest.aggro()) hostileEvent.addProperty("aggro", true);
+                                    });
                             sendEvent("hostiles_nearby", hostileEvent);
                         }
                         lastNearbyHostiles = nearbyHostiles;
@@ -1460,6 +2492,33 @@ public class ExternalControlServer implements ClientModInitializer {
                             lastCreeperEventAt = System.currentTimeMillis();
                             sendEvent("creeper_spotted", new JsonObject());
                         }
+                    } catch (Throwable ignored) { }
+
+                    // THE TAB LIST IS THE ROOM. see lastOnlineNames.
+                    try {
+                        java.util.Set<String> online = onlineNames(mc);
+                        gs.addProperty("onlinePlayers", online.size());
+                        JsonArray onlineArr = new JsonArray();
+                        int listed = 0;
+                        for (String name : online) {
+                            if (listed++ >= 24) break;
+                            onlineArr.add(name);
+                        }
+                        gs.add("onlinePlayerNames", onlineArr);
+                        java.util.Set<String> before = lastOnlineNames;
+                        // FIRST SIGHTING IS NOT AN ARRIVAL. the whole server is
+                        // "new" on the poll after she logs in, and announcing a
+                        // dozen joins she never saw happen is the seeding bug every
+                        // watcher in this codebase has had once. seed silently.
+                        if (before != null) {
+                            for (String name : online) {
+                                if (!before.contains(name)) sendPlayerRosterEvent("player_joined", name, online.size());
+                            }
+                            for (String name : before) {
+                                if (!online.contains(name)) sendPlayerRosterEvent("player_left", name, online.size());
+                            }
+                        }
+                        lastOnlineNames = online;
                     } catch (Throwable ignored) { }
 
                     try {
@@ -1474,8 +2533,19 @@ public class ExternalControlServer implements ClientModInitializer {
                         double nearestOreD = Double.MAX_VALUE, logsD = Double.MAX_VALUE, waterD = Double.MAX_VALUE,
                                lavaD = Double.MAX_VALUE, craftD = Double.MAX_VALUE, furnaceD = Double.MAX_VALUE,
                                chestD = Double.MAX_VALUE, bedD = Double.MAX_VALUE,
-                               smokerD = Double.MAX_VALUE, campfireD = Double.MAX_VALUE, wheatD = Double.MAX_VALUE;
-                        int wheatCount = 0;
+                               smokerD = Double.MAX_VALUE, campfireD = Double.MAX_VALUE, hayD = Double.MAX_VALUE;
+                        // ⚠ RIPE IS A SEPARATE FACT FROM PRESENT, and reporting only the
+                        // second is what marched her to a harvested field forever. the block
+                        // id `wheat` covers age 0 through 7; AltoClef refuses to break
+                        // anything short of max age (CollectCropTask.validCrop), so a field
+                        // she just harvested and replanted still read as "wheat here!" while
+                        // being worth exactly nothing. count both, send both.
+                        // index: 0 wheat, 1 carrots, 2 potatoes, 3 beetroots, 4 berries
+                        final String[] cropIds = { "wheat", "carrots", "potatoes", "beetroots", "sweet_berry_bush" };
+                        final String[] cropKeys = { "wheat", "carrot", "potato", "beetroot", "berries" };
+                        double[] cropD = { Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE };
+                        int[] cropCount = new int[cropIds.length];
+                        int[] cropRipe = new int[cropIds.length];
                         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
                         int bx = bp.getX(), by = bp.getY(), bz = bp.getZ();
                         for (int dx = -R; dx <= R; dx++) for (int dz = -R; dz <= R; dz++) for (int dy = -RY; dy <= RY; dy++) {
@@ -1494,9 +2564,21 @@ public class ExternalControlServer implements ClientModInitializer {
                             else if (id.equals("furnace") || id.equals("blast_furnace")) { if (d2 < furnaceD) furnaceD = d2; }
                             else if (id.equals("smoker")) { if (d2 < smokerD) smokerD = d2; }
                             else if (id.equals("campfire") || id.equals("soul_campfire")) { if (d2 < campfireD) campfireD = d2; }
-                            else if (id.equals("wheat")) { wheatCount++; if (d2 < wheatD) wheatD = d2; }
+                            // a hay bale is nine wheat that needs no growing at all, and
+                            // CollectWheatTask already prefers them - so a haystack is a
+                            // bread source worth walking to.
+                            else if (id.equals("hay_block")) { if (d2 < hayD) hayD = d2; }
                             else if (id.equals("chest") || id.equals("trapped_chest") || id.equals("barrel") || id.equals("ender_chest")) { if (d2 < chestD) chestD = d2; }
                             else if (id.endsWith("_bed")) { if (d2 < bedD) bedD = d2; }
+                            else {
+                                for (int ci = 0; ci < cropIds.length; ci++) {
+                                    if (!id.equals(cropIds[ci])) continue;
+                                    cropCount[ci]++;
+                                    if (d2 < cropD[ci]) cropD[ci] = d2;
+                                    if (isHarvestable(state)) cropRipe[ci]++;
+                                    break;
+                                }
+                            }
                         }
                         JsonObject nb = new JsonObject();
                         if (nearestOre != null) {
@@ -1519,9 +2601,15 @@ public class ExternalControlServer implements ClientModInitializer {
                         if (bedD < Double.MAX_VALUE) nb.addProperty("bed", (int) Math.round(Math.sqrt(bedD)));
                         if (smokerD < Double.MAX_VALUE) nb.addProperty("smoker", (int) Math.round(Math.sqrt(smokerD)));
                         if (campfireD < Double.MAX_VALUE) nb.addProperty("campfire", (int) Math.round(Math.sqrt(campfireD)));
-                        if (wheatD < Double.MAX_VALUE) {
-                            nb.addProperty("wheat", (int) Math.round(Math.sqrt(wheatD)));
-                            nb.addProperty("wheatCount", wheatCount);
+                        if (hayD < Double.MAX_VALUE) nb.addProperty("hay", (int) Math.round(Math.sqrt(hayD)));
+                        for (int ci = 0; ci < cropIds.length; ci++) {
+                            if (cropD[ci] == Double.MAX_VALUE) continue;
+                            // `wheat`/`wheatCount` keep their old names and meanings so an
+                            // older burnt reads this jar unchanged; `<crop>Ripe` is the new
+                            // fact, and its ABSENCE means "this jar cannot tell", never zero.
+                            nb.addProperty(cropKeys[ci], (int) Math.round(Math.sqrt(cropD[ci])));
+                            nb.addProperty(cropKeys[ci] + "Count", cropCount[ci]);
+                            nb.addProperty(cropKeys[ci] + "Ripe", cropRipe[ci]);
                         }
                         gs.add("nearby", nb);
                     } catch (Throwable ignored) { }
@@ -1533,7 +2621,7 @@ public class ExternalControlServer implements ClientModInitializer {
                     // the first shell that is mostly solid, so a cave or a hillside ends
                     // the scan almost immediately and only a genuine hall costs anything.
                     // the floor is deliberately excluded - a room needs one.
-                    try { gs.addProperty("clearEdge", measureClearEdge(mc)); } catch (Throwable ignored) { }
+                    try { gs.addProperty("clearEdge", clearEdge(mc)); } catch (Throwable ignored) { }
                     // Exact, component-level toaster construction state. Unlike
                     // clearEdge this distinguishes floor/walls/roof, the two top
                     // slots, walk-through, wall torches, the appliance gallery,
@@ -1556,7 +2644,41 @@ public class ExternalControlServer implements ClientModInitializer {
                     sendEvent("damage_taken", damage);
                 }
                 boolean dead = p.isDeadOrDying() || health <= 0;
-                if (dead && !wasDead) sendEvent("death", new JsonObject());
+                if (dead && !wasDead) {
+                    // ⚠ THE DEATH EVENT USED TO BE AN EMPTY OBJECT, and host-side
+                    // `_rememberMilestone` does `data.cause || data.killer || label`
+                    // where label is the string "died" - so semantic memory was being
+                    // written the sentence "burnt died in minecraft to died at x,y,z".
+                    // Asked how she died, that is what she got back, and being killed
+                    // by a player was indistinguishable from falling in lava.
+                    //
+                    // The damage source is available at exactly this moment and knows
+                    // all of it, so nothing has to be inferred or waited for. (The
+                    // death SCREEN has the same sentence, but it appears later than
+                    // this branch fires, which is why reading it there was the wrong
+                    // place to look.)
+                    JsonObject death = new JsonObject();
+                    death.add("position", pos);
+                    try {
+                        net.minecraft.world.damagesource.DamageSource src = p.getLastDamageSource();
+                        if (src != null) {
+                            death.addProperty("cause", src.getMsgId());
+                            net.minecraft.world.entity.Entity killer = src.getEntity();
+                            if (killer != null) {
+                                death.addProperty("killer", killer.getName().getString());
+                                death.addProperty("killerType",
+                                    BuiltInRegistries.ENTITY_TYPE.getKey(killer.getType()).getPath());
+                                death.addProperty("byPlayer", killer instanceof Player);
+                            }
+                            // the real sentence, the one the death screen shows
+                            death.addProperty("message", src.getLocalizedDeathMessage(p).getString());
+                        }
+                    } catch (Throwable ignored) {
+                        // a death with no cause is still a death - never let this
+                        // throw and lose the event itself
+                    }
+                    sendEvent("death", death);
+                }
                 if (!dead && wasDead) {
                     JsonObject respawn = new JsonObject();
                     respawn.add("position", pos);
@@ -1571,6 +2693,37 @@ public class ExternalControlServer implements ClientModInitializer {
                 lastHealth = health;
                 lastHunger = hunger;
                 wasDead = dead;
+
+                // ⚠ COMBAT WAS ENTIRELY MUTE. `entity_killed` has a host-side
+                // handler, a stats counter, a `recently:` label, an affect delta, a
+                // three-minute reasoning gap AND a written cue - and nothing ever
+                // emitted it, so she killed the skeleton chasing her and said nothing,
+                // ever. The most-watched thing she does had no voice at all.
+                //
+                // `getLastHurtMob()` is the mob SHE last hit (vanilla keeps it for 100
+                // ticks), so a kill needs no entity scan: watch that one entity and
+                // report it once when it goes down. Cheap, and it cannot credit her
+                // with a kill she had no hand in.
+                try {
+                    net.minecraft.world.entity.LivingEntity victim = p.getLastHurtMob();
+                    if (victim != null && victim.isDeadOrDying()) {
+                        int vid = victim.getId();
+                        if (vid != lastReportedKillId) {
+                            lastReportedKillId = vid;
+                            JsonObject killed = new JsonObject();
+                            killed.addProperty("type",
+                                BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType()).getPath());
+                            killed.addProperty("name", victim.getName().getString());
+                            killed.addProperty("hostile", victim instanceof Monster);
+                            killed.addProperty("player", victim instanceof Player);
+                            sendEvent("entity_killed", killed);
+                        }
+                    } else if (victim == null) {
+                        // the 100-tick memory expired: the next kill is a new one even
+                        // if the game reuses that entity id.
+                        lastReportedKillId = Integer.MIN_VALUE;
+                    }
+                } catch (Throwable ignored) { }
 
                 JsonObject env = new JsonObject();
                 env.addProperty("type", "state");
@@ -1588,8 +2741,103 @@ public class ExternalControlServer implements ClientModInitializer {
         JsonObject d = new JsonObject();
         d.addProperty("duration", e.durationSeconds);
         d.addProperty("task", String.valueOf(e.lastTaskRan));
+        // present only when the task was torn down rather than completed, so
+        // host-side can tell "done" from "gave up" instead of retrying a job
+        // that can never finish.
+        if (e.abortReason != null) d.addProperty("abortReason", e.abortReason);
         sendEvent("task_finished", d);
     }
+
+    /**
+     * She broke a block. Counter + recent line only, throttled to a trickle.
+     *
+     * A mining trip is thousands of swings; burnt's `recentEvents` keeps eight slots
+     * and they hold things like "finished the wheat field" and "MarDotIO asked me for
+     * bread". So this is deliberately stingy - it exists so `blocksMined` is a real
+     * number and so "mining stone" appears in the recent line at all, not so every
+     * cobblestone gets a mention.
+     */
+    private void onBlockBroken(BlockBrokenEvent e) {
+        try {
+            if (e == null || e.blockState == null) return;
+            Minecraft mc = Minecraft.getInstance();
+            // her swings only - another player breaking a block nearby is not her doing
+            if (e.player == null || mc.player == null || e.player != mc.player) return;
+            long now = System.currentTimeMillis();
+            if (now - lastBlockEventAt < 5000L) return;
+            lastBlockEventAt = now;
+            JsonObject d = new JsonObject();
+            d.addProperty("block", BuiltInRegistries.BLOCK.getKey(e.blockState.getBlock()).getPath());
+            if (e.blockPos != null) d.add("position", posJson(e.blockPos));
+            sendEvent("block_broken", d);
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * She walked into a dropped item, which in vanilla is how a pickup happens.
+     *
+     * Two events come out of this: a throttled `item_collected` (counter + recent
+     * line), and an UNTHROTTLED `rare_find` for the short list of things a streamer
+     * actually reacts to. `rare_find` already had a cue and a 60s gap host-side and
+     * nothing ever emitted it, so the one moment most worth a reaction - the
+     * ancient debris, the totem, the elytra - was the one moment she could not see.
+     */
+    private void onCollidedWithEntity(PlayerCollidedWithEntityEvent e) {
+        try {
+            if (e == null || !(e.other instanceof net.minecraft.world.entity.item.ItemEntity item)) return;
+            Minecraft mc = Minecraft.getInstance();
+            if (e.player == null || mc.player == null || e.player != mc.player) return;
+            ItemStack stack = item.getItem();
+            if (stack == null || stack.isEmpty()) return;
+            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+            long now = System.currentTimeMillis();
+            if (RARE_FINDS.contains(id)) {
+                JsonObject rare = new JsonObject();
+                rare.addProperty("name", id.replace('_', ' '));
+                rare.addProperty("item", id);
+                rare.addProperty("count", stack.getCount());
+                sendEvent("rare_find", rare);
+                return;     // a totem is not a routine pickup; don't also count it as one
+            }
+            if (now - lastPickupEventAt < 4000L) return;
+            lastPickupEventAt = now;
+            JsonObject d = new JsonObject();
+            d.addProperty("item", id);
+            d.addProperty("count", stack.getCount());
+            sendEvent("item_collected", d);
+        } catch (Throwable ignored) { }
+    }
+
+    // "Burnt has made the advancement [Stone Age]" / "...completed the challenge
+    // [The End?]" / "...reached the goal [Sky's the Limit]". All three verbs, because
+    // vanilla uses a different one per advancement frame.
+    private static final java.util.regex.Pattern ADVANCEMENT_NOTICE = java.util.regex.Pattern.compile(
+        "^(\\S+) has (?:made the advancement|completed the challenge|reached the goal) \\[(.+)\\]$");
+
+    private static String mcPlayerName() {
+        try {
+            LocalPlayer p = Minecraft.getInstance().player;
+            return p == null ? null : p.getName().getString();
+        } catch (Throwable ignored) { return null; }
+    }
+
+    private static JsonObject posJson(BlockPos bp) {
+        JsonObject pos = new JsonObject();
+        pos.addProperty("x", bp.getX());
+        pos.addProperty("y", bp.getY());
+        pos.addProperty("z", bp.getZ());
+        return pos;
+    }
+
+    // THINGS WORTH A REACTION. Deliberately short: the value of `rare_find` is that
+    // it almost never fires, so it never has to be throttled into meaninglessness.
+    // Diamonds are absent on purpose - `diamond_found` already covers the ore, and
+    // the pickup would double it.
+    private static final java.util.Set<String> RARE_FINDS = java.util.Set.of(
+        "ancient_debris", "netherite_scrap", "netherite_ingot", "elytra",
+        "totem_of_undying", "enchanted_golden_apple", "nether_star", "dragon_egg",
+        "trident", "heart_of_the_sea", "music_disc_pigstep", "budding_amethyst"
+    );
 
     private void onChatMessage(ChatMessageEvent e) {
         try {
@@ -1599,13 +2847,12 @@ public class ExternalControlServer implements ClientModInitializer {
 
     // THE NAME A SERVER SHOWS IS NOT THE NAME A SERVER STORES.
     //
-    // every rank/nick plugin renders "<(Member) » Nightjar_> hi" while the mojang
+    // every rank/nick plugin renders "<(Member) » Aereon42> hi" while the mojang
     // account behind that line is something else entirely - GameProfile.name()
-    // returned "mc_a41f9c", a string not one person in that room has ever
-    // seen. reading the speaker off the profile made her answer Nightjar_ by an
-    // account name nobody in the room uses, and filed ONE human under TWO names
-    // (chat under the account name, the join line under the nick, both of them
-    // in her roster at once).
+    // returned "ShadowAliceZ", a string not one person in that room has ever
+    // seen. reading the speaker off the profile made burnt answer Aereon42 as
+    // "shadow" and filed ONE human under TWO names (chat under the account name,
+    // the join line under the nick, both of them in her roster at once).
     //
     // so the speaker is resolved from the line the client actually RENDERS -
     // params.decorate() is the exact component minecraft draws on screen - and
@@ -1635,7 +2882,75 @@ public class ExternalControlServer implements ClientModInitializer {
         if (who != null) emitChatEvent(who, body);
     }
 
-    // "(Member) » Nightjar_" / "[VIP] Bob" -> the username at the end. ranks and
+    /**
+     * Who the tab list says is on the server, by the name people actually call
+     * them.
+     *
+     * Resolved the same way a chat speaker is (see emitPlayerChat): the RENDERED
+     * tab entry first, the mojang account name only as a fallback. Taking the
+     * profile name outright is what once filed one human under two names - the
+     * account behind "Aereon42" is "ShadowAliceZ" - and a greeting has to use the
+     * name the room uses or it reads as talking about a stranger.
+     *
+     * "Listed" rather than every connection: that is the list a human sees, so a
+     * vanished admin does not get greeted into a room that cannot see them.
+     */
+    private static java.util.Set<String> onlineNames(Minecraft mc) {
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        var connection = mc.getConnection();
+        if (connection == null) return names;
+        String self = null;
+        try { self = mc.getGameProfile() == null ? null : mc.getGameProfile().name(); } catch (Throwable ignored) { }
+        for (net.minecraft.client.multiplayer.PlayerInfo info : connection.getListedOnlinePlayers()) {
+            String name = null;
+            try {
+                var shown = info.getTabListDisplayName();
+                if (shown != null) name = lastNameToken(shown.getString());
+            } catch (Throwable ignored) { }
+            if (name == null) {
+                try { name = info.getProfile().name(); } catch (Throwable ignored) { }
+            }
+            if (name == null || name.isBlank()) continue;
+            // she is not company for herself
+            if (self != null && name.equalsIgnoreCase(self)) continue;
+            names.add(name);
+        }
+        return names;
+    }
+
+    private void sendPlayerRosterEvent(String event, String player, int onlineCount) {
+        JsonObject d = new JsonObject();
+        d.addProperty("player", player);
+        d.addProperty("online", onlineCount);
+        sendEvent(event, d);
+    }
+
+    /**
+     * "joined the game" / "left the game" and the shapes other servers use for
+     * the same thing.
+     *
+     * These arrive as SYSTEM messages, and the plugin-chat parser matches them
+     * perfectly - "&lt;(AI) » SomePlayer&gt; joined the game" is exactly the shape of
+     * somebody called SomePlayer saying the words "joined the game". So burnt heard
+     * a sentence and answered it, echoing the server back at itself: "left the
+     * game. dramatic exit for someone who wasn't even holding a torch" (live,
+     * 2026-08-05). The roster diff above reports arrivals properly; this stops
+     * the same fact arriving a second time disguised as conversation.
+     *
+     * Deliberately narrow. "left" and "joined" start plenty of real sentences -
+     * "left the base at 5", "joined the discord" - so the notice has to be the
+     * WHOLE message, not a prefix of it. Eating somebody's actual line is a worse
+     * failure than letting an unusual server's join format through: the roster
+     * diff has already reported the arrival either way, so the cost of a miss here
+     * is one duplicated cue, and the cost of a false positive is her going deaf to
+     * a person mid-sentence.
+     */
+    private static final java.util.regex.Pattern CONNECTION_NOTICE = java.util.regex.Pattern.compile(
+        "^\\s*(?:has\\s+)?(?:joined|left|disconnected|reconnected|quit)"
+            + "(?:\\s+the\\s+(?:game|server|world))?\\s*[.!]?\\s*$",
+        java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    // "(Member) » Aereon42" / "[VIP] Bob" -> the username at the end. ranks and
     // separators are decoration; the last bare word is the person.
     private static String lastNameToken(String decorated) {
         if (decorated == null) return null;
@@ -1657,6 +2972,8 @@ public class ExternalControlServer implements ClientModInitializer {
         // two different strings for one thing said, so an exact-match dedup counts
         // two lines and burnt answers both.
         text = stripOwnDecoration(sender, text);
+        // a connection notice is not a sentence somebody said. see CONNECTION_NOTICE.
+        if (CONNECTION_NOTICE.matcher(text).matches()) return;
         long now = System.currentTimeMillis();
         String key = chatKey(text);
         // her own line coming back off the server is not somebody talking to her
@@ -1698,11 +3015,11 @@ public class ExternalControlServer implements ClientModInitializer {
     // most community servers (plugin chat formats, offline-mode) deliver chat
     // as SYSTEM text, not signed player chat - recognize the common rendered
     // shapes: "<Name> msg", "Name: msg", "[Rank] Name: msg", "[Rank] Name » msg"
-    // real servers decorate the speaker: "<(Member) » Nightjar_> hi", "[VIP] Bob: hi",
+    // real servers decorate the speaker: "<(Member) » Aereon42> hi", "[VIP] Bob: hi",
     // "Bob » hi". the old pattern only accepted a bare "<Name>", so every
     // plugin-formatted line failed to match and fell through to the
     // last-known-sender fallback - which attributed other people's messages to
-    // the WRONG player (observed: Nightjar_'s line arriving as mc_a41f9c).
+    // the WRONG player (observed: Aereon42's line arriving as ShadowAliceZ).
     // the name group must sit immediately before '>', so the token captured is
     // the LAST one inside the brackets - which is where the real username sits in
     // every rank format seen. verified against the live server's exact lines.
@@ -1845,6 +3162,10 @@ public class ExternalControlServer implements ClientModInitializer {
         lastWeather = "";
         lastNearbyHostiles = 0;
         lastDiamondCount = -1;
+        // null, not empty: an empty set is a room she has SEEN and found empty, so
+        // reconnecting into a busy server would report every player as a fresh
+        // arrival. null re-seeds silently on the next poll.
+        lastOnlineNames = null;
     }
 
     private static int resolvePort() {

@@ -168,6 +168,17 @@ public abstract class DoStuffInContainerTask extends Task {
         return _cachedContainerPosition;
     }
 
+    /**
+     * the container we've settled on and are actively working inside.
+     * a parent ResourceTask reads this so it never generically loots the very
+     * furnace we're mid-smelt in - the smelt task pulls its own output, and
+     * looting it instead tears the smelt down and re-opens the screen for every
+     * ingot that pops.
+     */
+    public boolean isWorkingInContainer(BlockPos pos) {
+        return pos != null && pos.equals(_cachedContainerPosition);
+    }
+
     @Override
     protected void onStop(AltoClef mod, Task interruptTask) {
         mod.getBehaviour().pop();

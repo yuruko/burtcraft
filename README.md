@@ -8,7 +8,7 @@ ambushed, takes requests from chat, and can tell you what it is doing while it
 does it. It is packaged here so you can bolt it onto *your* VTuber instead.
 
 The hard part of "AI plays Minecraft" is not the AI. It is that Minecraft has no
-API. This repo is the missing plumbing, plus a 7,200-line autonomy brain that
+API. This repo is the missing plumbing, plus a 14,000-line autonomy brain that
 already knows how to survive.
 
 ```
@@ -24,6 +24,9 @@ already knows how to survive.
 |---|---|
 | **A wire protocol** | Newline-delimited JSON over localhost. Documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). |
 | **A Node library** | `core/` — ws server, live game state, durable place/settlement memory, and an autonomy loop. No LLM calls, database, HTTP, or dialogue opinions. |
+| **Perception worth reacting to** | who and what is standing around it and *which way*, who is watching it, a bestiary of first sightings, remembered places and food spots, and what the sky is doing — sunrise, golden hour, moon phase, time until dark. |
+| **A noticings board** | perceptions become ranked, decaying candidates instead of racing for one speech slot, so the loser of a moment comes back later instead of being dropped forever. Your brain is handed a shortlist and picks one, or none. |
+| **Goals it actually keeps** | a resumable goal ledger, so "make the wheat farm" survives a creeper, a re-task and a restart — rather than being forgotten the moment something interrupts it. |
 | **A relay** | `bridge/` — translates actions into real AltoClef commands and back. |
 | **An in-game mod** | `altoclef/src/main/java/adris/altoclef/external/ExternalControlServer.java` — the only piece that runs inside Minecraft. `mod/` documents it. |
 | **Two vendored forks** | `altoclef/` and `baritone/`, patched for Minecraft 26.1.2 and for not swimming across oceans. See [NOTICE](NOTICE). |
@@ -141,20 +144,38 @@ A toaster is an idempotently repaired rectangular stone prism with a clear
 interior, a two-wide doorless walk-through, two long roof slots, wall torches
 lighting the inside, and a 10-block clear yard on every side.
 
-**The footprint is a fixed ASCII floorplan and never changes size** — homestead
-14x9x8, outpost 12x7x6. Every fixture position is read off that map: 72
-appliance blocks (6 chests, 54 furnaces, 12 smokers), 36 wall torches and a
-two-bed nook for the homestead; 48, 24 and one bed for an outpost. Each
-appliance slot is a **column of three**, installed bottom course first
-(a block in mid-air has no face to click on), rotating chest → furnace → smoker.
+**The footprint is a fixed plan and never changes size.** The homestead used to
+grow a block of width per furnace, up to 43x20x12 — which meant it re-laid its
+own house two dozen times and never finished one. A fixed plan is the fix, so
+outposts are smaller by construction rather than by check.
 
-The homestead used to grow a block of width per furnace, up to 43x20x12 — which
-meant it re-laid its own house two dozen times and never finished one. A fixed
-plan is the fix, so outposts are smaller by construction rather than by check.
+There are two plans, and a settlement **carries the version it was built to**:
 
-> The floorplan lives in **two** places and they must stay byte-identical:
+| | footprint | what it is |
+|---|---|---|
+| **v1** | 14x9x8 (outpost 12x7x6) | the flat ASCII floorplan. 72 appliance blocks, 36 wall torches, a two-bed nook |
+| **v2** *(default for a new build)* | 13x21x11 | the layered toaster: stages SHELL → LIVED_IN → KITCHEN → FULL, 355 appliance blocks, 106 torches, shell material climbing cobblestone → smooth stone → stone brick → iron block |
+
+Every fixture position is read off the plan. Each appliance slot is a **column of
+three**, installed bottom course first — a block in mid-air has no face to click
+on, and the one below it is that face.
+
+> ⚠ **`planVersion` is what keeps an existing house standing.** A saved v1 record
+> rehydrated at v2 would be "13x21x11 at the old anchor", and the bot would build
+> the big toaster on top of the house it lives in. `settlementFromJSON` is the one
+> place that defaults to v1, because a constructor cannot tell rehydration from
+> creation. The version has to reach the wire too: `build_settlement` carries
+> `planVersion`, or the bridge resolves every homestead to the latest plan.
+
+> v1's floorplan lives in **two** places and they must stay byte-identical:
 > `core/settlements.js` and `altoclef/.../settlement/ToasterGeometry.java`.
-> Edit one, edit the other.
+> v2 is **generated into both languages from one schematic**, so there is no
+> parity to hand-maintain.
+
+Beyond toasters, `build_plan <id> x y z` puts up procedural blueprints
+(`simple_shelter`, `wood_house`, `fancy_wood_house`, `stone_outpost`,
+`wood_outpost`), and `farm create|expand` builds a hydrated wheat plot on
+vanilla's real 4-block rule without breaking anything a person placed.
 
 ```js
 await mc.executeAction('set_home', { target: 'main toaster' });
@@ -175,7 +196,7 @@ of trusting inventory or an elapsed timer.
 
 ## Wiring it into your VTuber
 
-There are exactly five seams. You do not need to read the 7,200-line file.
+There are exactly five seams. You do not need to read the 14,000-line file.
 
 ```js
 import { MinecraftTool } from 'burtcraft/core';
@@ -356,9 +377,14 @@ without the other and the two halves dial different ports.
 | `ALTOCLEF_CONTROL_PORT` | companion | `7440` | in-game tcp port it listens on |
 | `ALTOCLEF_HOST` / `ALTOCLEF_PORT` | bridge | `127.0.0.1` / `7440` | where the bridge dials the game |
 | `BOT_NAMES` | core | *(none)* | comma-separated names she answers to in chat |
-| `MINECRAFT_OWNER` | core | *(none)* | in-game username for a bare "follow me" |
+| `MINECRAFT_OWNER` | core | *(none)* | in-game username of whoever owns the bot |
+| `MINECRAFT_OWNER_ALIASES` | core | *(none)* | other names the same person goes by, comma-separated |
+| `MINECRAFT_HOME_SERVER` | core | *(none)* | host that counts as "her own" server, not a guest on somebody's box |
+| `MINECRAFT_HOME_SERVER_NAME` | core | *(none)* | what to call it |
 | `MINECRAFT_SPAWN_CENTER` | core | `0,0` | centre of the spawn keep-out box (multiplayer) |
 | `MINECRAFT_SPAWN_EXCLUSION` | core | `1000` | half-width of that box; `0` disables it |
+| `MINECRAFT_TRENCH_ENABLED` | core | off | dig a defensive moat around a settlement — see below |
+| `MINECRAFT_TIC_FREQUENCY` | core | low | how often it fidgets on camera (0..1) |
 | `MINECRAFT_BRIDGE_ORPHAN_MS` | bridge | `90000` | how long an unowned task may run before the bridge stops it |
 | `MINECRAFT_BRIDGE_ORPHAN_STARTUP_MS` | bridge | `600000` | grace for the same check after launch |
 | `BURTCRAFT_INTENT_HUD` | companion | on | on-screen "what I'm doing and why" line |
@@ -366,6 +392,37 @@ without the other and the two halves dial different ports.
 | `BURTCRAFT_KEEP_RENDERING` | companion | on | stop the game throttling to 10fps while unfocused |
 | `BURTCRAFT_HIDE_TUTORIAL` | companion | on | suppress vanilla tutorial toasts on stream |
 | `BURTCRAFT_VANITY_CAMERA` | companion | on | small camera niceties for a watchable shot |
+
+⚠ `MINECRAFT_TRENCH_ENABLED` ships **off** on purpose. Switching it on makes
+every settlement already standing read as incomplete and start a ~1240-block
+dig. Reach it per-build with `build_settlement { trench: true }` instead, or as
+the `defense_trench` upgrade, unless you actually want every base retrofitted.
+
+### Flavor lines — the library ships none
+
+The autonomy loop has a handful of moments it would happily narrate: baking
+bread, walking out to unseen ground, standing guard, giving up on a loop. **No
+dialogue ships with this repo.** An unregistered key yields `null`, the cue is
+dropped, and the bot simply acts. That is the intended default — see
+[Never speak a pre-written string](#never-speak-a-pre-written-string).
+
+If you want the loop to hand your brain a starting point, register your own:
+
+```js
+import { setFlavorLines } from 'burtcraft/core';
+
+setFlavorLines({
+  bread:         ['<your line for: putting bread on>'],
+  scout:         ['<your line for: heading out to unseen ground>'],
+  hold_station:  ['<your line for: standing guard, nothing happening>'],
+  'loop-break':  ['<your line for: giving up on something that is going nowhere>'],
+  'oven-install': ['<your line for: installing a new furnace>'],
+});
+```
+
+Keys: `bread`, `offbread_<kind>`, `oven-install`, `oven-<kind>`, `scout`,
+`hold_station`, `loop-break`. These are **cues**, not lines to speak — the same
+rule as every other cue this library emits.
 
 ### The spawn keep-out box
 

@@ -548,9 +548,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             int max = Baritone.settings().buildRepeatCount.value;
             numRepeats++;
             if (repeat.equals(new Vec3i(0, 0, 0)) || (max != -1 && numRepeats >= max)) {
-                // BURNT: logDirect is IN-GAME CHAT, which is on stream and never
-                // reaches latest.log, so every reason the builder quits has been
-                // invisible to us. The three that matter go to stdout as well.
+                // logDirect is IN-GAME CHAT, which is on stream and never reaches
+                // latest.log, so every reason the builder quits has been invisible
+                // to us. The three that matter go to stdout as well.
                 System.out.println("[baritone builder] done building (nothing incorrect left) at origin " + origin);
                 logDirect("Done building");
                 if (Baritone.settings().notificationOnBuildFinished.value) {
@@ -805,7 +805,17 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     private Goal assemble(BuilderCalculationContext bcc, List<BlockState> approxPlaceable, boolean logMissing) {
-        List<BetterBlockPos> placeable = new ArrayList<>();
+        // BURNT: a Set, not a List, purely because of the membership test twelve
+        // lines below. assemble() is called from onTick - twice on the tick where
+        // the first call comes back null - and `placeable.contains` on an
+        // ArrayList is a linear walk of the very list the forEach is iterating,
+        // i.e. O(n^2) every tick. at the stock incorrectSize (100) that is ~10k
+        // comparisons a tick and nobody notices, which is also precisely why that
+        // cap cannot be lifted while this is a List: a settlement schematic is
+        // thousands of cells, and 3000^2 twice a tick at 20tps is a dropped
+        // framerate on stream. LinkedHashSet keeps the iteration order
+        // deterministic so the goal composite is stable between ticks.
+        Set<BetterBlockPos> placeable = new LinkedHashSet<>();
         List<BetterBlockPos> breakable = new ArrayList<>();
         List<BetterBlockPos> sourceLiquids = new ArrayList<>();
         List<BetterBlockPos> flowingLiquids = new ArrayList<>();
@@ -1175,8 +1185,6 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     /**
-     * BURNT: added, with canSupply() below and its two call sites in assemble().
-     *
      * Would the item that places {@code have} also be able to place {@code want}?
      *
      * One item can place two DIFFERENT blocks depending on the face it is

@@ -675,7 +675,7 @@ public class TaskCatalogue {
         // silently includes everything CRAFTABLE that happens to be placeable.
         //
         // that is why "@get torch" sent her hunting for torches to smash instead of
-        // making them out of coal and sticks (2026-08-01), and the same applied
+        // making them out of coal and sticks (the operator, 2026-08-01), and the same applied
         // to crafting_table, chest, planks, ladders, beds - anything with a recipe.
         // on a shared server that is not a shortcut, it is stealing the furniture off
         // somebody's base, and it is a direct source of the "You are not allowed to

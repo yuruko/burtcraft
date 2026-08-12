@@ -5,9 +5,13 @@ import adris.altoclef.Debug;
 import adris.altoclef.TaskCatalogue;
 import adris.altoclef.tasks.InteractWithBlockTask;
 import adris.altoclef.tasks.construction.settlement.Settlement;
+import adris.altoclef.tasks.construction.settlement.ToasterLayout;
+import adris.altoclef.tasks.construction.settlement.ToasterTier;
 import adris.altoclef.tasks.movement.GetWithinRangeOfBlockTask;
 import adris.altoclef.tasksystem.ITaskRequiresGrounded;
 import adris.altoclef.tasksystem.Task;
+import baritone.api.BaritoneAPI;
+import baritone.api.Settings;
 import baritone.api.process.IBuilderProcess;
 import baritone.api.schematic.AbstractSchematic;
 import com.google.gson.JsonObject;
@@ -40,6 +44,17 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
      * behind the house and never converge on a shaft.
      */
     private static final int QUARRY_ARRIVED_RANGE = 6;
+    /**
+     * Hard ceiling on the widened incorrectSize - see {@link #widenBuilderSurvey}.
+     *
+     * This is a real limit, not a formality. incorrectPositions is walked by
+     * BuilderProcess#assemble, which runs from onTick and TWICE on the tick where
+     * the first call comes back null, so every entry is paid for ~20-40 times a
+     * second. The trench box is the largest thing we hand it at roughly 9500
+     * cells, so this leaves headroom for a bigger plan without ever letting a
+     * malformed schematic ask for an unbounded per-tick walk.
+     */
+    private static final int SURVEY_CELL_CEILING = 16384;
     /** An unreachable goto never fails, so the walk to the quarry is timed. */
     private static final long QUARRY_WALK_BUDGET_MS = 90_000L;
     private static final int STONE_BATCH = 192;
@@ -91,6 +106,48 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
      * refuses a torch is now rare enough that a short turn costs nothing.
      */
     private static final long TORCH_ATTEMPT_MS = 12_000L;
+    /**
+     * How long she may stand IN REACH of a spot with nothing appearing.
+     *
+     * THE CLOCK MUST NOT RUN DURING THE ONE STATE THAT PROVES THE SPOT IS FINE.
+     * TORCH_ATTEMPT_MS used to be plain elapsed time over the whole attempt -
+     * path computation, the walk, the approach AND the click - so arriving late
+     * left her a sliver of it to actually place in. Live:
+     *
+     *   19:21:25  interact ... 492,68,3376 dir east: waiting for click
+     *   19:21:28  side light at 493,68,3376 will not take a torch, trying another
+     *
+     * Three seconds. She had walked to the wall, was aiming at the face with a
+     * torch in her hand, and the deferral fired anyway - then that spot was
+     * written off as impossible after three rounds of the same. The give-up
+     * measured travel and blamed the block.
+     *
+     * Being in reach is arrival: the goal was satisfiable, she satisfied it, and
+     * the only question left is whether the face takes a torch - which resolves
+     * in a tick or two, or never. Eight seconds covers the equip, the look and a
+     * retry (InteractWithBlockTask's own click timer is five), and is still a
+     * definite end for a face that genuinely refuses.
+     */
+    private static final long TORCH_REACH_MS = 8_000L;
+    /**
+     * The one budget that runs no matter what she is doing.
+     *
+     * TORCH_ATTEMPT_MS now measures being STUCK rather than being busy - closing
+     * distance on the spot resets it - and a rule that generous needs a backstop,
+     * or a bot oscillating in front of a spot holds the rotation for good. This
+     * is the only clock that cannot be reset by progress.
+     */
+    private static final long TORCH_CEILING_MS = 45_000L;
+    /**
+     * How many times the whole rotation may come round with nothing lit before
+     * the spots still left are written off. See {@link LightRotation} - the
+     * round used to reset unconditionally, which is an infinite loop whenever
+     * the remaining spots are ones she can never place on.
+     *
+     * Three rounds of a 3-spot rotation is under two minutes, and it only ever
+     * costs that where the alternative was standing there for good.
+     */
+    private static final int LIGHT_ROUND_LIMIT = 3;
     private static final long SURVEY_INTERVAL_MS = 900L;
     /**
      * How often the YARD is re-read, as opposed to the house.
@@ -136,7 +193,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
      * actually pathing is never touched, however quiet it is.
      */
     private static final long BUILDER_MOTIONLESS_MS = 12_000L;
-    /** One stable string: burnt-side progress supervision hashes the phase. */
+    /** One stable string: host-side progress supervision hashes the phase. */
     private static final String BLOCKED_PHASE = "blocked_baritone_cannot_build";
     private static JsonObject latestTelemetry;
 
@@ -145,6 +202,8 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
     private long surveyedAt;
     /** Last yard reading, and when it was taken. Refreshed on its own slow clock. */
     private YardScan yard = YardScan.EMPTY;
+    /** Same, for the ring. Rides the yard's clock - both are big and neither is urgent. */
+    private TrenchScan trench = TrenchScan.EMPTY;
     private long yardScannedAt;
     /**
      * Whether the schematic Baritone is currently holding includes the yard.
@@ -156,9 +215,17 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
      * the block she climbed up for. That is the same fight that had her breaking
      * and re-placing one interior block forever, moved outdoors.
      */
-    private boolean builderYardMode;
+    private Scope builderScope = Scope.HOUSE;
     private String phase = "surveying";
     private boolean behaviourPushed;
+    /**
+     * True while {@link #widenBuilderSurvey} is holding baritone's builder survey
+     * open, and therefore while {@link #restoreBuilderSurvey} still owes it a
+     * restore. Also the once-only latch on saving the originals.
+     */
+    private boolean surveyWidened;
+    private boolean savedDistanceTrim;
+    private int savedIncorrectSize;
     private long builderKickAt;
     private int builderKicks;
     /** Last surveyed block tally, and when it last actually changed. */
@@ -177,25 +244,30 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
     private BlockPos handTarget;
     private boolean handPlacing;
     private long handTargetUntil;
-    /** The side light she is currently working on, and when she started on it. */
-    private BlockPos torchTarget;
-    private long torchTargetAt;
     /** When the current walk to the quarry started; 0 = not walking. */
     private long quarryWalkSince;
     /** Arrived at (or given up on) the quarry for THIS restock. See walkToQuarry. */
     private boolean quarryReached;
-    /**
-     * Side-light spots that have already had their turn and would not take a
-     * torch. Deferred, never abandoned - once every remaining spot is in here
-     * the set is emptied and the whole rotation comes round again.
-     */
-    private final java.util.Set<BlockPos> torchDeferred = new java.util.LinkedHashSet<>();
+    /** The three light rotations, one per ring. See {@link LightRotation}. */
+    private final LightRotation sideLights = new LightRotation("side light");
+    private final LightRotation yardLights = new LightRotation("yard light");
+    private final LightRotation trenchLights = new LightRotation("trench light");
     /**
      * Blocks the hands tried and could not lay. See {@link #handBuildStep}: the
      * torches have had this since the day one of them turned out to be
      * unplaceable, and the shell needed it for exactly the same reason.
      */
     private final java.util.Set<BlockPos> handDeferred = new java.util.LinkedHashSet<>();
+    /**
+     * The furthest stage this build has seen; it never goes backwards.
+     *
+     * A stage is worked out from the world, so a creeper taking the bed out
+     * would otherwise drop her back to SHELL and shrink the plan around a house
+     * that is plainly further along than that. Null until the first survey, so
+     * the opening reading is free to be anything - the settlement's FULL default
+     * must not be mistaken for a floor.
+     */
+    private ToasterTier.Stage stageFloor;
 
     public ToasterBuildTask(Settlement settlement) {
         if (settlement == null) throw new IllegalArgumentException("settlement is required");
@@ -230,31 +302,20 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         // Protecting inventory was never enough: the stone was not in her bag, it
         // was in the wall. This is the wall's version of addProtectedItems.
         //
-        // Only FINISHED shell is protected, so nothing the build legitimately
-        // breaks is caught. A shell position holding the WRONG block still gets
-        // cleared and re-laid, the interior still gets swept, and the entrance and
-        // toast slots still get opened out - all three want something other than
-        // what is standing there, so none of them satisfy isShellMaterial.
-        mod.getBehaviour().avoidBlockBreaking(pos -> {
-            // Geometry first: this runs on every break check in the world, and
-            // six int comparisons reject all but the build site.
-            if (!settlement.inOuterPrism(pos)) return false;
-            if (!settlement.isFloor(pos) && !settlement.isRoof(pos) && !settlement.isWall(pos)) return false;
-            if (settlement.isEntrance(pos) || settlement.isToastSlot(pos)) return false;
-            // this predicate runs on BARITONE'S PATHING THREAD, which outlives the
-            // world by a moment when the game is closing - and an unguarded
-            // getWorld() there threw an NPE straight out of the path finder
-            // (observed 2026-08-05 08:37:35 on shutdown). no world means no
-            // opinion: protecting nothing is the safe answer while everything is
-            // being torn down anyway.
-            var world = mod.getWorld();
-            if (world == null) return false;
-            return settlement.isShellMaterial(world.getBlockState(pos));
-        });
+        // IT DOES NOT LIVE ON THE BEHAVIOUR STACK ANY MORE. It used to be a
+        // getBehaviour().avoidBlockBreaking() next to the lines above, and that
+        // frame is popped in onStop - so the house was un-mineable only while she
+        // was building it, and became ordinary stone the moment she finished.
+        // Walking home then routinely cut a doorway through her own wall, because
+        // straight through is shorter than round to the door. The rule belongs to
+        // the HOUSE, not to this task, so it is registered somewhere the stack
+        // cannot clear (see Settlement#protectFromMining) and stays true during a
+        // goto, a mining trip and an idle tick alike.
+        settlement.protectFromMining(mod::getWorld);
         surveyedAt = 0L;
         yard = YardScan.EMPTY;
         yardScannedAt = 0L;
-        builderYardMode = false;
+        builderScope = Scope.HOUSE;
         phase = "surveying";
         builderKickAt = 0L;
         builderKicks = 0;
@@ -265,12 +326,24 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         handModeUntil = 0L;
         handTarget = null;
         handTargetUntil = 0L;
-        torchTarget = null;
-        torchTargetAt = 0L;
         quarryWalkSince = 0L;
         quarryReached = false;
-        torchDeferred.clear();
+        sideLights.forget();
+        yardLights.forget();
+        trenchLights.forget();
+        trench = TrenchScan.EMPTY;
+        // START AT ONE COURSE. The field defaults to full depth so a settlement
+        // nobody is building never describes itself as half-dug, but a build that
+        // is actually running has to open the ring a course at a time. Courses
+        // already out re-open on the first survey - their remaining count is zero
+        // - so resuming a dig costs one extra reading, not four.
+        if (settlement.trenchEnabled()) settlement.setTrenchDepthAllowed(1);
+        // NOT ON THE BEHAVIOUR STACK, for the same reason the house's mining guard
+        // is not: a veto popped when the build ends is a veto lifted exactly when
+        // a plain @goto starts pricing one dirt block across the ring.
+        settlement.protectTrenchFromBridging();
         handDeferred.clear();
+        stageFloor = null;
         refreshSurvey(mod, true);
     }
 
@@ -360,7 +433,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             // a higher chain, not Baritone refusing the site, and counting it as a
             // refusal let one mob walking past condemn the whole house to
             // blocked_baritone_cannot_build. the phase is deliberately left ALONE:
-            // burnt-side supervision hashes it as progress, so flapping it here would
+            // host-side supervision hashes it as progress, so flapping it here would
             // fake progress and mute the very watchdog that should rotate her off.
             if (mod.getExtraBaritoneSettings().isInteractionPaused()) {
                 setDebugState("something else has the hands right now");
@@ -426,7 +499,10 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             // stream does not say "clearing_interior" through an entire wall.
             phase = working
                 ? (current.shellRemaining() > 0 ? current.nextShellPhase()
-                    : (current.clearRemaining > 0 ? "clearing_interior" : "clearing_the_yard"))
+                    : current.clearRemaining > 0 ? "clearing_interior"
+                    : current.yardRemaining > 0 ? "clearing_the_yard"
+                    : current.trenchRemaining > 0 ? "digging_the_trench"
+                    : "clearing_the_yard")
                 : BLOCKED_PHASE;
             setDebugState(working ? "" : "baritone will not build this site");
             publish(current, true);
@@ -434,7 +510,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         }
 
         setDebugState("");
-        BlockPos missingTorch = nextTorchTarget(current);
+        BlockPos missingTorch = nextTorchTarget(mod, current);
         if (missingTorch != null) {
             if (!mod.getItemStorage().hasItem(Blocks.TORCH.asItem())) {
                 // going away to craft: baritone should not keep holding the site.
@@ -478,12 +554,106 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             // what makes the state come out as the plan asked for, rather than us
             // asserting a blockstate and hoping the placement agrees.
             Direction facing = settlement.torchFacing(missingTorch);
-            // The torch points AWAY from its wall, so the wall is the neighbour
-            // on the opposite side and the face to click is the one looking back
-            // at the torch's own spot. True for the floorplan's inside lights and
-            // for the fallback layout's outside ones alike.
-            BlockPos wall = missingTorch.relative(facing.getOpposite());
-            return new InteractWithBlockTask(Items.TORCH, facing, wall, false);
+            // WHICH BLOCK SHE CLICKS DEPENDS ON WHICH KIND OF TORCH IT IS, and
+            // the layered plan asks for both. A WALL torch points AWAY from the
+            // wall holding it, so the block to click is the neighbour on the
+            // opposite side and the face is the one looking back at the torch's
+            // own spot. A FLOOR torch - 104 of them, standing on the furnace
+            // banks and the deck - faces UP, and then the block underneath is
+            // what holds it up, exactly like the yard lights below.
+            //
+            // The two happen to be one expression (UP's opposite is DOWN), and
+            // it is spelled out anyway because getting it wrong is not cosmetic:
+            // PlaceBlockTask compares the whole blockstate, so a floor torch
+            // asked for as a wall torch is a spot that can never be satisfied
+            // and the lighting step rotates on it forever. It lives in
+            // torchSupport so the rotation writes off the same block she clicks.
+            return new InteractWithBlockTask(Items.TORCH, facing, torchSupport(missingTorch), false);
+        }
+
+        // THE DARK RING ROUND THE HOUSE. Last, because it is the one job that
+        // needs the yard already felled: a torch goes on the ground, and until
+        // the yard is clear "the ground" is whatever tree is standing there.
+        BlockPos missingLight = nextPerimeterTarget(mod, current);
+        if (missingLight != null) {
+            if (!mod.getItemStorage().hasItem(Blocks.TORCH.asItem())) {
+                stopBuilder(mod);
+                phase = "crafting_yard_lights";
+                publish(current, true);
+                int owed = Math.max(TORCH_BATCH, current.perimeterTotal - current.perimeterCorrect + 8);
+                return TaskCatalogue.getItemTask("torch", Math.min(64, owed));
+            }
+            stopBuilder(mod);
+            phase = "lighting_the_yard";
+            publish(current, true);
+            // Same primitive as the wall torches, one face round: a standing torch
+            // is a right-click on the TOP of the block underneath it, so the block
+            // she clicks is the ground and the side is UP. Vanilla decides between
+            // TORCH and WALL_TORCH from where she is stood, and the survey accepts
+            // either - what matters here is that the spot stops being dark.
+            return new InteractWithBlockTask(Items.TORCH, Direction.UP, missingLight.below(), false);
+        }
+
+        // THE RING, ONCE IT IS A RING. The digging itself belongs to the builder -
+        // the trench box IS the schematic - so the hands only arrive for the two
+        // jobs Baritone has no opinion about, and only after the last course is
+        // out: a torch on the trench floor needs the floor to exist, and a gate on
+        // the causeway needs the causeway either side of it.
+        if (current.trenchWanted && current.trenchRemaining == 0) {
+            BlockPos missingTrenchLight = nextTrenchTarget(mod, current);
+            if (missingTrenchLight != null) {
+                if (!mod.getItemStorage().hasItem(Blocks.TORCH.asItem())) {
+                    stopBuilder(mod);
+                    phase = "crafting_trench_lights";
+                    publish(current, true);
+                    int owed = Math.max(TORCH_BATCH,
+                        current.trenchLightTotal - current.trenchLightCorrect + 4);
+                    return TaskCatalogue.getItemTask("torch", Math.min(64, owed));
+                }
+                stopBuilder(mod);
+                phase = "lighting_the_trench";
+                publish(current, true);
+                return new InteractWithBlockTask(Items.TORCH, Direction.UP,
+                    missingTrenchLight.below(), false);
+            }
+            if (!current.trenchGateStanding) {
+                // ANY wood family will do - the survey accepts any FenceGateBlock,
+                // because what matters is that she can open it and nothing else can.
+                adris.altoclef.util.ItemTarget gate = new adris.altoclef.util.ItemTarget(
+                    adris.altoclef.util.helpers.ItemHelper.WOOD_FENCE_GATE, 1);
+                if (!mod.getItemStorage().hasItem(
+                        adris.altoclef.util.helpers.ItemHelper.WOOD_FENCE_GATE)) {
+                    stopBuilder(mod);
+                    phase = "crafting_the_gate";
+                    publish(current, true);
+                    return TaskCatalogue.getItemTask("fence_gate", 1);
+                }
+                stopBuilder(mod);
+                phase = "hanging_the_gate";
+                publish(current, true);
+                return new InteractWithBlockTask(gate, Direction.UP,
+                    settlement.causewayGate().below(), false);
+            }
+        }
+
+        // A HOUSE SHE CANNOT LIGHT IS STILL A FINISHED SITE'S WORTH OF STANDING
+        // ABOUT. Reaching here with lights still owed means every rotation has run
+        // out of spots worth another turn, and complete() counts those torches, so
+        // isFinished can never come true: without this she surveys, finds the same
+        // dark spot, offers it nothing, and ticks here forever at 97%.
+        //
+        // BLOCKED_PHASE is the same definite answer the shell gives when baritone
+        // refuses the site, and node already treats it as one - it collapses the
+        // build's stall budget to BUILD_BLOCKED_GRACE_MS instead of the full
+        // survey-silence budget, so the goal ends with a real outcome she can talk
+        // about. It is not a claim the torches are lit: the survey still says they
+        // are missing, and it will say so again if the build is dispatched afresh.
+        if (sideLights.gaveUp() || yardLights.gaveUp() || trenchLights.gaveUp()) {
+            stopBuilder(mod);
+            phase = BLOCKED_PHASE;
+            setDebugState("some lights will not go up - nothing else left to build");
+            publish(current, true);
+            return null;
         }
 
         // Nothing left to hand off to, so nobody should be holding the site.
@@ -496,6 +666,12 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
     @Override
     protected void onStop(AltoClef mod, Task interruptTask) {
         stopBuilder(mod);
+        // these are GLOBAL baritone settings, not a behaviour frame, so nothing
+        // else puts them back. an interrupt is a stop like any other here: the
+        // widened survey is only correct while this task is the one driving the
+        // builder, and the next ToasterBuildTask widens it again on its first
+        // startBuilder.
+        restoreBuilderSurvey();
         if (behaviourPushed) {
             mod.getBehaviour().pop();
             behaviourPushed = false;
@@ -553,6 +729,19 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
 
     /** Every block in the inventory that is allowed to become shell. */
     private int shellStoneCarried(AltoClef mod) {
+        // AN UPGRADE NARROWS THE ANSWER TO ONE BLOCK, and the count has to
+        // narrow with it. Counting a pocketful of cobble as "stocked" while only
+        // stone brick may be laid parks her on the site with a full bag, nothing
+        // she is allowed to place, and no restock ever triggered.
+        //
+        // This cannot start a run for a block a stone run could never fetch: a
+        // target is only ever named while she is holding at least
+        // MATERIAL_SWITCH_STOCK of it (see ToasterTier#buildingMaterial), and
+        // that is the same 64 as STONE_RESTOCK_AT - so by the time she has spent
+        // down to where a run would begin, the target is already gone and every
+        // shell stone counts again.
+        Block target = settlement.shellUpgradeTarget();
+        if (target != null) return mod.getItemStorage().getItemCount(target.asItem());
         int total = 0;
         for (Block stone : Settlement.shellStoneByPreference()) {
             total += mod.getItemStorage().getItemCount(stone.asItem());
@@ -726,6 +915,20 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             if (cut != null) return cut;
             yardScannedAt = 0L;   // it is already gone; the cached answer is stale
         }
+        // THE RING AFTER THE YARD ABOVE IT, and it needs a hand fallback more than
+        // any of them: a cell Baritone will not dig is a notch left in a wall whose
+        // entire value is being unbroken, and the one thing she must never do about
+        // it is bridge across - which the placement veto has already taken away.
+        if (current.shellRemaining() == 0 && current.clearRemaining == 0
+            && current.yardRemaining == 0 && current.trenchNearest != null) {
+            // Unlike the yard, the ring is not all breaking work: the seal under it
+            // and the causeway over it are both blocks that have to go IN, so the
+            // hand job is whichever one this cell is short of.
+            boolean placing = mod.getWorld().getBlockState(current.trenchNearest).isAir();
+            Task dig = commitHand(mod, current.trenchNearest, placing);
+            if (dig != null) return dig;
+            yardScannedAt = 0L;   // the ring rides the yard's clock
+        }
         return null;
     }
 
@@ -768,6 +971,13 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
 
     /** The shell stone she is actually carrying, in blueprint preference order. */
     private Block carriedShellStone(AltoClef mod) {
+        // While a renovation is on, the only correct block is the target - so
+        // handing the hands anything else would lay a block the very next survey
+        // reads as wrong and orders broken out again.
+        Block target = settlement.shellUpgradeTarget();
+        if (target != null) {
+            return mod.getItemStorage().getItemCount(target.asItem()) > 0 ? target : null;
+        }
         for (Block stone : Settlement.shellStoneByPreference()) {
             if (mod.getItemStorage().getItemCount(stone.asItem()) > 0) return stone;
         }
@@ -784,6 +994,77 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
     }
 
     /**
+     * WIDEN THE BUILDER'S VIEW TO THE SIZE OF THE THING BEING BUILT.
+     *
+     * Baritone's builder defaults are sized for "path over there and fix a few
+     * blocks", and two of them are actively hostile to a settlement:
+     *
+     *   distanceTrim (true)  - BuilderProcess#trim runs EVERY TICK and drops any
+     *                          outstanding cell more than sqrt(200) ~ 14.1 blocks
+     *                          from her feet.
+     *   incorrectSize (100)  - not a soft cap. It is an early `return` out of the
+     *                          middle of fullRecalc's scan loop, so past 100 cells
+     *                          the rest of the schematic is never even looked at.
+     *
+     * On their own those are survivable. What makes them a wedge is that
+     * fullRecalc is NOT periodic: BuilderProcess#recalc runs it once, and then
+     * only ever again when incorrectPositions drains to EXACTLY empty. Between
+     * those two moments the only thing adding work is recalcNearby, which reaches
+     * builderTickScanRadius (5) blocks.
+     *
+     * So: one cell she cannot satisfy - a torch whose facing can never match, a
+     * block whose support is missing, anything the unplaceable/handDeferred sets
+     * are there to survive - sits inside the trimmed neighbourhood and keeps the
+     * set non-empty forever. fullRecalc never re-runs, the rest of the structure
+     * is never re-added, and she works a 14-block bubble around one impossible
+     * block for as long as you let her. The plan v2 toaster is 13x21x11 and the
+     * trench ring is ~1240 cells; neither fits in that bubble, so most of the
+     * build is invisible to the builder for most of the build.
+     *
+     * The cap is raised to the scope's own box rather than switched off, and the
+     * ceiling is a real limit and not a formality - see SURVEY_CELL_CEILING.
+     */
+    private void widenBuilderSurvey(int boxCells) {
+        Settings settings = BaritoneAPI.getSettings();
+        // save ONCE. startBuilder is re-issued on every scope change and on every
+        // builder kick, and saving each time would capture our own widened values
+        // as the "originals" and make the restore a no-op.
+        if (!surveyWidened) {
+            savedDistanceTrim = settings.distanceTrim.value;
+            savedIncorrectSize = settings.incorrectSize.value;
+            surveyWidened = true;
+        }
+        settings.distanceTrim.value = false;
+        settings.incorrectSize.value = surveyCapFor(boxCells, savedIncorrectSize);
+    }
+
+    /**
+     * The widened incorrectSize for a box of {@code boxCells}, given whatever the
+     * setting was before we touched it.
+     *
+     * Pure and static so the invariants are checkable without a client: it never
+     * returns below {@code previous} (an operator who raised it by hand keeps
+     * their value), never above {@link #SURVEY_CELL_CEILING}, and is monotonic in
+     * the box size. A degenerate box cannot shrink the cap below what was there.
+     */
+    static int surveyCapFor(int boxCells, int previous) {
+        return Math.max(previous, Math.min(boxCells, SURVEY_CELL_CEILING));
+    }
+
+    /**
+     * Put both settings back exactly as they were found. Deliberately restores the
+     * SAVED values rather than the stock defaults: an operator who had set either
+     * of these by hand gets their value back, not baritone's.
+     */
+    private void restoreBuilderSurvey() {
+        if (!surveyWidened) return;
+        Settings settings = BaritoneAPI.getSettings();
+        settings.distanceTrim.value = savedDistanceTrim;
+        settings.incorrectSize.value = savedIncorrectSize;
+        surveyWidened = false;
+    }
+
+    /**
      * Hand Baritone the schematic for the job in front of her.
      *
      * The box is sized to the mode rather than always being the big one: while
@@ -791,18 +1072,61 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
      * positions, not the ~7900 the yard box covers, and eight times the recalc
      * is eight times the pause every time it is kicked.
      */
-    private void startBuilder(AltoClef mod, boolean withYard) {
-        builderYardMode = withYard;
+    private void startBuilder(AltoClef mod, Scope scope) {
+        builderScope = scope;
+        SettlementSchematic schematic = new SettlementSchematic(settlement, scope);
+        // the BOX volume, which over-estimates the number of cells that actually
+        // carry a desired state - the safe direction for a cap.
+        widenBuilderSurvey(schematic.widthX() * schematic.heightY() * schematic.lengthZ());
         mod.getClientBaritone().getBuilderProcess().build(
             settlement.kind() + "_" + settlement.name(),
-            new SettlementSchematic(settlement, withYard),
-            schematicOrigin(withYard));
+            schematic,
+            scopeOrigin(settlement, scope));
     }
 
-    private BlockPos schematicOrigin(boolean withYard) {
-        return withYard
-            ? new BlockPos(settlement.yardMinX(), settlement.floorY(), settlement.yardMinZ())
-            : settlement.origin();
+    /**
+     * How far outside the walls each box reaches. The trench box is the only one
+     * that also grows DOWNWARD - see {@link #scopeOrigin}.
+     */
+    private enum Scope { HOUSE, YARD, TRENCH }
+
+    private static int scopeMargin(Scope scope) {
+        return switch (scope) {
+            case HOUSE -> 0;
+            case YARD -> Settlement.YARD_MARGIN;
+            case TRENCH -> Settlement.YARD_MARGIN + Settlement.TRENCH_WIDTH;
+        };
+    }
+
+    private static BlockPos scopeOrigin(Settlement s, Scope scope) {
+        return switch (scope) {
+            case HOUSE -> s.origin();
+            case YARD -> new BlockPos(s.yardMinX(), s.floorY(), s.yardMinZ());
+            // the one box whose floor is not the house's floor: the trench is dug
+            // below grade, so the schematic has to start four courses under it.
+            case TRENCH -> new BlockPos(s.trenchMinX(), s.trenchFloorY(), s.trenchMinZ());
+        };
+    }
+
+    /**
+     * Which box the job in front of her needs.
+     *
+     * TRENCH is a strict superset - it contains the yard box and the house - so
+     * nothing is lost by being in it and a wall opened by a creeper is still
+     * repaired. It is not the permanent choice only because it covers ~9500
+     * positions to the house's ~1000, and every builder kick pays that recalc.
+     *
+     * The trench comes last for the same reason the yard waits for the wall
+     * torches: it is the one job that needs everything before it already true,
+     * and digging it while the yard is still a forest just moves her back and
+     * forth across the site.
+     */
+    private Scope scopeFor(Survey current) {
+        if (current.shellRemaining() > 0 || current.clearRemaining > 0) return Scope.HOUSE;
+        if (settlement.trenchEnabled()
+            && current.yardRemaining == 0
+            && current.perimeterCorrect == current.perimeterTotal) return Scope.TRENCH;
+        return Scope.YARD;
     }
 
     /**
@@ -822,7 +1146,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
      * full recalc instead of replaying the same dead goal. Kicks are spaced so a
      * genuinely impossible build cannot become a hot loop, and after
      * BUILDER_KICK_LIMIT consecutive refusals the spacing widens and the phase
-     * parks on one STABLE blocked string - stable because burnt-side progress
+     * parks on one STABLE blocked string - stable because host-side progress
      * supervision hashes the phase, so a flapping one would read as progress and
      * suppress the very watchdog that should rotate her onto something else.
      *
@@ -878,14 +1202,19 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         // would carry on driving a schematic that has no opinion about the yard -
         // active, unpaused, perfectly healthy, and with nothing left to do, which
         // is a builder that reports "working" while standing in a field.
-        boolean wantYard = current.shellRemaining() == 0 && current.clearRemaining == 0;
-        if (builder.isActive() && wantYard != builderYardMode) {
-            // Both directions: a creeper opening the wall pulls the schematic
-            // back off the yard and onto the house, which is the right order.
+        Scope wantScope = scopeFor(current);
+        if (builder.isActive() && wantScope != builderScope) {
+            // Every direction: a creeper opening the wall pulls the schematic back
+            // off the trench or the yard and onto the house, which is the right
+            // order - there is no point ringing a house that has a hole in it.
             Debug.logMessage("toaster build: switching the schematic to the "
-                + (wantYard ? "yard - the house is closed" : "house - it needs repairing again"));
+                + switch (wantScope) {
+                    case HOUSE -> "house - it needs repairing again";
+                    case YARD -> "yard - the house is closed";
+                    case TRENCH -> "trench - the yard is clear and lit";
+                });
             stopBuilder(mod);
-            startBuilder(mod, wantYard);
+            startBuilder(mod, wantScope);
             // a brand new schematic has not had a chance to place anything yet, so
             // it starts on a clean clock rather than inheriting the shell's.
             builderKicks = 0;
@@ -930,7 +1259,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             + ") - restart " + builderKicks
             + (builderKicks >= BUILDER_KICK_LIMIT ? ", giving up on this site" : ""));
         stopBuilder(mod);
-        startBuilder(mod, wantYard);
+        startBuilder(mod, wantScope);
         // The stall clock is deliberately NOT given back here. It stays tripped
         // until a real block lands, so BUILDER_STALL_RETRY_MS paces the kicks
         // directly: one restart, one window to place something, then the next.
@@ -940,58 +1269,281 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
     }
 
     /**
-     * Which side light to work on now.
+     * The block she must CLICK to put a torch in {@code spot}.
+     *
+     * A WALL torch points AWAY from the wall holding it, so the block to click is
+     * the neighbour on the opposite side. A FLOOR torch faces UP and is held up by
+     * the block underneath. Both the rotation below and the InteractWithBlockTask
+     * the lighting step hands back ask through here, so the block she is judged
+     * unable to reach is always the block she was actually sent to click.
+     */
+    private BlockPos torchSupport(BlockPos spot) {
+        Direction facing = settlement.torchFacing(spot);
+        return facing == Direction.UP ? spot.below() : spot.relative(facing.getOpposite());
+    }
+
+    private BlockPos nextTorchTarget(AltoClef mod, Survey current) {
+        return sideLights.next(current.missingTorches, unreachable(mod), this::torchSupport,
+            look(mod, this::torchSupport, settlement::torchFacing));
+    }
+
+    private BlockPos nextPerimeterTarget(AltoClef mod, Survey current) {
+        // A yard light stands on the ground, so the ground is what she clicks.
+        return yardLights.next(current.missingPerimeter, unreachable(mod), BlockPos::below,
+            look(mod, BlockPos::below, spot -> Direction.UP));
+    }
+
+    private BlockPos nextTrenchTarget(AltoClef mod, Survey current) {
+        return trenchLights.next(current.trenchMissingLights, unreachable(mod), BlockPos::below,
+            look(mod, BlockPos::below, spot -> Direction.UP));
+    }
+
+    /**
+     * How the attempt on one spot is actually going, asked of the world.
+     *
+     * The rotation cannot ask the InteractWithBlockTask directly - the build task
+     * hands back a fresh equal instance every tick and the task system keeps the
+     * live one, so the object here is never the object running. It does not need
+     * it: both facts are in the world. Reach is the same call the interact task
+     * makes to decide whether to click at all, and distance is just where she is.
+     */
+    private java.util.function.Function<BlockPos, LightRotation.Attempt> look(
+            AltoClef mod,
+            java.util.function.Function<BlockPos, BlockPos> supportOf,
+            java.util.function.Function<BlockPos, Direction> faceOf) {
+        return spot -> {
+            BlockPos support = supportOf.apply(spot);
+            boolean reach = adris.altoclef.util.helpers.LookHelper
+                .getReach(support, faceOf.apply(spot)).isPresent();
+            double distance = mod.getPlayer() == null ? Double.NaN
+                : Math.sqrt(mod.getPlayer().position().distanceToSqr(
+                    support.getX() + 0.5, support.getY() + 0.5, support.getZ() + 0.5));
+            return new LightRotation.Attempt(reach, distance);
+        };
+    }
+
+    /** AltoClef's standing verdict on whether she can get to a block at all. */
+    private static java.util.function.Predicate<BlockPos> unreachable(AltoClef mod) {
+        return pos -> mod.getBlockTracker().unreachable(pos);
+    }
+
+    /**
+     * One light rotation - the wall torches, the yard ring, or the trench floor.
      *
      * The lighting step runs AFTER the builder is stopped, so none of the stall
-     * machinery that watches the shell is watching here - a spot that will not
-     * take a torch had nothing to move her off it, and the whole step sat on
-     * "lighting_sides" indefinitely. A spot now gets TORCH_ATTEMPT_MS of her
-     * attention and is then deferred so the next one gets a turn. Deferring is
-     * not giving up: when every remaining spot has had a turn the set empties
-     * and the rotation starts over, and the survey keeps telling the truth
-     * either way - complete() still counts every torch, so a house that really
-     * cannot be lit is never reported finished.
+     * machinery that watches the shell is watching here: a spot that will not take
+     * a torch has nothing to move her off it. So a spot gets TORCH_ATTEMPT_MS of
+     * her attention and is then deferred, and the next one gets a turn. For a spot
+     * that is merely awkward that is still not giving up - when every remaining
+     * spot has had a turn the set empties and the rotation comes round again.
+     *
+     * THAT ROUND HAS TO BE COUNTED, THOUGH. The reset used to be unconditional,
+     * which is a perfect infinite loop the moment every remaining spot is one she
+     * can NEVER place on: defer, defer, defer, clear, defer, forever. Live, at 97%
+     * built: 204 attempts across the same 3 side lights in one hour, 12 seconds
+     * each, and nothing anywhere in the three processes said a word about it.
+     *
+     * There are two ways out now and they answer different failures:
+     *
+     *  - ALTOCLEF'S OWN VERDICT, which already existed and was simply never read.
+     *    InteractWithBlockTask calls requestBlockUnreachable on the support block
+     *    when it cannot get to it, and by the end of that hour the tracker was
+     *    logging "Try 66 / 4" against a threshold of four while this rotation
+     *    handed the same spot straight back. Asking costs nothing.
+     *  - LIGHT_ROUND_LIMIT fruitless rounds, for the spot she can path to and
+     *    still not place on. That is what the other two spots in that log were:
+     *    no blacklist entry ever, just twelve seconds of nothing, on repeat.
+     *
+     * Giving up on PLACING is not a claim the spot is lit. The survey still counts
+     * it missing, so complete() stays false and the site is never reported
+     * finished on the strength of having given up - the caller escalates to
+     * BLOCKED_PHASE instead, which is the definite answer node already knows how
+     * to end a build on.
+     *
+     * Any progress wipes every verdict here: one torch landing anywhere means the
+     * world is no longer the one those verdicts were formed in, and the spot she
+     * could not reach is very often the one that torch just opened up.
      */
-    private BlockPos nextTorchTarget(Survey current) {
-        if (current.missingTorches.isEmpty()) {
-            torchTarget = null;
-            torchTargetAt = 0L;
-            torchDeferred.clear();
+    private static final class LightRotation {
+        /**
+         * How the attempt on the current spot is going. {@code distance} is to the
+         * block she must CLICK, and is NaN when there is no player to ask.
+         */
+        record Attempt(boolean inReach, double distance) {}
+
+        private final String what;
+        private BlockPos target;
+        private long targetAt;
+        /** When she last got measurably nearer the spot, or first reached it. */
+        private long sinceProgress;
+        /** When she came into reach; 0 = she has not. */
+        private long arrivedAt;
+        /** The nearest she has been to this spot, so closing in is detectable. */
+        private double closest = Double.MAX_VALUE;
+        /** Spots that have had their turn this round. */
+        private final java.util.Set<BlockPos> deferred = new java.util.LinkedHashSet<>();
+        /** Spots written off for good - see gaveUp(). */
+        private final java.util.Set<BlockPos> impossible = new java.util.LinkedHashSet<>();
+        private int fruitlessRounds;
+        /** How many were outstanding last tick; -1 = no reading yet. */
+        private int lastMissing = -1;
+
+        LightRotation(String what) {
+            this.what = what;
+        }
+
+        /**
+         * Has this spot had a fair go? Three clocks, because "she is getting
+         * nowhere" and "she has been at this a while" are different claims.
+         *
+         * The whole give-up used to be one line - twelve seconds of wall clock
+         * since the spot was picked - which counted baritone's path computation,
+         * the walk, the approach and the click against the block, and then
+         * reported the block as the thing at fault. On a loaded server a single
+         * path took thirteen seconds to compute, so the budget could expire
+         * before she had taken a step, and worse, it expired three seconds into
+         * a click that was already underway.
+         *
+         *  - IN REACH: she is there, with the face in front of her. Whether it
+         *    takes a torch is now a fact about the block, and TORCH_REACH_MS is
+         *    the honest time to establish it.
+         *  - CLOSING: getting nearer is progress by any reading, so the stuck
+         *    clock restarts. A spot she is walking to is not a spot that refuses
+         *    her. Half a block of movement so ordinary jitter does not count.
+         *  - Otherwise TORCH_ATTEMPT_MS of going nowhere, which is what the
+         *    twelve seconds was always meant to mean, and TORCH_CEILING_MS over
+         *    everything so no amount of progress holds the rotation for good.
+         *
+         * Note this leaves AltoClef's own verdict room to form: the block
+         * tracker needs four failed approaches to call a block unreachable, and
+         * a budget that cut every approach short never let it get there. pick()
+         * has always asked; now the answer exists.
+         */
+        private boolean hadItsGo(long now, Attempt at) {
+            if (now - targetAt >= TORCH_CEILING_MS) return true;
+            if (at.inReach()) {
+                if (arrivedAt == 0L) arrivedAt = now;
+                return now - arrivedAt >= TORCH_REACH_MS;
+            }
+            arrivedAt = 0L;
+            if (at.distance() < closest - 0.5) {
+                closest = at.distance();
+                sinceProgress = now;
+            }
+            return now - sinceProgress >= TORCH_ATTEMPT_MS;
+        }
+
+        BlockPos next(List<BlockPos> missing,
+                      java.util.function.Predicate<BlockPos> unreachable,
+                      java.util.function.Function<BlockPos, BlockPos> supportOf,
+                      java.util.function.Function<BlockPos, Attempt> look) {
+            if (missing.isEmpty()) {
+                forget();
+                return null;
+            }
+            long now = System.currentTimeMillis();
+            boolean progressed = (lastMissing >= 0 && missing.size() < lastMissing)
+                || (target != null && !missing.contains(target));
+            if (progressed) forget();
+            lastMissing = missing.size();
+
+            if (gaveUp()) return null;
+
+            if (target != null && hadItsGo(now, look.apply(target))) {
+                deferred.add(target);
+                Debug.logMessage(what + " at " + target.toShortString()
+                    + " will not take a torch, trying another spot");
+                target = null;
+            }
+            if (target == null) {
+                BlockPos pick = pick(missing, unreachable, supportOf);
+                if (pick == null) {
+                    // Every spot left has had its turn and not one of them took a
+                    // torch. Round again - but not forever.
+                    fruitlessRounds++;
+                    if (gaveUp()) {
+                        impossible.addAll(deferred);
+                        deferred.clear();
+                        Debug.logMessage(what + ": " + impossible.size()
+                            + " spot(s) will not take a torch after " + LIGHT_ROUND_LIMIT
+                            + " rounds, giving up on them");
+                        return null;
+                    }
+                    deferred.clear();
+                    pick = pick(missing, unreachable, supportOf);
+                    if (pick == null) return null;
+                }
+                target = pick;
+                targetAt = now;
+                sinceProgress = now;
+                arrivedAt = 0L;
+                closest = Double.MAX_VALUE;
+            }
+            return target;
+        }
+
+        /** The first spot still worth a turn, writing off any the tracker refuses. */
+        private BlockPos pick(List<BlockPos> missing,
+                              java.util.function.Predicate<BlockPos> unreachable,
+                              java.util.function.Function<BlockPos, BlockPos> supportOf) {
+            for (BlockPos pos : missing) {
+                if (deferred.contains(pos) || impossible.contains(pos)) continue;
+                if (unreachable.test(supportOf.apply(pos))) {
+                    impossible.add(pos);
+                    continue;
+                }
+                return pos;
+            }
             return null;
         }
-        long now = System.currentTimeMillis();
-        if (torchTarget != null && !current.missingTorches.contains(torchTarget)) {
-            // It got lit. Whatever was deferred deserves a fresh look.
-            torchTarget = null;
-            torchDeferred.clear();
+
+        /** Has this ring run out of spots it has any reason to try again? */
+        boolean gaveUp() {
+            return fruitlessRounds >= LIGHT_ROUND_LIMIT;
         }
-        if (torchTarget != null && now - torchTargetAt >= TORCH_ATTEMPT_MS) {
-            torchDeferred.add(torchTarget);
-            Debug.logMessage("side light at " + torchTarget.toShortString()
-                + " will not take a torch, trying another spot");
-            torchTarget = null;
+
+        void forget() {
+            target = null;
+            targetAt = 0L;
+            sinceProgress = 0L;
+            arrivedAt = 0L;
+            closest = Double.MAX_VALUE;
+            deferred.clear();
+            impossible.clear();
+            fruitlessRounds = 0;
+            lastMissing = -1;
         }
-        if (torchTarget == null) {
-            BlockPos pick = null;
-            for (BlockPos pos : current.missingTorches) {
-                if (!torchDeferred.contains(pos)) { pick = pos; break; }
-            }
-            if (pick == null) {
-                // Every unlit spot has had its turn. Round again rather than
-                // leaving the house half dark forever.
-                torchDeferred.clear();
-                pick = current.missingTorches.get(0);
-            }
-            torchTarget = pick;
-            torchTargetAt = now;
-        }
-        return torchTarget;
+    }
+
+    /**
+     * OPEN ONE COURSE AT A TIME, and only when the one above it is finished.
+     *
+     * This is what makes the staircase reachable at every moment of the dig
+     * rather than only once it is carved: the stairs are clamped by the same
+     * gate, so the deepest ground anywhere in the ring is never more than one
+     * course below the step beside it. Without it the builder works by proximity
+     * and sinks a single four-deep shaft wherever it happens to begin - and with
+     * bridging vetoed, standing at the bottom of that shaft is a trap she has no
+     * move out of.
+     *
+     * Bounded by TRENCH_DEPTH, so a resumed build catches up in one pass instead
+     * of one course per survey.
+     */
+    private boolean advanceTrenchLayer(TrenchScan scan) {
+        if (!settlement.trenchEnabled() || scan == null) return false;
+        if (scan.remaining > 0) return false;
+        int open = settlement.trenchDepthAllowed();
+        if (open >= Settlement.TRENCH_DEPTH) return false;
+        settlement.setTrenchDepthAllowed(open + 1);
+        Debug.logMessage("toaster build: trench course " + (open + 1)
+            + " of " + Settlement.TRENCH_DEPTH + " open");
+        return true;
     }
 
     /**
      * Ground truth for "is anything actually happening". The survey tally only
      * moves when a real block in the site changed, so it cannot be refreshed by
-     * her shuffling on the spot - which is precisely how the burnt-side stall
+     * her shuffling on the spot - which is precisely how the host-side stall
      * watchdog was being kept alive through a frozen build.
      *
      * A changed tally is also the ONLY thing that forgives the builder: the kick
@@ -1054,6 +1606,128 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             && mod.getChunkTracker().isChunkLoaded(new BlockPos(settlement.maxX(), y, settlement.maxZ()));
     }
 
+    /**
+     * WHICH STAGE THE WORLD IS AT, re-read every survey and never remembered.
+     *
+     * The stage she should be working on is the LOWEST one that is not finished,
+     * so she lives in the silhouette from night one and the furniture arrives
+     * later. Every stage is a superset of the one before it, so this is a walk
+     * up the list that stops at the first thing still owed.
+     *
+     * @return true when the stage actually moved, which makes the survey that
+     *         was just taken stale - it counted fixtures against the old scope.
+     */
+    private boolean advanceStage(AltoClef mod, Survey current) {
+        // Only the layered plan has stages. The old extruded geometry ignores
+        // the field entirely and must keep its FULL default, or a 14x9x8 house
+        // that is already standing would find its gallery cut down to nothing.
+        if (!ToasterLayout.applies(settlement)) return false;
+        ToasterTier.Stage want = ToasterTier.Stage.FULL;
+        for (ToasterTier.Stage candidate : ToasterTier.Stage.values()) {
+            if (!stageSatisfied(mod, current, candidate)) {
+                want = candidate;
+                break;
+            }
+        }
+        if (stageFloor != null && want.ordinal() < stageFloor.ordinal()) want = stageFloor;
+        stageFloor = want;
+        if (settlement.stage() == want) return false;
+        Debug.logMessage("toaster build: working the " + stageName(want) + " stage now");
+        settlement.setStage(want);
+        return true;
+    }
+
+    /**
+     * Is every block this stage claims actually standing?
+     *
+     * The shell and the openings are the same in every stage and the survey has
+     * just read all 1126 of them, so that half of the answer is taken from the
+     * tally rather than paid for twice - re-walking the shell here would double
+     * the cost of the most expensive part of the pass for something already in
+     * hand. Everything else is a fixture, and there are 2 of them at SHELL and
+     * 19 at LIVED_IN, so the common case is a handful of block reads.
+     */
+    private boolean stageSatisfied(AltoClef mod, Survey current, ToasterTier.Stage candidate) {
+        if (current.shellRemaining() > 0) return false;
+        for (ToasterLayout.Cell cell : ToasterLayout.cellsFor(settlement, candidate)) {
+            if (cell.glyph == ToasterLayout.SHELL) continue;
+            if (!fixtureStanding(mod, cell)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Does the world agree with one fixture cell?
+     *
+     * Deliberately looser than {@link ToasterLayout#wantedBlock} in two places,
+     * because the plan names ONE block and the game will hand her a different
+     * one for perfectly good reasons: a bed is whatever colour she crafted, and
+     * vanilla decides between a standing torch and a wall torch from where she
+     * was stood when she clicked. Insisting on the literal block would leave a
+     * stage permanently unsatisfied over a blue bed.
+     */
+    private boolean fixtureStanding(AltoClef mod, ToasterLayout.Cell cell) {
+        BlockState state = mod.getWorld().getBlockState(cell.pos);
+        switch (cell.glyph) {
+            case ToasterLayout.SHELL:
+                return settlement.isShellMaterial(state);
+            case ToasterLayout.BED:
+                return state.getBlock() instanceof net.minecraft.world.level.block.BedBlock;
+            case ToasterLayout.TORCH:
+            case ToasterLayout.WALL_TORCH:
+                return state.getBlock() == Blocks.TORCH || state.getBlock() == Blocks.WALL_TORCH;
+            default:
+                Block wanted = ToasterLayout.wantedBlock(cell.glyph, settlement.material());
+                return wanted != null && state.getBlock() == wanted;
+        }
+    }
+
+    private static String stageName(ToasterTier.Stage stage) {
+        return stage.name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * WHAT THE SHELL IS MADE OF, re-decided every survey.
+     *
+     * Normally nothing is named at all: any stone she can dig counts as shell,
+     * which is what stops her tearing a sound cobblestone wall down to re-lay it
+     * in smooth stone. Naming a block turns that off - every wall block that is
+     * not the named one instantly reads as outstanding work - so it is only ever
+     * done for a REAL upgrade, one rung above plain cobble, and
+     * {@link ToasterTier#buildingMaterial} will only climb a rung while she is
+     * holding a full stack of the better block. That stack is what keeps the
+     * answer from flickering every time a furnace finishes, and it is also what
+     * stops a renovation stranding her mid-wall.
+     */
+    private void refreshShellTarget(AltoClef mod) {
+        if (!ToasterLayout.applies(settlement)) return;
+        List<Block> ladder = ToasterTier.materialLadder();
+        int[] carried = new int[ladder.size()];
+        for (int rung = 0; rung < ladder.size(); rung++) {
+            carried[rung] = mod.getItemStorage().getItemCount(ladder.get(rung).asItem());
+        }
+        Block chosen = ToasterTier.buildingMaterial(carried, established(mod));
+        // rung 0 is cobblestone, i.e. "just build the house" - which is the
+        // no-target case, not an upgrade to anything.
+        settlement.setShellUpgradeTarget(ToasterTier.rungOf(chosen) >= 1 ? chosen : null);
+    }
+
+    /**
+     * RICH IS NOT "HAS SOME IRON".
+     *
+     * The top rung is 1126 iron blocks - ten thousand ingots - so the question
+     * is not whether a stack happened to land in her bag, it is whether she is
+     * the kind of bot that finishes such a thing. The stack itself is already
+     * demanded by buildingMaterial, so all this has to decide is the rest of it,
+     * and diamond tooling is the cheapest honest proxy available from here: a
+     * pickaxe and a chestplate mean she reached the bottom of a mine, kitted
+     * herself out, and lived long enough to still be wearing it.
+     */
+    private boolean established(AltoClef mod) {
+        return mod.getItemStorage().hasItem(Items.DIAMOND_PICKAXE)
+            && mod.getItemStorage().hasItem(Items.DIAMOND_CHESTPLATE);
+    }
+
     private Survey refreshSurvey(AltoClef mod, boolean force) {
         long now = System.currentTimeMillis();
         if (!force && survey != null && now - surveyedAt < SURVEY_INTERVAL_MS) return survey;
@@ -1066,9 +1740,28 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         // times a second is how a survey becomes the thing that drops frames.
         if (yardScannedAt == 0L || now - yardScannedAt >= YARD_SURVEY_INTERVAL_MS) {
             yard = YardScan.scan(mod, settlement);
+            // the ring is ~310 columns to the yard's ~860 and it costs nothing when
+            // the trench is switched off, so it shares the same slow clock.
+            trench = TrenchScan.scan(mod, settlement);
+            // a finished course opens the next one, and the reading has to be taken
+            // again afterwards or the survey describes a trench she is no longer
+            // allowed to stop digging.
+            for (int course = 0; course < Settlement.TRENCH_DEPTH && advanceTrenchLayer(trench); course++) {
+                trench = TrenchScan.scan(mod, settlement);
+            }
             yardScannedAt = now;
         }
-        survey = Survey.scan(mod, settlement, yard, handDeferred);
+        // BOTH AXES ARE DECIDED BEFORE THE BLOCKS ARE READ, because both change
+        // what the reading MEANS: the material target decides which wall blocks
+        // count as correct, and the stage decides how many fixtures are even
+        // being asked for.
+        refreshShellTarget(mod);
+        survey = Survey.scan(mod, settlement, yard, trench, handDeferred);
+        // ...except the stage, which needs the shell tally to know whether the
+        // silhouette is closed. So it is settled after the scan, and a scan that
+        // turns out to have counted the wrong scope is simply taken again - a
+        // stage moves a handful of times in a whole build.
+        if (advanceStage(mod, survey)) survey = Survey.scan(mod, settlement, yard, trench, handDeferred);
         surveyedAt = now;
         publish(survey, isActive());
         return survey;
@@ -1093,14 +1786,14 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         private final Settlement settlement;
         private final BlockPos origin;
 
-        SettlementSchematic(Settlement settlement, boolean withYard) {
-            super(settlement.width() + (withYard ? Settlement.YARD_MARGIN * 2 : 0),
-                settlement.height(),
-                settlement.depth() + (withYard ? Settlement.YARD_MARGIN * 2 : 0));
+        SettlementSchematic(Settlement settlement, Scope scope) {
+            super(settlement.width() + scopeMargin(scope) * 2,
+                // the trench box is the only one taller than the house, because it
+                // is the only one that reaches under the floor course.
+                settlement.height() + (scope == Scope.TRENCH ? Settlement.TRENCH_DEPTH : 0),
+                settlement.depth() + scopeMargin(scope) * 2);
             this.settlement = settlement;
-            this.origin = withYard
-                ? new BlockPos(settlement.yardMinX(), settlement.floorY(), settlement.yardMinZ())
-                : settlement.origin();
+            this.origin = scopeOrigin(settlement, scope);
         }
 
         @Override
@@ -1172,6 +1865,83 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         }
     }
 
+    /**
+     * The ring as it stands: how much of it is still solid, whether it is lit,
+     * and whether the gate is hung.
+     *
+     * EVERY CELL IS JUDGED BY ASKING {@link Settlement#desiredState} - the same
+     * function the schematic asks - instead of re-deriving here what a trench is
+     * supposed to look like. A second description of the same geometry is the
+     * mistake the floorplan taught us once already, and this is where it would
+     * hurt most: the builder and the survey would disagree about which cells are
+     * finished, so she would work on ground the tally already called done and the
+     * job would never close.
+     *
+     * The heightmap only bounds the TOP of each column. Everything from the
+     * column's floor up to grade is read unconditionally, because that is the
+     * part that is supposed to be underground and a heightmap has nothing to say
+     * about it.
+     */
+    private static final class TrenchScan {
+        static final TrenchScan EMPTY = new TrenchScan(0, null, List.of(), 0, true);
+        final int remaining;
+        final BlockPos nearest;
+        final List<BlockPos> missingLights;
+        final int lightTotal;
+        final boolean gateStanding;
+
+        TrenchScan(int remaining, BlockPos nearest, List<BlockPos> missingLights,
+                   int lightTotal, boolean gateStanding) {
+            this.remaining = remaining;
+            this.nearest = nearest;
+            this.missingLights = missingLights;
+            this.lightTotal = lightTotal;
+            this.gateStanding = gateStanding;
+        }
+
+        int lightsCorrect() { return lightTotal - missingLights.size(); }
+        boolean complete() { return remaining == 0 && missingLights.isEmpty() && gateStanding; }
+
+        static TrenchScan scan(AltoClef mod, Settlement s) {
+            if (!s.trenchEnabled()) return EMPTY;
+            BlockPos me = mod.getPlayer() != null ? mod.getPlayer().blockPosition() : s.origin();
+            int remaining = 0;
+            BlockPos nearest = null;
+            double nearestDistance = Double.MAX_VALUE;
+            BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+            for (int x = s.trenchMinX(); x <= s.trenchMaxX(); x++) {
+                for (int z = s.trenchMinZ(); z <= s.trenchMaxZ(); z++) {
+                    cursor.set(x, s.floorY(), z);
+                    // the yard and the house fill most of this box; one predicate
+                    // rejects them by column rather than by cell
+                    if (!s.inTrenchColumn(cursor)) continue;
+                    int surface = mod.getWorld().getHeight(Heightmap.Types.MOTION_BLOCKING, x, z) - 1;
+                    int top = Math.min(s.roofY(), Math.max(surface, s.floorY()));
+                    for (int y = s.trenchGroundY(x, z); y <= top; y++) {
+                        cursor.set(x, y, z);
+                        BlockState state = mod.getWorld().getBlockState(cursor);
+                        if (state.equals(s.desiredState(cursor, state))) continue;
+                        remaining++;
+                        double distance = cursor.distSqr(me);
+                        if (distance < nearestDistance) {
+                            nearestDistance = distance;
+                            nearest = cursor.immutable();
+                        }
+                    }
+                }
+            }
+            List<BlockPos> lights = s.trenchLightPositions();
+            List<BlockPos> missing = new java.util.ArrayList<>();
+            for (BlockPos spot : lights) {
+                Block block = mod.getWorld().getBlockState(spot).getBlock();
+                if (block != Blocks.TORCH && block != Blocks.WALL_TORCH) missing.add(spot);
+            }
+            boolean gate = mod.getWorld().getBlockState(s.causewayGate()).getBlock()
+                instanceof net.minecraft.world.level.block.FenceGateBlock;
+            return new TrenchScan(remaining, nearest, missing, lights.size(), gate);
+        }
+    }
+
     private static final class Survey {
         int floorTotal, floorCorrect;
         int wallTotal, wallCorrect;
@@ -1184,6 +1954,20 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         int yardRemaining;
         BlockPos yardNearest;
         /**
+         * The ring. Copied in from {@link TrenchScan} the same way the yard is.
+         *
+         * {@code trenchWanted} is carried rather than re-derived because
+         * {@link #percent()} has to tell "no trench asked for" from "a trench with
+         * everything still to do" - without it a settlement that never wanted one
+         * could never reach a hundred per cent.
+         */
+        boolean trenchWanted;
+        int trenchRemaining;
+        BlockPos trenchNearest;
+        int trenchLightTotal, trenchLightCorrect;
+        List<BlockPos> trenchMissingLights = List.of();
+        boolean trenchGateStanding = true;
+        /**
          * The nearest doorway or toast slot with something standing in it.
          *
          * Openings are meant to be air, so they are neither "missing shell" nor
@@ -1195,7 +1979,7 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         /**
          * THE WORLD IS THE LEDGER.
          *
-         * Burnt-side, an install is booked the moment the companion reports the
+         * Host-side, an install is booked the moment the companion reports the
          * place finished - and a CANCELLED task reports finished too
          * (UserTaskChain.cancel runs the same onFinish path). So an F1 takeover
          * mid-place books an appliance that is not there, and the block is
@@ -1213,6 +1997,15 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
          * forever while five perfectly good spots waited behind it.
          */
         final List<BlockPos> missingTorches = new ArrayList<>();
+        /**
+         * The same, for the ground torches out in the yard. Kept as its own tally
+         * rather than folded into the wall torches because the two are placed
+         * differently (a wall face versus the ground), happen at different points
+         * in the build, and answer different questions on the readout - "is the
+         * house lit" and "is the yard lit" are not one fact.
+         */
+        int perimeterTotal, perimeterCorrect;
+        final List<BlockPos> missingPerimeter = new ArrayList<>();
         // The nearest thing she could fix WITHOUT Baritone, so a refusal from the
         // builder still has somewhere to go. Nearest, not first, because the walk
         // is most of the cost of doing it by hand.
@@ -1237,11 +2030,21 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
          * reads as outstanding and the house is never reported finished on the
          * strength of having given up on part of it.
          */
-        static Survey scan(AltoClef mod, Settlement settlement, YardScan yard, java.util.Set<BlockPos> deferred) {
+        static Survey scan(AltoClef mod, Settlement settlement, YardScan yard, TrenchScan trench,
+                           java.util.Set<BlockPos> deferred) {
             Survey out = new Survey();
             out.scannedAt = System.currentTimeMillis();
             out.yardRemaining = yard == null ? 0 : yard.remaining;
             out.yardNearest = yard == null ? null : yard.nearest;
+            out.trenchWanted = settlement.trenchEnabled();
+            if (trench != null) {
+                out.trenchRemaining = trench.remaining;
+                out.trenchNearest = trench.nearest;
+                out.trenchLightTotal = trench.lightTotal;
+                out.trenchLightCorrect = trench.lightsCorrect();
+                out.trenchMissingLights = trench.missingLights;
+                out.trenchGateStanding = trench.gateStanding;
+            }
             BlockPos me = mod.getPlayer() != null ? mod.getPlayer().blockPosition() : settlement.origin();
             double nearestInterior = Double.MAX_VALUE;
             double nearestShell = Double.MAX_VALUE;
@@ -1330,6 +2133,24 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
                     if (out.firstMissingTorch == null) out.firstMissingTorch = pos;
                 }
             }
+            for (BlockPos pos : settlement.perimeterLightPositions()) {
+                out.perimeterTotal++;
+                BlockState state = mod.getWorld().getBlockState(pos);
+                // ANY torch counts as lit. She clicks the top of a block, so
+                // vanilla gives her a standing TORCH - but a spot next to a wall
+                // can come out as a WALL_TORCH, and it lights the ground just the
+                // same. Insisting on the exact block would send her back to
+                // re-place a torch that is already burning, forever.
+                // the tally stays blind to every deferral, same as the rest of the
+                // survey: a spot she has given up on still reads as outstanding, so
+                // the yard is never reported lit on the strength of giving up.
+                // Skipping one is a job for the target picker (see nextPerimeterTarget).
+                if (state.getBlock() == Blocks.TORCH || state.getBlock() == Blocks.WALL_TORCH) {
+                    out.perimeterCorrect++;
+                } else {
+                    out.missingPerimeter.add(pos);
+                }
+            }
             return out;
         }
 
@@ -1348,7 +2169,21 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
         }
 
         boolean complete() {
-            return housed() && yardRemaining == 0;
+            return housed() && yardRemaining == 0 && perimeterCorrect == perimeterTotal
+                && trenchDone();
+        }
+
+        /**
+         * A trench nobody asked for is finished by definition.
+         *
+         * This is what keeps every homestead already standing out of a 1250-block
+         * dig it never agreed to: {@code trenchWanted} is off unless the build was
+         * dispatched with the flag, and then {@link #complete()} is exactly the
+         * sentence it was before.
+         */
+        boolean trenchDone() {
+            if (!trenchWanted) return true;
+            return trenchRemaining == 0 && trenchLightCorrect == trenchLightTotal && trenchGateStanding;
         }
 
         /**
@@ -1362,7 +2197,11 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
                 // felling a yard IS the work during that phase, so it has to count
                 // as progress here or the stall watchdog condemns a builder that is
                 // visibly chopping down a wood.
-                + "/" + applianceCorrect + "/" + yardRemaining;
+                + "/" + applianceCorrect + "/" + yardRemaining + "/" + perimeterCorrect
+                // digging the ring IS the work during that phase, for the same
+                // reason felling the yard is - leave it out and the six-minute
+                // stall budget condemns a builder that is visibly excavating.
+                + "/" + trenchRemaining + "/" + trenchLightCorrect;
         }
 
         /**
@@ -1375,14 +2214,21 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
          */
         int progressScore() {
             return floorCorrect + wallCorrect + roofCorrect + slotCorrect
-                + entranceCorrect + torchCorrect + applianceCorrect
-                - clearRemaining - yardRemaining;
+                + entranceCorrect + torchCorrect + applianceCorrect + perimeterCorrect
+                + trenchLightCorrect
+                - clearRemaining - yardRemaining - trenchRemaining;
         }
 
         /** Short human-readable "what is left" for the stall warning. */
         String remainingSummary() {
             return "shell " + smoothStoneRemaining() + ", clear " + clearRemaining
-                + ", torches " + (torchTotal - torchCorrect) + ", yard " + yardRemaining;
+                + ", torches " + (torchTotal - torchCorrect) + ", yard " + yardRemaining
+                + ", yard lights " + (perimeterTotal - perimeterCorrect)
+                + (trenchWanted
+                    ? ", trench " + trenchRemaining
+                        + ", trench lights " + (trenchLightTotal - trenchLightCorrect)
+                        + (trenchGateStanding ? "" : ", no gate")
+                    : "");
         }
 
         void noteShell(BlockState state) {
@@ -1424,14 +2270,27 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             // It is scored as "how close to done does this look", which reaches
             // full marks the moment nothing is left and degrades gently otherwise.
             double yardScore = yardRemaining <= 0 ? 1.0 : Math.max(0.0, 1.0 - yardRemaining / 400.0);
-            double weighted = ratio(floorCorrect, floorTotal) * 0.17
-                + ratio(wallCorrect, wallTotal) * 0.20
-                + ratio(roofCorrect, roofTotal) * 0.17
-                + ratio(slotCorrect, slotTotal) * 0.10
-                + ratio(entranceCorrect, entranceTotal) * 0.07
-                + Math.max(0.0, clear) * 0.10
+            double weighted = ratio(floorCorrect, floorTotal) * 0.16
+                + ratio(wallCorrect, wallTotal) * 0.19
+                + ratio(roofCorrect, roofTotal) * 0.16
+                + ratio(slotCorrect, slotTotal) * 0.09
+                + ratio(entranceCorrect, entranceTotal) * 0.06
+                + Math.max(0.0, clear) * 0.09
                 + ratio(torchCorrect, torchTotal) * 0.09
-                + yardScore * 0.10;
+                + yardScore * 0.09
+                + ratio(perimeterCorrect, perimeterTotal) * 0.07;
+            // THE TRENCH IS FOLDED IN, NOT ADDED TO THE TABLE. Reserving a slice of
+            // the weights for it would cap every settlement that never wanted one
+            // below a hundred; rescaling only when it is asked for leaves the nine
+            // ratios above summing to 1.0 exactly as they did.
+            if (trenchWanted) {
+                double dug = trenchRemaining <= 0 ? 1.0
+                    : Math.max(0.0, 1.0 - trenchRemaining / 1300.0);
+                double trenchScore = dug * 0.80
+                    + ratio(trenchLightCorrect, trenchLightTotal) * 0.15
+                    + (trenchGateStanding ? 0.05 : 0.0);
+                weighted = weighted * 0.90 + trenchScore * 0.10;
+            }
             return complete() ? 100 : Math.min(99, Math.max(0, (int) Math.floor(weighted * 100.0)));
         }
 
@@ -1448,6 +2307,11 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             json.addProperty("depth", s.depth());
             json.addProperty("height", s.height());
             json.addProperty("material", shellMaterialName(s));
+            // HOW MUCH OF THE PLAN IS CURRENTLY BEING ASKED FOR. Every fixture
+            // count below is scoped to it, so burnt's side reading "appliances
+            // 3 of 3" needs to know it is looking at the lived-in stage and not
+            // at a finished 355-slot toaster.
+            json.addProperty("stage", s.stage().name().toLowerCase(java.util.Locale.ROOT));
             json.addProperty("phase", phase);
             json.addProperty("percent", percent());
             json.addProperty("complete", complete());
@@ -1469,8 +2333,28 @@ public final class ToasterBuildTask extends Task implements ITaskRequiresGrounde
             json.addProperty("yardClear", yardRemaining == 0);
             json.addProperty("yardRemaining", yardRemaining);
             json.addProperty("yardMargin", Settlement.YARD_MARGIN);
+            // THE RING. `trench` is what burnt's side reads to know whether this
+            // settlement is even supposed to have one - the counters below are all
+            // zero either way, so without it "nothing left to dig" and "not digging"
+            // are the same reading.
+            json.addProperty("trench", trenchWanted);
+            json.addProperty("trenchDone", trenchDone());
+            json.addProperty("trenchRemaining", trenchRemaining);
+            json.addProperty("trenchLights", trenchLightCorrect);
+            json.addProperty("trenchLightsRequired", trenchLightTotal);
+            json.addProperty("trenchLightsRemaining", trenchLightTotal - trenchLightCorrect);
+            json.addProperty("trenchGate", trenchGateStanding);
+            json.addProperty("trenchDepth", Settlement.TRENCH_DEPTH);
+            json.addProperty("trenchWidth", Settlement.TRENCH_WIDTH);
             json.addProperty("torches", torchCorrect);
             json.addProperty("torchesRequired", torchTotal);
+            // the yard lights are reported apart from the wall torches: "the house
+            // is lit" and "nothing spawns outside it" are different promises and
+            // burnt's side says different things about them.
+            json.addProperty("yardLit", perimeterCorrect == perimeterTotal && perimeterTotal > 0);
+            json.addProperty("yardLights", perimeterCorrect);
+            json.addProperty("yardLightsRequired", perimeterTotal);
+            json.addProperty("yardLightSpacing", Settlement.PERIMETER_LIGHT_SPACING);
             // the gallery as the WORLD has it, so a booked-but-absent appliance
             // cannot retire its block from the plan permanently
             json.addProperty("appliances", applianceCorrect);

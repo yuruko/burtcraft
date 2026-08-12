@@ -5,7 +5,7 @@ import adris.altoclef.commandsystem.Arg;
 import adris.altoclef.commandsystem.ArgParser;
 import adris.altoclef.commandsystem.Command;
 import adris.altoclef.commandsystem.CommandException;
-import adris.altoclef.tasks.construction.PlaceBlockNearbyTask;
+import adris.altoclef.tasks.construction.AcquireAndPlaceBlockTask;
 import adris.altoclef.tasks.misc.PlaceBedAndSetSpawnTask;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
@@ -45,6 +45,8 @@ public class PlaceCommand extends Command {
         if (block == null || block == Blocks.AIR) {
             throw new CommandException("unknown block: " + cleaned);
         }
-        mod.runUserTask(new PlaceBlockNearbyTask(block), this::finish);
+        // "she COLLECTS heat appliances and places them" (above) was only ever half
+        // true - the collecting had no step. same hole as @place_at.
+        mod.runUserTask(new AcquireAndPlaceBlockTask(block), this::finish);
     }
 }

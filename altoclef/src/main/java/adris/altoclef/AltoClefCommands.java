@@ -40,7 +40,11 @@ public class AltoClefCommands {
                 new SelfCareCommand(),
                 new PlaceCommand(),
                 new PlaceAtCommand(),
-                new ToasterBuildCommand()
+                new ToasterBuildCommand(),
+                new FarmCommand(),
+                new BuildPlanCommand(),
+                new PeekCommand(),
+                new WithdrawCommand()
                 //new TestMoveInventoryCommand(),
                 //    new TestSwapInventoryCommand()
         );

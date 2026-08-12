@@ -8,6 +8,7 @@ import adris.altoclef.tasks.container.SmeltInFurnaceTask;
 import adris.altoclef.tasksystem.Task;
 import adris.altoclef.util.ItemTarget;
 import adris.altoclef.util.SmeltTarget;
+import adris.altoclef.util.helpers.WorldHelper;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.item.Items;
 import net.minecraft.core.BlockPos;
@@ -34,11 +35,33 @@ public class CollectIronIngotTask extends ResourceTask {
         mod.getBlockTracker().trackBlock(Blocks.FURNACE, Blocks.BLAST_FURNACE);
     }
 
+    /**
+     * a blast furnace this task could actually USE, by the same test the
+     * container task applies - placed, tracked, and reachable from here.
+     * <p>
+     * ⚠ THE CHOICE MUST BE MADE ON THE TEST THAT DECIDES WHETHER THE CHOICE
+     * WORKS. this used to ask `anyFound(BLAST_FURNACE)`, true for any blast
+     * furnace the tracker has ever seen - including one in a stranger's base
+     * 300 blocks off behind a claim. {@link adris.altoclef.tasks.container.DoStuffInContainerTask}
+     * then applied the stricter `getNearestTracking(pos, canReach, ...)`, found
+     * nothing, and went to CRAFT one - and a blast furnace costs 5 iron ingots,
+     * which is exactly what we are standing here collecting. that closed a
+     * cycle (collect iron -> smelt in blast furnace -> craft blast furnace ->
+     * collect iron) which allocates a fresh task at every level and descends
+     * until the stack dies. it crashed the client five times on 2026-08-06.
+     */
+    private static Optional<BlockPos> usableBlastFurnace(AltoClef mod) {
+        return mod.getBlockTracker().getNearestTracking(
+                mod.getPlayer().position(),
+                blockPos -> WorldHelper.canReach(mod, blockPos),
+                Blocks.BLAST_FURNACE);
+    }
+
     @Override
     protected Task onResourceTick(AltoClef mod) {
         if (mod.getModSettings().shouldUseBlastFurnace()) {
             if (mod.getItemStorage().hasItem(Items.BLAST_FURNACE) ||
-                    mod.getBlockTracker().anyFound(Blocks.BLAST_FURNACE) ||
+                    usableBlastFurnace(mod).isPresent() ||
                     mod.getEntityTracker().itemDropped(Items.BLAST_FURNACE)) {
                 return new SmeltInBlastFurnaceTask(new SmeltTarget(new ItemTarget(Items.IRON_INGOT, _count), new ItemTarget(Items.RAW_IRON, _count)));
             }

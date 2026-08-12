@@ -88,7 +88,6 @@ public class MovementTraverse extends Movement {
             boolean water = false;
             boolean sneaking = false;
             if (MovementHelper.isWater(pb0) || MovementHelper.isWater(pb1)) {
-                // BURNT: a dry path may only enter water across a narrow crossing.
                 if (!context.canCrossSmallWater(x, y, z, destX, destZ)) {
                     return COST_INF;
                 }
@@ -147,7 +146,6 @@ public class MovementTraverse extends Movement {
                     return COST_INF;
                 }
                 double hardness2 = MovementHelper.getMiningDurationTicks(context, destX, y + 1, destZ, pb0, true); // only include falling on the upper block to break
-                // BURNT: same bounded-crossing rule on the break-and-walk branch.
                 if (throughWater && !context.canCrossSmallWater(x, y, z, destX, destZ)) {
                     return COST_INF;
                 }
