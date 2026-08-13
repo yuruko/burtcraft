@@ -78,6 +78,34 @@ const COMFORT_MERGE_DIST = 1;
 const MAX_PLAYERS = 48;
 const MAX_PLAYER_REQUESTS = 4;                  // the last few things one person asked of her
 const MAX_PLAYER_NOTES = 3;
+// HOW LONG AN UNMET ASK IS STILL OWED.
+//
+// `_looksLikeRequest` is deliberately broad - it would rather file a real ask as
+// conversation-shaped than miss one - so the requests ledger legitimately holds
+// greetings and jokes. That is fine as a RECORD and was poison as an OBLIGATION:
+// `playersContext` surfaced the newest un-done entry as "still wants: X" forever,
+// under a prompt line that says an ask she never got round to is still owed. On the
+// live save that told her, permanently, that one player still wanted a greeting they
+// had said in passing and another still wanted a one-line joke about taxes - 6 of the
+// 8 open asks were greetings. She cannot discharge a debt that was never incurred, so
+// it never cleared and every one of those people read as someone she had let down.
+// (⚠ the real usernames and quotes were here, and this file syncs to a PUBLIC repo -
+// what somebody typed in a game is theirs, and a git history cannot be taken back.)
+//
+// Two gates now, and they are different questions on purpose:
+//  - it must have PARSED to an action. That is the honest test for "work she took
+//    on and has not finished"; a line with no verb was answered in words by the
+//    freeform lane and owes nothing further.
+//  - it must be RECENT. A job from four days ago that never completed is history,
+//    not a standing obligation, and dragging it into every prompt is how she ends
+//    up apologising to someone who has long since forgotten they asked.
+const PLAYER_REQUEST_OWED_MS = 6 * 60 * 60 * 1000;
+// what she brings back from a trip. small on purpose: this is the story, not a log.
+const MAX_EXPEDITION_DISCOVERIES = 8;
+// vanilla ships ~120 advancements and she plays several worlds. generous, because
+// eviction here loses a thing she DID and there is no world source to re-derive it
+// from - unlike ore or food spots, a beaten dragon is not re-observable.
+const MAX_CONQUESTS = 500;
 const MAX_TERRAIN_CELLS = 4000;
 const MAX_CLAIMED_CELLS = 400;
 const MAX_VISITED_SPOTS = 256;
@@ -126,7 +154,17 @@ export const PLACE_FEATURES = {
     hostile: 'hostiles about',
     dark: 'dark even in the day',
     wet_ground: 'waterlogged ground',
-    ruin: 'ruins'
+    ruin: 'ruins',
+    // real dungeon content, each identified by a block that occurs nowhere else.
+    // ⚠ A NEW FEATURE TOUCHES THREE REGISTRIES and only this one is prose: it must
+    // also go in PLACE_NOTABLE_FEATURES (or the place is recorded and immediately
+    // judged worthless) and, if it is worth stopping for, PLACE_STRIKING_FEATURES -
+    // both in minecraft_tool.js. `ruin` sat in the latter two with no producer for
+    // months; this is the same trap from the other end.
+    dungeon: 'a mob spawner dungeon',
+    trial_chamber: 'a trial chamber',
+    vault: 'a vault',
+    deep_dark: 'the deep dark'
 };
 // she is meant to remember every place she has lived, so this is a runaway
 // guard rather than a working limit - and eviction is by value, never by age
@@ -141,17 +179,14 @@ const OVEN_MERGE_DIST = 3;                  // same block, re-reported by the sc
 // named unit in a collection it keeps track of - a cheap, durable source of
 // "things that are mine" for a character to refer back to.
 export const OVEN_KINDS = ['furnace', 'blast_furnace', 'smoker', 'campfire', 'soul_campfire'];
-// auto-names for units the idle brain installs, in her antique-toaster register
-// (model names, chrome-and-bakelite era, a couple of clergy). her own brain can
-// override with a name when it places one through the tool.
 // auto-names for units the idle brain installs, used only when the brain does
 // not supply one through the tool.
 //
 // THIS IS CHARACTER FLAVOR, and it is the one place persona would otherwise leak
 // into an otherwise neutral memory layer. the default below is deliberately
-// plain. pass your own register to the constructor - burnt's, for instance, is a
-// set of antique-toaster model names because she collects them:
-//     new MinecraftMemory(path, { ovenNames: ['sunbeam', 'bakelite betty', ...] })
+// plain. pass your own register to the constructor - anything your character
+// would plausibly have named:
+//     new MinecraftMemory(path, { ovenNames: ['the kettle', 'big red', ...] })
 const DEFAULT_OVEN_NAME_POOL = [
     'the first one', 'old reliable', 'number two', 'the spare', 'the good one',
     'backup', 'the corner unit', 'the loud one', 'the new one', 'the small one'
@@ -438,7 +473,41 @@ export class MinecraftMemory {
             // world. same job as biomes and for the same reason - it is the
             // only honest source of "i have never seen one of these before",
             // which is the single best thing she has to say about a mob.
-            creatures: {}
+            creatures: {},
+            // THE TRIP SHE IS CURRENTLY ON. null when she is just living at home.
+            //
+            // Every travel decision in this codebase was a SINGLE HOP - pick a landing
+            // spot, walk to it, forget why. That is why she orbited: `_pickLandingSpot`
+            // clamps any hop into unknown ground to BLIND_WANDER_MAX (200), and the
+            // night home-pull reels her back from up to 1200 out, so distance could
+            // never accumulate. Measured on the live save: 9 visited cells, furthest
+            // 630 blocks, mean 337 - while her own favourites from an earlier era sit
+            // 2789-4613 blocks away.
+            //
+            // An expedition is the missing thing: a COMMITMENT that survives the hop.
+            // It does not raise the per-hop clamp (200 blocks into unknown terrain is a
+            // survivable step and a 900-block blind leap across an ocean is not) - it
+            // just keeps taking outward steps until the total is what she meant. Legs
+            // accumulate; the clamp stays.
+            //
+            // ⚠ PERSISTED, and therefore in the _load() whitelist. A trip that resets
+            // on restart is the go-home campaign bug again: the whole value is that she
+            // is still 2000 blocks out and still means to be when the process bounces.
+            expedition: null,
+            // WHAT SHE HAS ACTUALLY BEATEN. Keyed by milestone id, per world.
+            //
+            // Before this there was NO notion of progression anywhere in the stack.
+            // The only signal was a regex on the chat string "X has made the
+            // advancement [Y]", which wrote a `landmarks` entry that nothing but a
+            // three-line prose dump ever read - so she could not answer "have i done
+            // the nether yet", could not tell a first kill from a hundredth, and had
+            // no way to want anything. On a survival server that is most of what a
+            // player IS.
+            //
+            // ⚠ WORLD-SCOPED, and this one really matters: advancements are per-server.
+            // Carrying that server's conquests onto a fresh server would have her claiming
+            // a dragon she has not fought here.
+            conquests: {}
         };
         this._dirty = false;
         this._saveTimer = null;
@@ -447,9 +516,37 @@ export class MinecraftMemory {
         if (registerExitHook) process.once('exit', () => this.flush());
     }
 
+    // ⚠⚠ TWO DIFFERENT FAILURES LIVE IN HERE AND THEY NEED OPPOSITE ANSWERS.
+    //
+    // "the file is damaged" -> keep it aside so the history is recoverable by hand,
+    // and start clean. That is what the rename below is for and it is correct.
+    //
+    // "our own migration code threw" -> the file is FINE. Renaming it aside is then
+    // the total loss the guard exists to prevent, caused by the guard: the good
+    // 154 KB ledger is moved out of the way, the constructor defaults stay in
+    // place, and the first record() of the session writes empty ledgers over it.
+    // The old single try covered the parse AND every evictor, settlementFromJSON,
+    // _restoreSettlementUpgrades and _sanitizeExpedition - so one malformed
+    // position reaching one eviction scorer, or any bug introduced in any of them,
+    // destroyed her memory on startup and reported it as a corrupt file.
+    //
+    // So: the rename belongs to the parse alone. A fault in the migration logs and
+    // keeps whatever was already restored.
     _load() {
+        let parsed = null;
         try {
-            const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+            parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+        } catch (err) {
+            if (err.code === 'ENOENT') return;   // first run; nothing to load or save
+            console.warn(`[minecraft-memory] unable to read memory: ${err.message}`);
+            try {
+                const aside = `${this.filePath}.corrupt-${Date.now()}`;
+                fs.renameSync(this.filePath, aside);
+                console.warn(`[minecraft-memory] kept the unreadable file at ${aside}`);
+            } catch { /* nothing left to save */ }
+            return;
+        }
+        try {
             if (parsed && typeof parsed === 'object') {
                 // drop the cosmetic-heartbeat entries a previous build wrote as real
                 // completions. they had taken 208 of 240 slots and evicted her actual
@@ -597,6 +694,19 @@ export class MinecraftMemory {
                 this.data.creatures = parsed.creatures && typeof parsed.creatures === 'object' && !Array.isArray(parsed.creatures)
                     ? parsed.creatures
                     : {};
+                // ⚠ AND THE TRIP. an expedition that resets on restart is not an
+                // expedition - she wakes 2400 blocks from home with no idea she meant
+                // to be there and the home-pull walks her straight back, which is the
+                // exact loop the feature exists to break. validated rather than
+                // trusted: a half-written record with no origin or no bearing would
+                // send her walking on NaN.
+                this.data.expedition = this._sanitizeExpedition(parsed.expedition);
+                // ⚠ AND THE CONQUESTS. Losing these does not read as forgetting - it
+                // reads as her announcing her first ever nether trip for the fourth
+                // time, which is the single failure that makes a progression system
+                // worse than not having one.
+                this.data.conquests = parsed.conquests && typeof parsed.conquests === 'object'
+                    && !Array.isArray(parsed.conquests) ? parsed.conquests : {};
 
                 // ⚠ THE SAME LESSON, FOUR MORE LEDGERS. these restores are not
                 // optional polish: a ledger this function forgets is a ledger the
@@ -731,18 +841,11 @@ export class MinecraftMemory {
                 };
             }
         } catch (err) {
-            if (err.code !== 'ENOENT') {
-                console.warn(`[minecraft-memory] unable to load memory: ${err.message}`);
-                // a truncated file used to escalate into TOTAL loss: the catch left
-                // the empty constructor defaults in place and the next record flushed
-                // them straight over her journal, landmarks, home and settlements.
-                // keep the damaged copy so the history is recoverable by hand.
-                try {
-                    const aside = `${this.filePath}.corrupt-${Date.now()}`;
-                    fs.renameSync(this.filePath, aside);
-                    console.warn(`[minecraft-memory] kept the unreadable file at ${aside}`);
-                } catch { /* nothing left to save */ }
-            }
+            // the file parsed, so it is not damaged - this is our own code. keep
+            // every ledger that made it in, leave the file on disk untouched, and
+            // say so loudly. NEVER rename here: see the note above _load.
+            console.warn(`[minecraft-memory] memory migration failed (${err.message}) `
+                + '- keeping whatever loaded, file left intact');
         }
     }
 
@@ -771,7 +874,14 @@ export class MinecraftMemory {
             const temp = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
             const fd = fs.openSync(temp, 'w');
             try {
-                fs.writeFileSync(fd, JSON.stringify(this.data, null, 2), 'utf8');
+                // ⚠ NOT pretty-printed. This is a machine file that gets rewritten
+                // ~40 times a minute during play, synchronously, on the same event
+                // loop her chat and tts run on. On the live ledger the indentation
+                // was 157,780 bytes against 100,618 compact - 57% of every write,
+                // every fsync and every stringify spent on whitespace nobody reads.
+                // `node -e "console.log(JSON.stringify(JSON.parse(fs.readFileSync(f)),null,2))"`
+                // when a human does need to look at it.
+                fs.writeFileSync(fd, JSON.stringify(this.data), 'utf8');
                 fs.fsyncSync(fd);   // rename is only atomic against a file that reached the disk
             } finally {
                 fs.closeSync(fd);
@@ -806,7 +916,13 @@ export class MinecraftMemory {
     recordLandmark(label, state = {}) {
         const point = safePoint(state.position);
         if (!point) return null;
-        const entry = { at: Date.now(), label: cleanText(label), position: point, dimension: cleanText(state.dimension || 'overworld', 64) };
+        // ⚠ normalizeDimension, not cleanText. This was the one spatial writer in
+        // the file that stored the dimension raw, while its own dedupe two lines
+        // below compares `old.dimension === entry.dimension` - so `overworld` and
+        // `minecraft:overworld` were two different places at the same coordinates
+        // and the dedupe silently stopped working across them. The live ledger has
+        // both spellings in it (58 of one, 1 of the other) for exactly this reason.
+        const entry = { at: Date.now(), label: cleanText(label), position: point, dimension: normalizeDimension(state.dimension) };
         // ⚠ scoped, like every other spatial ledger here. an unscoped landmark
         // puts the place she died on one server onto the map of every other.
         if (state.world) entry.world = cleanText(state.world, 64);
@@ -875,10 +991,24 @@ export class MinecraftMemory {
         return key ? this.data.foodSpots.find((s) => s.id === key) || null : null;
     }
 
-    _foodSpotAt(point, dim, kind, radius = FOOD_SPOT_MERGE_DIST) {
+    // ⚠ `world` IS OPTIONAL AND OMITTING IT MEANS "ANY WORLD". Every reader of this
+    // ledger (nearestFoodSpot and friends) filters by world, and every neighbouring
+    // ledger scopes its own lookups - this one and its ore twin were the two that
+    // did not. That matters most on the MERGE path, which then stamps the incoming
+    // world onto whatever it matched: a field at the same x/z on a singleplayer save
+    // and on a server collapses into one entry whose `world` is whichever wrote
+    // last, and the reader on the other world then filters that entry out entirely.
+    // The live ledger already has the trigger loaded - several spots carry no world
+    // at all, so the first walk past those coordinates on a server would have
+    // stamped them to it for good.
+    // The predicate is the same legacy-tolerant one the rest of the file uses: an
+    // entry with no world recorded still matches, so nothing already saved is lost.
+    _foodSpotAt(point, dim, kind, radius = FOOD_SPOT_MERGE_DIST, world = null) {
         const want = normalizeDimension(dim);
+        const here = world ? cleanText(world, 64) : null;
         return this.data.foodSpots.find((s) => s.kind === kind &&
             normalizeDimension(s.dimension) === want &&
+            !(here && s.world && s.world !== here) &&
             Math.hypot(s.position.x - point.x, s.position.z - point.z) <= radius);
     }
 
@@ -894,7 +1024,9 @@ export class MinecraftMemory {
         // `minecraft:` and the writer used to keep it, so a companion that sent a
         // bare `overworld` created a second entry for a field she already knew.
         const dim = normalizeDimension(dimension);
-        const existing = this._foodSpotAt(point, dim, type);
+        // scoped: this branch STAMPS `world` onto whatever it matches (see below),
+        // so matching across worlds would rewrite another world's entry.
+        const existing = this._foodSpotAt(point, dim, type, FOOD_SPOT_MERGE_DIST, world);
         if (existing) {
             existing.at = Date.now();
             if (world) existing.world = cleanText(world, 64);
@@ -983,11 +1115,14 @@ export class MinecraftMemory {
         const dim = normalizeDimension(dimension);
         const kinds = kind ? [cleanText(kind, 24).toLowerCase()] : Object.keys(FOOD_SPOT_KINDS);
         let result = null;
+        this._spotEmptyWrote = false;
         for (const k of kinds) {
             const verdict = this._markSpotEmpty(this._foodSpotAt(point, dim, k, radius), now, { reported });
             if (verdict === 'forgotten' || !result) result = verdict || result;
         }
-        if (result) this._save();
+        // ⚠ SAVE ON A WRITE, NOT ON A VERDICT. "still empty" inside the debounce is
+        // a truthy verdict that changed nothing - see _markSpotEmpty.
+        if (this._spotEmptyWrote) this._save();
         return result;
     }
 
@@ -997,8 +1132,9 @@ export class MinecraftMemory {
     // aborted up to LOOP_CONFINE_RADIUS away) and safer (a `get wheat` that failed
     // near her homestead for unrelated reasons is not evidence against her field).
     noteFoodSpotEmptyById(id, now = Date.now()) {
+        this._spotEmptyWrote = false;
         const result = this._markSpotEmpty(this.getFoodSpotById(id), now);
-        if (result) this._save();
+        if (this._spotEmptyWrote) this._save();
         return result;
     }
 
@@ -1009,12 +1145,28 @@ export class MinecraftMemory {
     _markSpotEmpty(spot, now = Date.now(), { reported = false } = {}) {
         if (!spot) return null;
         const restating = spot.emptyAt && now - spot.emptyAt < EMPTY_NOTE_DEBOUNCE_MS;
+        // ⚠⚠ RETURN BEFORE WRITING ANYTHING. this used to re-stamp emptyAt/ripe/at
+        // first and return 'regrowing' second, and every caller treats a truthy
+        // verdict as "something changed" and calls _save(). the observer behind it
+        // runs on the 2-SECOND STATE FRAME with no throttle of its own, so standing
+        // in a field she had just harvested - or beside a pasture she had just
+        // cleared - meant a full JSON.stringify + 154 KB write + fsync of the whole
+        // ledger every 1.5s, indefinitely, on the same event loop her chat and tts
+        // run on. inside the debounce window NOTHING IS BEING LEARNED: emptyAt was
+        // set when the window opened, and the miss streak is deliberately not
+        // advanced. so the honest answer is "yes, still empty" with no write at all.
+        // (the sibling guard in recordContainer says the same thing in its own
+        // comment - this is that bug, one ledger over.)
+        if (restating) return 'regrowing';
+        // from here on we are actually changing the ledger. the flag is how the two
+        // public callers tell a real write from a debounced restate; it is set
+        // false by each of them immediately before the call.
+        this._spotEmptyWrote = true;
         spot.emptyAt = now;
         spot.ripe = 0;
         // she was just there, so it is not a STALE entry - keep it fresh for the
         // eviction tie-break. the miss streak, not age, is what retires it.
         spot.at = now;
-        if (restating) return 'regrowing';
         const next = (spot.misses || 0) + 1;
         if (reported) {
             spot.misses = Math.min(next, FOOD_SPOT_DROP_MISSES - 1);
@@ -1384,6 +1536,166 @@ export class MinecraftMemory {
             });
     }
 
+    // ---- conquests: what she has actually beaten -------------------------------
+
+    _conquestKey(world, id) {
+        return `${world ? cleanText(world, 64) : 'any'}::${cleanText(id, 64)}`;
+    }
+
+    /**
+     * She beat something. Idempotent by (world, id): the FIRST time is the only time
+     * that is news, and everything downstream depends on being able to tell a first
+     * kill from a hundredth.
+     *
+     * Returns `{ entry, first }` - `first` is what a caller should gate an
+     * announcement on. Returning the entry either way means a repeat still updates
+     * `count` and `lastAt` without ever re-firing the moment.
+     */
+    recordConquest(id, { world = null, label = null, kind = 'milestone', position = null, dimension = null } = {}) {
+        const key = this._conquestKey(world, id);
+        if (!this.data.conquests || typeof this.data.conquests !== 'object') this.data.conquests = {};
+        const existing = this.data.conquests[key];
+        const now = Date.now();
+        if (existing) {
+            existing.count = (existing.count || 1) + 1;
+            existing.lastAt = now;
+            this._save();
+            return { entry: existing, first: false };
+        }
+        const keys = Object.keys(this.data.conquests);
+        if (keys.length >= MAX_CONQUESTS) delete this.data.conquests[keys[0]];
+        const entry = {
+            id: cleanText(id, 64),
+            kind: cleanText(kind, 24),
+            label: cleanText(label, 80) || cleanText(id, 64),
+            world: world ? cleanText(world, 64) : null,
+            at: now, lastAt: now, count: 1,
+            position: safePoint(position),
+            dimension: dimension ? normalizeDimension(dimension) : null
+        };
+        this.data.conquests[key] = entry;
+        this._save();
+        return { entry, first: true };
+    }
+
+    hasConquered(id, world = null) {
+        return !!this.data.conquests?.[this._conquestKey(world, id)];
+    }
+
+    listConquests(world = null) {
+        const scope = world ? cleanText(world, 64) : null;
+        return Object.values(this.data.conquests || {})
+            .filter((c) => !scope || !c.world || c.world === scope)
+            .sort((a, b) => (b.at || 0) - (a.at || 0));
+    }
+
+    conquestCount(world = null) { return this.listConquests(world).length; }
+
+    // ---- expeditions: the trip that survives the hop ---------------------------
+
+    /**
+     * A stored expedition is only usable if it can still answer "where from, which
+     * way, how far". A record missing any of those would put NaN into a `move`, and
+     * a NaN destination is the one failure mode that looks exactly like her standing
+     * still for no reason.
+     */
+    _sanitizeExpedition(raw) {
+        if (!raw || typeof raw !== 'object') return null;
+        const origin = safePoint(raw.origin);
+        const bearing = Number(raw.bearing);
+        const targetDist = Number(raw.targetDist);
+        if (!origin || !Number.isFinite(bearing) || !Number.isFinite(targetDist) || targetDist <= 0) return null;
+        if (raw.status !== 'out' && raw.status !== 'returning') return null;
+        return {
+            id: cleanText(raw.id, 48) || this._mintId('x', []),
+            startedAt: Number.isFinite(raw.startedAt) ? raw.startedAt : Date.now(),
+            world: raw.world ? cleanText(raw.world, 64) : null,
+            dimension: normalizeDimension(raw.dimension),
+            origin, bearing, targetDist,
+            furthest: Number.isFinite(raw.furthest) ? raw.furthest : 0,
+            legs: Number.isFinite(raw.legs) ? raw.legs : 0,
+            lastLegAt: Number.isFinite(raw.lastLegAt) ? raw.lastLegAt : 0,
+            // what she actually found out there - the whole point of going
+            discoveries: Array.isArray(raw.discoveries)
+                ? raw.discoveries.filter((d) => typeof d === 'string').slice(-MAX_EXPEDITION_DISCOVERIES)
+                : [],
+            status: raw.status,
+            reason: cleanText(raw.reason, 80) || null
+        };
+    }
+
+    getExpedition(world = null) {
+        const x = this.data.expedition;
+        if (!x) return null;
+        // ⚠ world-scoped like every other spatial record here. a trip on one server
+        // is not a trip on another, and resuming that server's bearing on a fresh server
+        // would march her into the sea for reasons she could not explain.
+        if (world && x.world && x.world !== cleanText(world, 64)) return null;
+        return x;
+    }
+
+    startExpedition({ origin, bearing, targetDist, world = null, dimension = 'overworld', reason = null } = {}) {
+        const point = safePoint(origin);
+        if (!point || !Number.isFinite(Number(bearing)) || !Number.isFinite(Number(targetDist))) return null;
+        this.data.expedition = {
+            id: this._mintId('x', []),
+            startedAt: Date.now(),
+            world: world ? cleanText(world, 64) : null,
+            dimension: normalizeDimension(dimension),
+            origin: point,
+            bearing: Number(bearing),
+            targetDist: Number(targetDist),
+            furthest: 0, legs: 0, lastLegAt: 0,
+            discoveries: [],
+            status: 'out',
+            reason: cleanText(reason, 80) || null
+        };
+        this._save();
+        return this.data.expedition;
+    }
+
+    /** one leg walked. `furthest` is a high-water mark, never a current reading. */
+    noteExpeditionLeg(distanceFromOrigin) {
+        const x = this.data.expedition;
+        if (!x) return null;
+        x.legs += 1;
+        x.lastLegAt = Date.now();
+        const d = Number(distanceFromOrigin);
+        // ⚠ MONOTONIC. a leg that ended closer than the last one (a detour round a
+        // ravine, a flee, a shelter run) must not lower the record of how far she got,
+        // or the "am i there yet" test can never be satisfied and the trip never ends.
+        if (Number.isFinite(d) && d > x.furthest) x.furthest = Math.round(d);
+        this._save();
+        return x;
+    }
+
+    noteExpeditionDiscovery(text) {
+        const x = this.data.expedition;
+        if (!x) return null;
+        const line = cleanText(text, 100);
+        if (!line || x.discoveries.includes(line)) return x;
+        x.discoveries.push(line);
+        while (x.discoveries.length > MAX_EXPEDITION_DISCOVERIES) x.discoveries.shift();
+        this._save();
+        return x;
+    }
+
+    setExpeditionStatus(status) {
+        const x = this.data.expedition;
+        if (!x || (status !== 'out' && status !== 'returning')) return null;
+        x.status = status;
+        this._save();
+        return x;
+    }
+
+    /** the trip is over. returns the finished record so the caller can journal it. */
+    endExpedition() {
+        const x = this.data.expedition;
+        this.data.expedition = null;
+        this._save();
+        return x;
+    }
+
     // ---- biomes she has actually been in -------------------------------------
     // tiny and cheap, and it buys the one thing places cannot: "i have never
     // seen this before". places are capped and evicted by value, so deriving
@@ -1455,8 +1767,16 @@ export class MinecraftMemory {
             if (!key) continue;
             const existing = this.data.creatures[key];
             if (existing) {
-                existing.seen = (existing.seen || 1) + 1;
+                // ⚠ THE COUNT IS ENCOUNTERS, NOT FRAMES, so it belongs INSIDE the
+                // debounce with `last`. It sat outside, and this method is fed by
+                // the 2-second state frame - so one cow standing next to her for ten
+                // minutes scored ~300 sightings. creatureSeenCount() is documented
+                // as the difference between "the second one" and "the two
+                // hundredth", and every line built on it was wrong from the first
+                // mob that lingered. Same debounce, same clock: a sighting counts
+                // once per CREATURE_TOUCH_DEBOUNCE_MS.
                 if (now - (existing.last || 0) >= CREATURE_TOUCH_DEBOUNCE_MS) {
+                    existing.seen = (existing.seen || 1) + 1;
                     existing.last = now;
                     changed = true;
                 }
@@ -1665,10 +1985,14 @@ export class MinecraftMemory {
         return key ? this.data.oreSpots.find((s) => s.id === key) || null : null;
     }
 
-    _oreSpotAt(point, dim, kind, radius = ORE_SPOT_MERGE_DIST) {
+    // same optional world scope as _foodSpotAt, and for the same reason - these two
+    // were the only merge lookups in the file without one.
+    _oreSpotAt(point, dim, kind, radius = ORE_SPOT_MERGE_DIST, world = null) {
         const want = normalizeDimension(dim);
+        const here = world ? cleanText(world, 64) : null;
         return this.data.oreSpots.find((s) => s.kind === kind &&
             normalizeDimension(s.dimension) === want &&
+            !(here && s.world && s.world !== here) &&
             Math.hypot(s.position.x - point.x, s.position.z - point.z) <= radius &&
             Math.abs(s.position.y - point.y) <= radius);
     }
@@ -1688,7 +2012,8 @@ export class MinecraftMemory {
         if (!point) return null;
         const dim = normalizeDimension(dimension);
         const now = Date.now();
-        const existing = this._oreSpotAt(point, dim, type);
+        // scoped for the same reason as recordFoodSpot: this branch stamps `world`.
+        const existing = this._oreSpotAt(point, dim, type, ORE_SPOT_MERGE_DIST, world);
         if (existing) {
             existing.at = now;
             if (world) existing.world = cleanText(world, 64);
@@ -2179,7 +2504,6 @@ export class MinecraftMemory {
 
     // ---- the oven family ----------------------------------------------------
     // every furnace/smoker/campfire she installs joins a named collection that
-    // survives restarts. this is the minecraft version of her antique toasters:
     // the units are individuals with names, not a block count.
 
     // pick a name that isn't taken yet; falls back to a numbered unit once the
@@ -3075,7 +3399,12 @@ export class MinecraftMemory {
             if (p.chats) bits.push(`${p.chats} talk${p.chats === 1 ? '' : 's'}`);
             if (p.gifts) bits.push(`${p.gifts} loaf${p.gifts === 1 ? '' : 's'} given`);
             if (!near.has(p.key)) bits.push(`last seen ${ago(p.lastSeen)}`);
-            const open = (p.requests || []).filter((r) => !r.done).slice(-1)[0];
+            // an ask is only OWED while it named real work and is still live - see
+            // PLAYER_REQUEST_OWED_MS. everything else they said is already carried by
+            // `lastSaid`, which is what it actually was: something they said.
+            const open = (p.requests || [])
+                .filter((r) => !r.done && r.action && (now - (r.at || 0)) <= PLAYER_REQUEST_OWED_MS)
+                .slice(-1)[0];
             if (open) bits.push(`still wants: ${open.text}`);
             if (p.lastSaid) bits.push(`said "${p.lastSaid}"`);
             if (p.notes?.length) bits.push(p.notes[p.notes.length - 1]);

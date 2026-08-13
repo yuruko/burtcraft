@@ -60,6 +60,8 @@ import net.minecraft.world.entity.projectile.arrow.SpectralArrow;
 import net.minecraft.world.entity.projectile.hurtingprojectile.SmallFireball;
 import net.minecraft.core.component.DataComponents;
 import adris.altoclef.util.helpers.ItemVersionHelper;
+import adris.altoclef.util.helpers.CombatGear;
+import adris.altoclef.tasks.entity.BowCombatTask;
 import net.minecraft.world.entity.projectile.throwableitemprojectile.AbstractThrownPotion;
 
 public class MobDefenseChain extends SingleTaskChain {
@@ -117,6 +119,16 @@ public class MobDefenseChain extends SingleTaskChain {
     private static final double FIGHT_HOLD_DISTANCE = 24;
     // below this, running really is the right call even from one zombie
     private static final float STAND_AND_FIGHT_MIN_HEALTH = 8;
+    // ---- ranged combat (see shouldFightAtRange / BowCombatTask) ----
+    // committing to a bow fight on the last arrow means running dry mid-engagement and
+    // falling back to melee anyway, having spent the opening trading shots she cannot make.
+    private static final int RANGED_MIN_ARROWS = 4;
+    // already this close: hit it. backing up to draw while something swings at her is
+    // strictly worse than swinging back.
+    private static final double RANGED_CONTACT_DISTANCE = 4;
+    // an arrow does full damage whatever is in her hand, so below a real weapon's worth
+    // of melee damage the bow is simply the better attack. a stone sword is 4.
+    private static final double RANGED_WEAK_MELEE_DAMAGE = 4;
     // how long a chosen defensive answer is held before a sibling answer may replace
     // it. must comfortably exceed a baritone path calculation (~1s at these ranges)
     // or the answer never gets far enough to be one. see commitTo().
@@ -146,8 +158,11 @@ public class MobDefenseChain extends SingleTaskChain {
     private static final double FROZEN_MOVE_EPSILON = 0.9;
     private static final double PANIC_TRIGGER_DISTANCE = 7;
     private static final double PANIC_HOLD_SECONDS = 1.2;
-    private static final Item[] SWORDS = new Item[]{Items.NETHERITE_SWORD, Items.DIAMOND_SWORD, Items.IRON_SWORD,
-            Items.GOLDEN_SWORD, Items.STONE_SWORD, Items.WOODEN_SWORD};
+    // (the old hardcoded SWORDS[] ladder lived here. It is gone on purpose: it was the
+    // reason a netherite AXE - which hits harder than the netherite sword - scored as
+    // bare hands and turned winnable fights into retreats. Ask CombatGear instead, which
+    // reads the game's own WEAPON marker, so the answer does not need a literal list
+    // somebody has to remember to extend.)
     private static boolean _shielding = false;
     private final DragonBreathTracker _dragonBreathTracker = new DragonBreathTracker();
     private final KillAura _killAura = new KillAura();
@@ -186,6 +201,46 @@ public class MobDefenseChain extends SingleTaskChain {
      * that starts the rebound, which is precisely when the miscount happened.
      */
     private boolean _overrideEngaged = false;
+
+    /**
+     * MELEE OR BOW, DECIDED ONCE PER TARGET AND THEN LEFT ALONE.
+     * <p>
+     * The decision inputs (distance, arrow count, line of sight) all move constantly, so
+     * re-asking every tick would swap the task in the chain slot at roughly the tick rate
+     * - which is the precise mechanism behind every freeze in this file's history. It is
+     * therefore latched when {@link #rememberFightTarget} sees a genuinely NEW target,
+     * and it is a ONE-WAY DOOR: ranged may fall back to melee (out of arrows, cannot line
+     * the shot up), melee never escalates to ranged mid-fight. A two-way door between two
+     * answers to the same question is the ping-pong, by construction.
+     */
+    private boolean _rangedEngagement = false;
+    /**
+     * The live bow task, kept so the fight branch can notice it has given up.
+     * <p>
+     * ⚠ this reference is load-bearing, not a convenience. SingleTaskChain neither ticks
+     * nor clears a FINISHED task, and setTask() is a no-op against an .equals() twin - so
+     * a bow task that ran out of arrows would sit in the slot forever while the chain
+     * held priority 65 and she stood still. That is the 2026-08-02 corpse-in-the-slot
+     * freeze wearing a new hat.
+     */
+    private BowCombatTask _bowTask;
+    /** true while she still has gear in the bag she has not managed to put on yet. */
+    private boolean _gearingUp = false;
+    /**
+     * "I would win this if I were wearing what I am carrying" - COMPUTED ON THE TICK
+     * THREAD, read by the companion poll.
+     * <p>
+     * ⚠ THE COMPANION POLL IS ITS OWN THREAD ("altoclef-state-poll", a 2s scheduled
+     * executor), NOT the client tick. The first version of the combat readout had the
+     * getter call combatThreats() -> threats() live, which WRITES the tick-keyed scan
+     * cache (_threatScanTick then _threatScan). Landing on the same tick number as the
+     * task runner hands the tick thread a list the poll thread is still appending to, and
+     * a ConcurrentModificationException escaping getPriority() takes down
+     * TaskRunner.tick() for EVERY chain - the exact hazard the comment inside threats()
+     * already warns about. So the verdict is computed where the fight is decided and
+     * merely READ across the thread boundary. volatile for publication.
+     */
+    private volatile boolean _couldWinIfGeared = false;
 
     private float _cachedLastPriority;
 
@@ -412,12 +467,26 @@ public class MobDefenseChain extends SingleTaskChain {
                 return installKill(mod, _fightTargetEntity);
             }
             _fightingItOut = false;
-            // it died, or it left. running is no longer failing, so a ledger of failed
-            // escapes no longer describes anything - and THIS is the safe place to drop
-            // it, because nothing is about to re-read it to justify a fight.
-            if (_fightTargetEntity == null || !_fightTargetEntity.isAlive()) {
-                clearFleeLedger();
-            }
+            // ⚠⚠ CLEAR IT ON EVERY EXIT, NOT ONLY WHEN THE TARGET IS GONE.
+            //
+            // There are two ways out of the commitment and they both end the
+            // override, but only one of them used to say so. If it died or left,
+            // running is no longer failing. If instead FIGHT_HOLD_SECONDS simply
+            // elapsed with the mob still alive, the override TRIED and DID NOT
+            // WORK - and leaving the ledger up meant `escapes` was still over the
+            // limit two lines below, so the override re-fired on the very same
+            // tick. Worse, commitToKilling then sees the mode is already FIGHT, so
+            // it neither clears the target nor resets the hold, while installKill
+            // does setTask(null) + setTask(new KillEntitiesTask) - tearing down and
+            // rebuilding the whole task tree, cancelling baritone, 20 times a
+            // second, until the 90s flee window ages out. That is the 2026-08-08
+            // freeze signature with N pinned instead of climbing: standing still in
+            // a crowd, logging "killing it instead" on every tick.
+            //
+            // Dropping the ledger here makes the failed override a bounded attempt:
+            // she goes back to running, and if running keeps failing the count
+            // rebuilds and she commits again - later, once, instead of forever.
+            clearFleeLedger();
         }
         int escapes = recentFleeCount();
         if (escapes < FLEE_CHURN_LIMIT) return null;
@@ -489,7 +558,65 @@ public class MobDefenseChain extends SingleTaskChain {
         if (target == null) return null;
         forceMode(DefenseMode.FIGHT);   // clears the old target, so remember AFTER it
         _runAwayTask = null;
-        rememberFightTarget(target);
+        rememberFightTarget(mod, target);
+        return attackTaskFor(mod, target);
+    }
+
+    /**
+     * The task that actually fights the chosen target - bow or blade.
+     * <p>
+     * ⚠ reads the LATCHED {@link #_rangedEngagement}, never re-deciding: this is called
+     * on every tick of a live fight (the branch re-mints its task each tick and relies on
+     * setTask() discarding the .equals() twin), so a per-call decision would swap the
+     * chain's task at tick rate.
+     * <p>
+     * ⚠ a bow task that has given up must NOT be handed back. SingleTaskChain neither
+     * ticks nor clears a finished task, and setTask() refuses an equal replacement, so it
+     * would hold the slot forever while the chain kept priority 65 - she would stand
+     * still, out of arrows, "in a fight". Falling back to melee is one-way and permanent
+     * for this target.
+     * <p>
+     * ⚠ THERE IS DELIBERATELY NO "the mob got close, switch to melee" RULE HERE, and it
+     * looks like an omission twice over. Both cases that would want one are already
+     * covered, and adding it would break the case ranged exists for:
+     * <ul>
+     *   <li>the anti-treadmill override (fightBecauseFleeingIsNotWorking) reaches this
+     *       through commitToKilling, which calls forceMode(FIGHT) FIRST - and that clears
+     *       the latch, so rememberFightTarget re-asks shouldFightAtRange, which already
+     *       answers "no" inside RANGED_CONTACT_DISTANCE. The override gets a fresh,
+     *       correct decision without any help from here.</li>
+     *   <li>a mob closing on a live ranged fight is KITING, not a mistake: BowCombatTask
+     *       opens the range and keeps shooting, and ENGAGEMENT_MAX_SECONDS bounds it if
+     *       that stops working.</li>
+     * </ul>
+     * A contact-range drop would fire at exactly the moment a CREEPER reaches her - and
+     * meleeing a creeper is the single thing this whole ranged layer exists to stop.
+     */
+    private Task attackTaskFor(AltoClef mod, Entity target) {
+        if (_rangedEngagement) {
+            if (_bowTask != null && (_bowTask.gaveUp() || _bowTask.isFinished(mod))) {
+                _rangedEngagement = false;
+                _bowTask = null;
+                // the corpse has to leave the slot or the melee task cannot get in.
+                setTask(null);
+                // ⚠⚠ ...BUT NOT INTO A CREEPER. The javadoc above reasons only about a
+                // mob CLOSING on a live ranged fight; this is the other way out -
+                // BowCombatTask gives up when the arrows RUN OUT. She had chosen the
+                // bow precisely because this target must not be met with a sword, and
+                // dropping through to melee here charged her straight at it. (The
+                // anti-treadmill override refuses creepers too, so nothing downstream
+                // would have broken the approach/swell/flee oscillation that follows.)
+                // Let the commitment go instead: the flee and shield branches own a
+                // creeper, and next tick they get it.
+                if (target instanceof Creeper) {
+                    releaseDefenseMode();
+                    return null;
+                }
+            } else {
+                if (_bowTask == null) _bowTask = new BowCombatTask(target);
+                return _bowTask;
+            }
+        }
         return new KillEntitiesTask(target.getClass());
     }
 
@@ -509,13 +636,48 @@ public class MobDefenseChain extends SingleTaskChain {
      * every tick - which pickFightTarget does by design - must not extend the hold
      * forever, or FIGHT_HOLD_SECONDS bounds nothing at all.
      */
-    private void rememberFightTarget(Entity target) {
+    private void rememberFightTarget(AltoClef mod, Entity target) {
         if (target == null) return;
         if (_fightTargetEntity != target) {
             _fightTargetEntity = target;
             _fightHold.reset();
+            // A NEW TARGET IS THE ONE MOMENT THE MELEE/RANGED QUESTION IS ASKED. Asking
+            // it per tick would swap the chain's task at tick rate - see _rangedEngagement.
+            _rangedEngagement = shouldFightAtRange(mod, target);
+            _bowTask = null;
         }
         _committedFightTarget = target.getClass();
+    }
+
+    /**
+     * Is this a fight to have from across the room?
+     * <p>
+     * Called ONCE per target (see {@link #rememberFightTarget}), never per tick.
+     * <p>
+     * public because HeroTask needs the SAME answer: `@hero` is what burnt's `attack` and
+     * `defend` verbs and every viewer "kill that skeleton" actually run, and if only this
+     * chain knew about the bow then she could shoot reflexively but never on purpose.
+     * Two copies of "is this a ranged fight" would drift, which is this codebase's
+     * most-repeated bug.
+     */
+    public boolean shouldFightAtRange(AltoClef mod, Entity target) {
+        if (target == null || !CombatGear.canShoot(mod)) return false;
+        // Keep a few arrows back. Committing to a ranged fight on the last arrow means
+        // running dry mid-engagement and falling back to melee anyway, having spent the
+        // opening on it.
+        if (CombatGear.arrowCount(mod) < RANGED_MIN_ARROWS) return false;
+        double distanceSq = target.distanceToSqr(mod.getPlayer());
+        // A CREEPER IS THE WHOLE POINT. Walking up to a bomb is not a plan, and every
+        // other branch in this file can only run away from one - nothing could ever
+        // KILL one safely. An arrow can.
+        if (target instanceof Creeper) return true;
+        // Already breathing on her: hit it, do not back up drawing a bow while it swings.
+        if (distanceSq <= RANGED_CONTACT_DISTANCE * RANGED_CONTACT_DISTANCE) return false;
+        // Things that shoot back, and things it is stupid to let reach her. A Ghast is
+        // named outright because melee against one is not a fight, it is a wish.
+        if (outrangesUs(target) || isScaryToPickAFightWith(target) || target instanceof Ghast) return true;
+        // Under-armed for melee: an arrow does full damage no matter what is in her hand.
+        return CombatGear.bestMeleeDamage(mod) < RANGED_WEAK_MELEE_DAMAGE;
     }
 
     private void forceMode(DefenseMode mode) {
@@ -523,6 +685,11 @@ public class MobDefenseChain extends SingleTaskChain {
             _defenseMode = mode;
             _committedFightTarget = null;
             _fightTargetEntity = null;
+            // clearing the target clears the choice made ABOUT that target. this runs
+            // before rememberFightTarget on the commitToKilling path, so the new target
+            // gets a fresh bow-or-blade decision rather than inheriting the last one.
+            _rangedEngagement = false;
+            _bowTask = null;
         }
         _defenseCommitment.reset();
     }
@@ -532,6 +699,12 @@ public class MobDefenseChain extends SingleTaskChain {
         _committedFightTarget = null;
         _fightTargetEntity = null;
         _fightingItOut = false;
+        // the ranged choice belongs to ONE target. carrying it into the next fight would
+        // mean the answer to "bow or blade" was decided about a mob that is already dead.
+        _rangedEngagement = false;
+        _bowTask = null;
+        // and the readout must not keep claiming there is a fight she could win dressed.
+        _couldWinIfGeared = false;
         // the ledger is evidence about a fight that no longer has a target. leaving it
         // behind while dropping the latch is what let the override re-fire on stale
         // counts the instant this ran (it is reachable from the eat branch, the MLG
@@ -546,27 +719,82 @@ public class MobDefenseChain extends SingleTaskChain {
      * whose order comes from the entity tracker and reorders freely. a skeleton and
      * an enderman standing together therefore swapped the kill target, and with it
      * the whole task tree, on alternate ticks. hold the target while it is alive and
-     * still a problem; otherwise take the closest, since that is what is hitting her.
+     * still a problem; otherwise take the most DANGEROUS one, not merely the nearest.
+     * <p>
+     * ⚠ "nearest" was the whole ranking, everywhere - here, in KillAura, and in HeroTask.
+     * threatWeight() has always known that a creeper is worth 2.75 zombies and a warden is
+     * worth a hundred, and no targeting decision anywhere consulted it. So she would punch
+     * the zombie in front of her while the creeper two blocks behind it finished swelling.
+     * Ranking by threat-per-distance keeps proximity mattering (something on top of her is
+     * more urgent than the same mob across the room) while letting a genuinely worse mob
+     * win from further out.
      */
     private Class<?> pickFightTarget(AltoClef mod, List<Entity> toDealWith) {
         if (_committedFightTarget != null) {
+            // ⚠ THE EXACT ENTITY FIRST, NOT MERELY ONE OF ITS CLASS. This loop used to
+            // return the first mob whose CLASS matched, so with two skeletons in the list
+            // it handed back whichever the entity tracker happened to order first - and
+            // rememberFightTarget reads that as a NEW target: it resets _fightHold (so
+            // FIGHT_HOLD_SECONDS never actually arrives), re-runs shouldFightAtRange, and
+            // nulls _bowTask.
+            //
+            // That wobble was harmless while the fight task was keyed on the CLASS
+            // (KillEntitiesTask), because setTask() then discarded the twin. BowCombatTask
+            // is keyed on the ENTITY, so the same wobble now genuinely swaps the chain's
+            // task - full sub-task teardown plus a baritone force-cancel, at tracker
+            // reorder rate. Introducing the bow is what converted this into a real bug.
+            if (_fightTargetEntity != null && _fightTargetEntity.isAlive()
+                    && toDealWith.contains(_fightTargetEntity)) {
+                rememberFightTarget(mod, _fightTargetEntity);
+                return _committedFightTarget;
+            }
             for (Entity e : toDealWith) {
                 if (e.getClass() == _committedFightTarget && e.isAlive()) {
-                    rememberFightTarget(e);
+                    rememberFightTarget(mod, e);
                     return _committedFightTarget;
                 }
             }
         }
-        Entity closest = null;
-        double best = Double.POSITIVE_INFINITY;
+        // ⚠⚠ RANKING BY THREAT MAKES A CREEPER THE MOST ATTRACTIVE TARGET IN THE GAME,
+        // and walking a sword into a creeper is how you lose a base, not a fight. It is
+        // the single highest-weight ordinary mob (2.75 and climbing as it swells), so
+        // switching this ranking from distance to threat - without this guard - would
+        // have actively made the creeper problem WORSE than the naive "nearest" it
+        // replaced. A creeper is only a target she may CHOOSE when she can answer it from
+        // range; otherwise the flee/shield branches above own it and she leaves it alone.
+        // ⚠ THE GUARD AND THE DECISION MUST ASK THE SAME QUESTION. This used to be
+        // bare canShoot() (a bow and >0 arrows), while shouldFightAtRange refuses
+        // below RANGED_MIN_ARROWS. With 1-3 arrows the two disagreed: the creeper
+        // was admitted to the ranking, won it (highest-weight ordinary mob), and
+        // then shouldFightAtRange said no - so attackTaskFor handed back a MELEE
+        // KillEntitiesTask and walked her into it. Admitted only if the ranged
+        // answer is actually available.
+        boolean mayHuntCreepers = CombatGear.canShoot(mod) && CombatGear.arrowCount(mod) >= RANGED_MIN_ARROWS;
+        Entity worst = null;
+        double best = Double.NEGATIVE_INFINITY;
         for (Entity e : toDealWith) {
-            double d = e.distanceToSqr(mod.getPlayer());
-            if (d < best) {
-                best = d;
-                closest = e;
+            if (!mayHuntCreepers && e instanceof Creeper) continue;
+            // +1 so a mob standing ON her does not divide by zero and swamp the ranking.
+            double score = threatWeight(mod, e) / (1 + Math.sqrt(e.distanceToSqr(mod.getPlayer())));
+            if (score > best) {
+                best = score;
+                worst = e;
             }
         }
-        rememberFightTarget(closest != null ? closest : toDealWith.get(0));
+        if (worst == null) {
+            // every candidate was a creeper she has no ranged answer for. Fall back to
+            // the nearest of them rather than returning null: the caller needs a class,
+            // and the creeper-specific branches above are what actually keep her alive.
+            double nearest = Double.POSITIVE_INFINITY;
+            for (Entity e : toDealWith) {
+                double d = e.distanceToSqr(mod.getPlayer());
+                if (d < nearest) {
+                    nearest = d;
+                    worst = e;
+                }
+            }
+        }
+        rememberFightTarget(mod, worst != null ? worst : toDealWith.get(0));
         return _committedFightTarget;
     }
 
@@ -825,6 +1053,29 @@ public class MobDefenseChain extends SingleTaskChain {
             // is still the right answer, so the normal paths below are untouched.
             Task insteadOfRunning = fightBecauseFleeingIsNotWorking(mod);
             if (insteadOfRunning != null) return 75;
+            // ---- RETREAT AND RE-ARM ----
+            // She is running anyway; running is not a reason to still be naked when she
+            // stops. Every previous version of this branch let her flee a fight she owned
+            // the gear to win, because capacity is measured off WORN armour and nothing in
+            // the defense path had ever put a piece on.
+            //
+            // ⚠ THIS IS A SLOT-FREE SIDE EFFECT, NOT A TASK, AND THAT IS THE ENTIRE
+            // DESIGN. EquipArmorTask would need the task slot, which this chain is
+            // currently holding at priority 70-80 for the escape - and a second contender
+            // for that slot is the mechanism behind every freeze in this file's history.
+            // Slot clicks are not tasks, and KillAura already equips a shield mid-fight
+            // by exactly this route. Nothing about the escape changes: same task, same
+            // priority, same commitment. She just arrives dressed.
+            //
+            // The fight branch below then flips on its own as the numbers improve - there
+            // is deliberately no new "PREPARE" mode, because a new mode is a new sibling
+            // for the existing three to trade the slot with.
+            _gearingUp = !CombatGear.readyUp(mod, true);
+            // Published for the readout, computed HERE because this runs on the TICK
+            // thread. The getter must never scan entities - see _couldWinIfGeared.
+            List<Entity> fleeingFrom = combatThreats(mod, _targetEntity);
+            _couldWinIfGeared = !fleeingFrom.isEmpty()
+                    && !canSafelyFight(mod, fleeingFrom) && couldWinIfGeared(mod, fleeingFrom);
             if (overmatched) {
                 // Worsening health or a newly arrived mob is an emergency escalation;
                 // do not wait out a previous fight commitment.
@@ -857,8 +1108,7 @@ public class MobDefenseChain extends SingleTaskChain {
                         // 15, i.e. from outside the range that would have made her react at all -
                         // that is what killed her on 2026-08-01. Stray/WitherSkeleton come along
                         // for free since they share the same parent.
-                        int annoyingRange = (hostile instanceof AbstractSkeleton || hostile instanceof Witch || hostile
-                                instanceof Pillager || hostile instanceof Piglin) ? 15 : 8;
+                        int annoyingRange = outrangesUs(hostile) ? 15 : 8;
                         boolean isClose = hostile.closerThan(mod.getPlayer(), annoyingRange);
 
                         if (isClose) {
@@ -949,8 +1199,20 @@ public class MobDefenseChain extends SingleTaskChain {
                     // We can deal with it.
                     if (commitTo(mod, DefenseMode.FIGHT)) {
                         _runAwayTask = null;
-                        setTask(new KillEntitiesTask(pickFightTarget(mod, toDealWith)));
+                        Class<?> targetClass = pickFightTarget(mod, toDealWith);
+                        setTask(_fightTargetEntity != null
+                                ? attackTaskFor(mod, _fightTargetEntity)
+                                : new KillEntitiesTask(targetClass));
                     }
+                    // ⚠ GEAR UP ON THE WAY IN, NOT AFTER SHE LOSES. The shield was only
+                    // ever moved to the offhand REACTIVELY - once a creeper was already
+                    // fusing or an arrow was already in the air - even though capacity
+                    // scores an offhand shield at +0.75 against +0.20 for the same shield
+                    // in the bag. The code knew the difference and never acted on it.
+                    // A drawn bow needs both hands, so a ranged fight does not want one.
+                    _gearingUp = !CombatGear.readyUp(mod, !_rangedEngagement);
+                    // she can already take this one; nothing to promise about gear.
+                    _couldWinIfGeared = false;
                     return 65;
                 } else {
                     // We can't deal with it...
@@ -961,6 +1223,14 @@ public class MobDefenseChain extends SingleTaskChain {
                     // hundred lines up). without this, commitTo() let the fight stand
                     // for DEFENSE_COMMIT_SECONDS and then handed it back to the flee.
                     if (_fightingItOut && fightStillStands(mod)) return 75;
+                    // Same retreat-and-re-arm as the emergency flee block above. This arm
+                    // is reached on its own conditions, so a gear-up wired only into that
+                    // one would be missing exactly where "she ran from a fight she owned
+                    // the gear to win" is decided.
+                    _gearingUp = !CombatGear.readyUp(mod, true);
+                    // toDealWith is already the set this arm judged unwinnable, so the
+                    // "...but not if I were dressed" verdict is exact here.
+                    _couldWinIfGeared = couldWinIfGeared(mod, toDealWith);
                     if (commitTo(mod, DefenseMode.FLEE)) {
                         beginOrAdoptFlee(mod);
                     }
@@ -1209,27 +1479,56 @@ public class MobDefenseChain extends SingleTaskChain {
 
     private boolean canSafelyFight(AltoClef mod, Collection<Entity> hostiles) {
         if (hostiles.isEmpty()) return true;
-        float effectiveHealth = mod.getPlayer().getHealth() + mod.getPlayer().getAbsorptionAmount();
-        if (effectiveHealth <= STAND_AND_FIGHT_MIN_HEALTH
-                || mod.getPlayer().hasEffect(MobEffects.WITHER)
-                || mod.getPlayer().hasEffect(MobEffects.POISON)) {
-            return false;
-        }
+        if (fightIsHopeless(mod)) return false;
+        return combatCapacity(mod, false) >= dangerOf(mod, hostiles) * COMBAT_SAFETY_MARGIN;
+    }
 
-        Item bestSword = null;
-        for (Item sword : SWORDS) {
-            if (mod.getItemStorage().hasItem(sword)) {
-                bestSword = sword;
-                break; // SWORDS is strongest-first
-            }
-        }
-        double attackDamage = bestSword == null ? 0 : 1 + ItemVersionHelper.getAttackDamage(bestSword);
-        double capacity = 0.65
-                + mod.getPlayer().getArmorValue() * 0.10
-                + attackDamage * 0.20;
-        if (mod.getItemStorage().hasItemInOffhand(Items.SHIELD)) {
+    /**
+     * The same question asked about the loadout she is CARRYING rather than wearing.
+     * <p>
+     * ⚠ THIS IS THE DIFFERENCE BETWEEN "I CANNOT WIN THIS" AND "I CANNOT WIN THIS YET".
+     * capacity is built from getArmorValue() (worn) and scores a shield in the offhand at
+     * +0.75 against +0.20 for the same shield in her bag - so a bot carrying a full iron
+     * set was scored as naked, decided the fight was unwinnable and ran. Nothing anywhere
+     * in the defense path had ever put a piece of armour on. And a fresh spawn owns
+     * nothing, so "carrying but not wearing" is the normal case.
+     * <p>
+     * When this is true and {@link #canSafelyFight} is false, running is not the answer -
+     * getting dressed is. See the gear-up call on the flee path.
+     */
+    private boolean couldWinIfGeared(AltoClef mod, Collection<Entity> hostiles) {
+        if (hostiles.isEmpty()) return true;
+        if (fightIsHopeless(mod)) return false;
+        return combatCapacity(mod, true) >= dangerOf(mod, hostiles) * COMBAT_SAFETY_MARGIN;
+    }
+
+    /** the conditions no amount of gear fixes. */
+    private boolean fightIsHopeless(AltoClef mod) {
+        float effectiveHealth = mod.getPlayer().getHealth() + mod.getPlayer().getAbsorptionAmount();
+        return effectiveHealth <= STAND_AND_FIGHT_MIN_HEALTH
+                || mod.getPlayer().hasEffect(MobEffects.WITHER)
+                || mod.getPlayer().hasEffect(MobEffects.POISON);
+    }
+
+    /**
+     * @param assumeGeared count what she could put on in a few slot clicks, instead of
+     *                     what is currently on her body.
+     */
+    private double combatCapacity(AltoClef mod, boolean assumeGeared) {
+        float effectiveHealth = mod.getPlayer().getHealth() + mod.getPlayer().getAbsorptionAmount();
+
+        // ⚠ ANY melee weapon, not just swords. The old scan walked a hardcoded SWORDS[]
+        // ladder, so a netherite AXE - which hits HARDER than the netherite sword - scored
+        // as bare hands and turned every fight into a retreat. See CombatGear.
+        double weaponDamage = CombatGear.bestMeleeDamage(mod);
+        double attackDamage = weaponDamage <= 0 ? 0 : 1 + weaponDamage;
+
+        double armor = assumeGeared ? CombatGear.reachableArmor(mod) : CombatGear.wornCapacityArmor(mod);
+        double capacity = 0.65 + armor * 0.10 + attackDamage * 0.20;
+
+        if (CombatGear.shieldInOffhand(mod) || (assumeGeared && CombatGear.hasShield(mod))) {
             capacity += 0.75;
-        } else if (mod.getItemStorage().hasItem(Items.SHIELD)) {
+        } else if (CombatGear.hasShield(mod)) {
             capacity += 0.20; // owning one is not the same as blocking with it
         }
         if (mod.getPlayer().getFoodData().getFoodLevel() >= 14) {
@@ -1241,13 +1540,15 @@ public class MobDefenseChain extends SingleTaskChain {
         // Gear at half a heart bar is not full-strength gear. Keep a small floor so one
         // weak mob does not cause indecision, but rapidly prefer escape as health falls.
         double healthFactor = Math.max(0.35, Math.min(1.0, (effectiveHealth - 4) / 16.0));
-        capacity *= healthFactor;
+        return capacity * healthFactor;
+    }
 
+    private double dangerOf(AltoClef mod, Collection<Entity> hostiles) {
         double danger = 0;
         for (Entity hostile : hostiles) {
             danger += threatWeight(mod, hostile);
         }
-        return capacity >= danger * COMBAT_SAFETY_MARGIN;
+        return danger;
     }
 
     private double threatWeight(AltoClef mod, Entity hostile) {
@@ -1275,6 +1576,19 @@ public class MobDefenseChain extends SingleTaskChain {
         if (distanceSq <= 16) weight *= 1.20;
         if (distanceSq <= 6.25) weight *= 1.15;
         return weight;
+    }
+
+    /**
+     * mobs that can hurt her from further away than she can hurt them back.
+     * <p>
+     * this set was written inline in the annoying-hostiles branch and nowhere else, so
+     * the one fact "this thing shoots" could not be consulted by any other decision.
+     * Extracted verbatim - same four types, so the annoying-range behaviour is unchanged -
+     * because the ranged/melee choice needs exactly this question.
+     */
+    private static boolean outrangesUs(Entity hostile) {
+        return hostile instanceof AbstractSkeleton || hostile instanceof Witch
+                || hostile instanceof Pillager || hostile instanceof Piglin;
     }
 
     // mobs it is not worth PICKING a fight with while healthy. this is deference, not
@@ -1871,6 +2185,56 @@ public class MobDefenseChain extends SingleTaskChain {
 
     public boolean isPuttingOutFire() {
         return _wasPuttingOutFire;
+    }
+
+    // ------------------------------------------------------------------
+    // COMBAT READOUT - what she decided, and why
+    //
+    // ⚠ this chain has always made the entire fight-or-flight decision in private. Burnt
+    // could see "3 hostiles nearby" and her own health and nothing else, so when the
+    // machine chose to run there was no way for her to know it had, let alone say why -
+    // which is what "she says 'fighting back' for absolutely no reason" and "no idea what
+    // she's doing or why" actually are. These are cheap reads off state the chain already
+    // holds; the companion polls them every couple of seconds.
+    // ------------------------------------------------------------------
+
+    /** "none" | "dodge" | "fight" | "flee" - the answer she is currently committed to. */
+    public String getCombatMode() {
+        return _defenseMode.name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** the mob she has actually committed to killing, or null. */
+    public Entity getCombatTarget() {
+        return _fightTargetEntity != null && _fightTargetEntity.isAlive() ? _fightTargetEntity : null;
+    }
+
+    /** true when the committed fight is being had with a bow rather than a blade. */
+    public boolean isFightingAtRange() {
+        return _rangedEngagement;
+    }
+
+    /** true while there is still gear in her bag she has not managed to put on. */
+    public boolean isGearingUp() {
+        return _gearingUp;
+    }
+
+    /** true while the anti-treadmill override is deliberately standing its ground. */
+    public boolean isStandingItsGround() {
+        return _fightingItOut;
+    }
+
+    /**
+     * "I would win this if I were wearing what I am carrying."
+     * <p>
+     * The single most useful thing she can know about a fight she is losing, and it was
+     * not computable anywhere before {@link #couldWinIfGeared} existed.
+     * <p>
+     * ⚠ A PLAIN FIELD READ, ON PURPOSE - see {@link #_couldWinIfGeared}. Computing it
+     * here would run an entity scan on the poll thread and corrupt the tick-keyed threat
+     * cache out from under TaskRunner.
+     */
+    public boolean couldWinCurrentFightIfGeared() {
+        return _couldWinIfGeared;
     }
 
     @Override

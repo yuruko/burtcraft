@@ -523,7 +523,7 @@ async function main() {
 
     console.log('\n-- and now with a goal that is already yours --');
     tool.activeGoal = {
-        id: 'llm1', action: 'mine', params: { target: 'iron_ore' }, source: 'llm',
+        id: 'llm1', action: 'mine', params: { target: 'iron_ore' }, source: 'agent',
         startedAt: Date.now() - 15000, lastProgressAt: Date.now() - 1000, anchorAt: null
     };
     await adapter.takeTheWheel('mine', { target: 'gold_ore' }, { reason: 'changed my mind' });

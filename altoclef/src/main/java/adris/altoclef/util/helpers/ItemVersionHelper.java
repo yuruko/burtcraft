@@ -66,6 +66,22 @@ public class ItemVersionHelper {
     }
 
     /**
+     * anything the game itself marks as a weapon - swords, axes, maces, tridents.
+     * <p>
+     * ⚠ this is deliberately WIDER than {@link #isSword}, and the difference is not
+     * cosmetic. every "how hard can she hit" question in the codebase used to scan a
+     * hardcoded SWORDS[] ladder, so a netherite AXE (10 damage, more than the netherite
+     * sword's 8) scored as bare hands - and MobDefenseChain.canSafelyFight turns "bare
+     * hands" into "run away". she fled fights holding the better weapon.
+     * <p>
+     * the WEAPON component is vanilla's own marker, so this stays right as items are
+     * added instead of needing a new literal in a list nobody remembers to update.
+     */
+    public static boolean isMeleeWeapon(Item item) {
+        return item.components().has(DataComponents.WEAPON);
+    }
+
+    /**
      * the old ArmorItem: equippable into a real armor slot (not a saddle or a horse
      * blanket, and not a shield, which is EQUIPPABLE-to-offhand).
      */

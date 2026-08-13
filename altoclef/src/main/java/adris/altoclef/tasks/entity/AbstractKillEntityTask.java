@@ -10,6 +10,7 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import java.util.List;
 import adris.altoclef.util.helpers.ItemVersionHelper;
+import adris.altoclef.util.helpers.CombatGear;
 
 /**
  * Attacks an entity, but the target entity must be specified.
@@ -32,29 +33,19 @@ public abstract class AbstractKillEntityTask extends AbstractDoToEntityTask {
         super(maintainDistance, combatGuardLowerRange, combatGuardLowerFieldRadius);
     }
 
+    /**
+     * ⚠ TWO BUGS, ONE LINE OF INTENT. The old body scanned only {@code isSword}, so an
+     * axe - which out-damages the sword of the same material - was invisible and she went
+     * into fights bare-handed while carrying one. And it reassigned {@code bestItem} on
+     * every iteration, so the answer was never a maximum: it was "the LAST sword the
+     * inventory happened to yield, compared against her hand". A wooden sword sorted after
+     * a diamond one won.
+     * <p>
+     * {@link CombatGear#bestMeleeWeapon} is a real max over everything the game marks as a
+     * weapon.
+     */
     public static Item bestWeapon(AltoClef mod) {
-        List<ItemStack> invStacks = mod.getItemStorage().getItemStacksPlayerInventory(true);
-        if (!invStacks.isEmpty()) {
-            float handDamage = Float.NEGATIVE_INFINITY;
-            Item bestItem = null;
-            for (ItemStack invStack : invStacks) {
-                Item item = invStack.getItem();
-                if (ItemVersionHelper.isSword(item)) {
-                    float itemDamage = ItemVersionHelper.getAttackDamage(item);
-                    Item handItem = StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot()).getItem();
-                    if (ItemVersionHelper.isSword(handItem)) {
-                        handDamage = ItemVersionHelper.getAttackDamage(handItem);
-                    }
-                    if (itemDamage > handDamage) {
-                        bestItem = item;
-                    } else {
-                        bestItem = handItem;
-                    }
-                }
-            }
-            return bestItem;
-        }
-        return null;
+        return CombatGear.bestMeleeWeapon(mod);
     }
 
     public static boolean equipWeapon(AltoClef mod) {

@@ -34,12 +34,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
     toasterHomesteadDimensions, toasterOutpostDimensions
-} from '../../../node/tools/minecraft_settlements.js';
+} from '../core/settlements.js';
 // the ornaments she stands in her own yard. IMPORTED, never restated: this list
 // and `PLACEABLE_BLOCKS` in minecraft_tool.js are two enforcement points for one
 // rule, and hand-copying it is precisely how nine of the ten ornaments ended up
 // accepted here and refused there. (module import only - nothing is constructed.)
-import { COMFORT_KINDS } from '../../../node/tools/minecraft_memory.js';
+import { COMFORT_KINDS } from '../core/minecraft_memory.js';
 
 const SUPPORTED_ACTIONS = new Set([
     'move', 'get', 'mine', 'collect', 'craft', 'follow', 'stop', 'idle',
@@ -60,12 +60,17 @@ const SUPPORTED_ACTIONS = new Set([
 // starts no goal and moves her nowhere, so like 'hud' it must never own currentTask -
 // its instant completion would make a running mine or follow read as idle.
 const NON_TASK_ACTIONS = new Set(['chat', 'stop', 'inventory', 'coords', 'look', 'boat', 'hud', 'protect_settlement', 'tic']);
+// gameState keys that describe A MOMENT rather than a condition, and so must not
+// survive in the accumulator this relay merges into. see the 'state' case for
+// what latching one costs. add a key here whenever the companion sends something
+// deliberately once-only or only-when-non-empty.
+const FEED_ONLY_STATE_KEYS = ['advancementsAll', 'advancementsNew'];
 // (the table of legal footprints that used to live here is gone on purpose -
 // see the build_settlement case: the relay resolves the size from the floorplan
 // now instead of refusing anything that disagrees with a copy of it.)
 const MAX_COMPANION_BUFFER_BYTES = 1024 * 1024;
 const BRIDGE_LOCK_PATH = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'tmp', 'minecraft_bot_bridge.lock'
+    path.dirname(fileURLToPath(import.meta.url)), '..', 'tmp', 'minecraft_bot_bridge.lock'
 );
 
 function processIsAlive(pid) {
@@ -1116,6 +1121,22 @@ class MinecraftBotBridge extends EventEmitter {
                     if (pending.detached) {
                         this._respond(msg.id, 'success', { result: { started: true, persistent: true } });
                         this.inflight.delete(msg.id);
+                        // ⚠ A DETACHED ACTION COMPLETES HERE, SO IT MUST RELEASE THE
+                        // TASK SLOT HERE. `idle` and `explore` are detached and are
+                        // NOT in NON_TASK_ACTIONS, so they claim currentTask on
+                        // dispatch - but the only code that ever clears the slot is
+                        // the 'finished' handler below, guarded on the inflight
+                        // entry we just deleted. So the slot was claimed forever:
+                        // the relay reported `currentTask: 'idle'` on every poll,
+                        // re-pinning host-side's copy every 2s, and the idle menu
+                        // refused its own actions with "busy with idle". Today that
+                        // is masked by an unrelated persistent-goal watchdog
+                        // eventually issuing a stop; any future detached action
+                        // outside PERSISTENT_ACTIONS would simply wedge.
+                        if (this.currentTaskOwnerId === msg.id) {
+                            this.gameState.currentTask = null;
+                            this.currentTaskOwnerId = null;
+                        }
                     }
                 }
                 break;
@@ -1160,6 +1181,28 @@ class MinecraftBotBridge extends EventEmitter {
                         observedAt: this.lastGameStateAt,
                         timestamp: Date.now()
                     });
+                    // ⚠⚠ A FEED IS NOT A STATE, AND THIS RELAY MERGES.
+                    //
+                    // We forward `this.gameState` - our running accumulator - not the
+                    // companion's frame. That is right for state (health, position:
+                    // last known is the best answer) and catastrophic for a DELTA.
+                    // The companion deliberately sends `advancementsAll` once per
+                    // world and `advancementsNew` only when non-empty, to avoid
+                    // shipping 4KB of unchanged json 30 times a minute. Merged into
+                    // the accumulator, that saving is undone and then some: the key
+                    // LATCHES, so every later poll re-delivers the same
+                    // advancements, host-side recordConquest bumps a count and calls
+                    // _save() on each one, and the whole 154KB memory ledger is
+                    // stringified, written and fsync'd every ~2 seconds for the rest
+                    // of the session - plus a "how many times have I done this"
+                    // counter inflating by ~1,800/hour.
+                    //
+                    // So a feed key is dropped the instant it has been forwarded: it
+                    // reaches the host exactly on the frame that carried it, which
+                    // is what a delta means. (Host-side keeps its own stale copy of
+                    // the array, which is harmless - nothing reads it as state, only
+                    // the arrival is meaningful.)
+                    for (const key of FEED_ONLY_STATE_KEYS) delete this.gameState[key];
                 }
                 break;
 

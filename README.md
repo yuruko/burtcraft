@@ -8,7 +8,7 @@ ambushed, takes requests from chat, and can tell you what it is doing while it
 does it. It is packaged here so you can bolt it onto *your* VTuber instead.
 
 The hard part of "AI plays Minecraft" is not the AI. It is that Minecraft has no
-API. This repo is the missing plumbing, plus a 14,000-line autonomy brain that
+API. This repo is the missing plumbing, plus a 15,000-line autonomy brain that
 already knows how to survive.
 
 ```
@@ -100,8 +100,8 @@ npm run build:mod    # baritone, then altoclef, with a Java 25 check
 By hand, if you prefer:
 
 ```bash
-cd baritone    && ./gradlew :compileApiJava :compileJava :fabric:build
-cd ../altoclef && ./gradlew build      # -> build/libs/altoclef-26.1.2-beta1.jar
+cd baritone    && ./gradlew :compileApiJava :compileJava :fabric:build --no-daemon --no-watch-fs
+cd ../altoclef && ./gradlew build --no-daemon --no-watch-fs   # -> build/libs/altoclef-26.1.2-beta1.jar
 ```
 
 The control server is an additive Fabric `client` entrypoint, so a normal
@@ -133,8 +133,10 @@ npm run bridge
 node examples/01_hello_bot.mjs
 ```
 
-Every example runs standalone with no game attached, so you can read the output
-and learn the API before any of the above works.
+Every example runs standalone with no game attached — `npm install` first, then
+read the output and learn the API before any of the above works. (`01` keeps
+listening until Ctrl-C; set `BURTCRAFT_DEMO_MS=12000` to make it exit on its
+own.)
 
 ### Toaster settlements
 
@@ -180,9 +182,13 @@ vanilla's real 4-block rule without breaking anything a person placed.
 ```js
 await mc.executeAction('set_home', { target: 'main toaster' });
 const project = mc.getStatus().homeProject; // durable %/phase/components
+// ⚠ carry the settlement's OWN planVersion, per the warning above: omit it and
+// the bridge resolves to the latest plan, which is how you end up building the
+// big toaster on top of the small house she already lives in. Dimensions are
+// resolved from the plan, so passing them does nothing either way.
+const home = mc.getStatus().settlements[0];
 await mc.executeAction('build_settlement', {
-  role: 'homestead', ...project.dimensions,
-  ...mc.getStatus().settlements[0].anchor
+  role: 'homestead', planVersion: home.planVersion, ...home.anchor
 });
 await mc.executeAction('set_outpost', { target: 'east toaster', level: 2 });
 await mc.executeAction('build_outpost', { target: 'east toaster' });
@@ -196,7 +202,7 @@ of trusting inventory or an elapsed timer.
 
 ## Wiring it into your VTuber
 
-There are exactly five seams. You do not need to read the 14,000-line file.
+There are exactly five seams. You do not need to read the 15,000-line file.
 
 ```js
 import { MinecraftTool } from 'burtcraft/core';
@@ -219,7 +225,7 @@ mc.on('gameEvent', async (event, data) => {
 ```
 
 Also available: `actionComplete`, `actionFailed`, `botTaskPhase` (the live "what
-am I doing" readout), `sessionEnded`, `faultDetected`, and ~16 more. Full list in
+am I doing" readout), `sessionEnded`, `faultDetected`, and 18 more. Full list in
 [docs/INTEGRATING.md](docs/INTEGRATING.md).
 
 ### 2. Give your brain situational awareness — `getStatus()`
@@ -242,7 +248,7 @@ say so, or your character will confidently narrate a game that is not running.
 const parsed = mc.interpretChatCommand('go mine some diamonds');
 // -> { action: 'mine', target: 'diamond_ore' }   (or null if it is not a command)
 
-if (parsed) await mc.executeAction(parsed.action, parsed.params, { source: 'viewer' });
+if (parsed) await mc.executeAction(parsed.action, parsed.params, { source: 'request' });
 else mc.recordViewerSuggestion(user, text);       // surfaces in getStatus() for your brain
 ```
 
@@ -319,7 +325,8 @@ transition instead of returning "busy". Autonomous picks still wait their turn.
 
 Finite tasks also have progress watchdogs. A craft with no movement or inventory
 change is stopped after 20 seconds (45 seconds by default for other work, 90 for
-speedrun), and dead persistent exploration is restarted rather than displaying
+speedrun, and minutes for builds and farms, which are legitimately stationary),
+and dead persistent exploration is restarted rather than displaying
 an activity label forever.
 
 ### Fail honestly
@@ -365,8 +372,6 @@ Selected mappings to the underlying commands:
 
 ## Configuration
 
-| Env var | Default | What |
-|---|---|---|
 Each hop has **two** ends, and each end reads its own variable. Change one
 without the other and the two halves dial different ports.
 
@@ -377,7 +382,7 @@ without the other and the two halves dial different ports.
 | `ALTOCLEF_CONTROL_PORT` | companion | `7440` | in-game tcp port it listens on |
 | `ALTOCLEF_HOST` / `ALTOCLEF_PORT` | bridge | `127.0.0.1` / `7440` | where the bridge dials the game |
 | `BOT_NAMES` | core | *(none)* | comma-separated names she answers to in chat |
-| `MINECRAFT_OWNER` | core | *(none)* | in-game username of whoever owns the bot |
+| `MINECRAFT_OWNER` | core + bridge | *(none)* | in-game username of whoever owns the bot |
 | `MINECRAFT_OWNER_ALIASES` | core | *(none)* | other names the same person goes by, comma-separated |
 | `MINECRAFT_HOME_SERVER` | core | *(none)* | host that counts as "her own" server, not a guest on somebody's box |
 | `MINECRAFT_HOME_SERVER_NAME` | core | *(none)* | what to call it |

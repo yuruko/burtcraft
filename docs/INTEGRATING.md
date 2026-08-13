@@ -23,7 +23,7 @@ const mc = new MinecraftTool({
   },
 });
 
-await mc.initialize({ port: 7431, actionTimeout: 300000, debug: false });
+await mc.initialize({ port: 7431, actionTimeout: 90000, debug: false });  // these are the defaults
 // optional: { reclaimPort: true } - see the warning below
 mc.enable();                        // gate: nothing dispatches until enabled
 mc.setAutonomousMode(true);         // optional: idle self-play
@@ -125,11 +125,38 @@ mc.knownPlayers();         // who she has seen
 ### Chat handling
 
 ```js
-mc.shouldSurfaceChat(sender, text);   // -> {surface, addressed, owner, followUp, toSomeoneElse}
+mc.shouldSurfaceChat(sender, text);
+// surfaced -> {surface: true, addressed, owner, followUp?, toSomeoneElse?, request?}
+// refused  -> {surface: false, reason}    // ⚠ no addressed/owner on this shape
 mc.interpretChatCommand(text, sender); // -> {action, target, params} | null
 mc.addressedToSomeoneElse(text);       // don't answer on another player's behalf
 mc.recordViewerSuggestion(user, text, { inGame });
 ```
+
+⚠ There is a fifth lane that is easy to miss: **anyone may just ask.** A
+request-shaped line surfaces with `request: true` even when it never says her
+name — but `addressed` stays `false`, so your prompt must not claim they were
+waiting on her personally. Players who are not physically near her pay a 20s
+floor between requests; somebody standing next to her does not.
+
+### Decisions the library asks you to make
+
+Three events are questions, not notifications. Each one has a fallback timer
+armed *before* you are asked, so a dead API key or a hung model degrades into
+reasonable default behaviour instead of hanging — but if you never wire up the
+answer, you never get the good version.
+
+| Event | Answer with | If you never answer |
+|---|---|---|
+| `noticings` `{items:[{kind,line,tags}], busy, task}` | `mc.acceptNoticings([kind, …])` — **only once you have actually committed to a turn** | nothing is spent; the same noticings can win a later opening |
+| `bread_opportunity` (facts about someone who just walked up) | `mc.actOnBreadOpportunity(player, 'ignore'\|'talk'\|'offer'\|'give'\|'approach_and_give')` | a coin flip picks the gesture once the timer expires |
+| `request_opportunity` `{player, said, inGame, busy, task, carrying, position, nearby, budgetMs}` | `mc.actOnRequestDecision({action, params})`, or `{action:'decline'}` | the ask is let go, silently |
+
+⚠ **Offering is not spending.** `acceptNoticings()` is a separate call on
+purpose. The board hands you a shortlist without consuming it; if the offer
+spent them, a speech gate that then decided not to talk would eat the perception
+permanently — which is the exact failure the board was built to fix. Call it
+when you have queued the line, not when you receive the list.
 
 ### Gates and state
 
@@ -142,7 +169,30 @@ mc.setBroadcast(fn);         // (re)point the UI mirror
 mc.setRemember(sink);        // (re)point long-term memory; null unhooks
 await mc.startGamerMode();   // committed, narrated speedrun
 mc.stopGamerMode();
+
+mc.setAutonomyMode('gather_food');
+// auto | gather_materials | gather_food | scout_area | secure_area
+// 'auto' is the full idle ladder; the others replace ONLY the free-time
+// provider. Nothing above the idle menu is mode-gated - safety, recovery and
+// viewer requests are not preferences. Read it back from getStatus() as
+// `autonomyMode` / `autonomyModeLabel`, and the legal set is exported as
+// AUTONOMY_MODES.
 ```
+
+Every key in the config is also an `initialize()` option, not just the four in
+[Setup](#setup). The ones worth knowing:
+
+| Option | Default | What |
+|---|---|---|
+| `autonomousTickMs` | `25000` | how often the idle menu gets a turn |
+| `noticeEnabled` | `true` | the noticings board |
+| `noticeSensitivity` | `0.35` | moves the salience floor *and* the offer gap together — a low floor with a long gap just delays the same noise |
+| `ticFrequency` | `0.12` | chance of an idle fidget |
+| `trenchEnabled` | `false` | the defensive moat. Turning this on makes every standing settlement read as incomplete and start a ~1240-block dig |
+
+The constructor also takes `registerMemoryExitHook` (default `true`). That is the
+flag to pass `false` if you construct the tool yourself specifically to avoid the
+process-exit hook.
 
 ### Places
 
@@ -224,8 +274,9 @@ Things that are reasonable in context but will surprise you once:
 - **`getStatus()` is not a pure getter.** It advances internal affect state as a
   side effect. Call it freely, but do not treat it as free.
 - **When nothing is connected it still returns a fully-populated `gameState`** —
-  health 20/20, position 0,0,0. That is the honesty trap in miniature. Gate on
-  `gameConnected` before you let any of it reach a prompt.
+  health 20, hunger 20, position 0,0,0 (and no `maxHealth` at all). That is the
+  honesty trap in miniature. Gate on `gameConnected` before you let any of it
+  reach a prompt.
 - **`shouldSurfaceChat()` is random and stateful.** Ambient lines are sampled
   (~50% behind a 75s gap) and the call updates per-sender timestamps, so the
   same input can answer differently twice. That is deliberate — it is what stops

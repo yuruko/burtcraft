@@ -10,7 +10,7 @@ Most of the friction here is Minecraft 26.1.2 and Java 25, not this project.
 `java-runtime-epsilon` (major 25). Java 17 will neither build nor run it.
 
 ```bash
-java -version    # must report 25
+java -version    # 25 if you build by hand; npm run build:mod finds its own
 ```
 
 Get it from [Adoptium](https://adoptium.net/temurin/releases/?version=25).
@@ -36,8 +36,8 @@ npm run build:mod        # both projects, in order, with a Java 25 check
 By hand:
 
 ```bash
-cd baritone    && ./gradlew :compileApiJava :compileJava :fabric:build
-cd ../altoclef && ./gradlew build          # -> build/libs/altoclef-26.1.2-beta1.jar
+cd baritone    && ./gradlew :compileApiJava :compileJava :fabric:build --no-daemon --no-watch-fs
+cd ../altoclef && ./gradlew build --no-daemon --no-watch-fs   # -> build/libs/altoclef-26.1.2-beta1.jar
 ```
 
 On Windows use `.\gradlew.bat` (PowerShell needs the `.\` prefix).
@@ -126,5 +126,9 @@ Check the two links separately. `getStatus().connected` is the bridge;
 fail honestly rather than queueing — that is intended.
 
 **Pathfinding overlays or the task-chain dump appear on stream**
-Both default to off in this fork. A regenerated settings file used to bring them
+`renderPath`, `renderGoal`, `renderSelectionBoxes` and `showTaskChains` all
+default to off in this fork. A regenerated settings file used to bring them
 back; the defaults now keep them hidden. See [../NOTICE](../NOTICE).
+
+Note `renderSelection` is still on — it only draws while a `#sel` selection is
+active.

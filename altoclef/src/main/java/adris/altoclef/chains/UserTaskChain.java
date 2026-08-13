@@ -19,6 +19,20 @@ public class UserTaskChain extends SingleTaskChain {
     /** set for the duration of a forced teardown, read once by onTaskFinish. */
     private String _abortReason = null;
 
+    /**
+     * WHAT was cancelled, captured before the teardown throws it away.
+     *
+     * `cancel()` calls `stop(mod)` first, and SingleTaskChain.onStop nulls
+     * `_mainTask` - so by the time `onTaskFinish` reads it at the `oldTask` line it
+     * is ALREADY null, and `TaskFinishedEvent.lastTaskRan` goes out as null on every
+     * cancel path (cyclic tree, F1 takeover, bridge disconnect, ctrl-K, @stop).
+     * host-side that is serialized with String.valueOf, so the wire carried the
+     * literal string "null" as the task name - which is how 38 rows of one host's
+     * journal came to be labelled "null". the abort REASON survived, so the
+     * done-vs-gave-up half of the contract held; only the identity was lost.
+     */
+    private Task _cancelledTask = null;
+
     private boolean _runningIdleTask;
     private boolean _nextTaskIdleFlag;
 
@@ -59,6 +73,8 @@ public class UserTaskChain extends SingleTaskChain {
 
     public void cancel(AltoClef mod) {
         if (_mainTask != null && _mainTask.isActive()) {
+            // remember it before stop() clears it - see _cancelledTask.
+            _cancelledTask = _mainTask;
             stop(mod);
             onTaskFinish(mod);
         }
@@ -143,7 +159,10 @@ public class UserTaskChain extends SingleTaskChain {
             mod.getClientBaritone().getInputOverrideHandler().clearAllKeys();
         }
         double seconds = _taskStopwatch.time();
-        Task oldTask = _mainTask;
+        // on a normal finish _mainTask is still set; on a cancel it was nulled by
+        // stop() before we got here, so fall back to what cancel() put aside.
+        Task oldTask = _mainTask != null ? _mainTask : _cancelledTask;
+        _cancelledTask = null;
         _mainTask = null;
         if (_currentOnFinish != null) {
             //noinspection unchecked

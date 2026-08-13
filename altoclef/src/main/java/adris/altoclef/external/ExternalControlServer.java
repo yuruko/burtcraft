@@ -238,6 +238,20 @@ public class ExternalControlServer implements ClientModInitializer {
      */
     private volatile java.util.Set<String> lastOnlineNames = null;
 
+    /**
+     * Every completed advancement id as of the last poll, so the feed can be a DELTA.
+     *
+     * ⚠ null means "not read yet this session" and is what triggers the one-time full
+     * send; an EMPTY SET is a real answer (a brand-new world where she has achieved
+     * nothing). Collapsing those two would re-send the entire list on every poll of a
+     * fresh world forever.
+     *
+     * ⚠ CLEARED ON WORLD CHANGE, in resetObservedState() - advancements are per-server,
+     * so carrying SomePlayer's set onto another box would report "nothing new" for
+     * everything she has already done there and she would never announce a single one.
+     */
+    private volatile java.util.Set<String> lastAdvancements = null;
+
     @Override
     public void onInitializeClient() {
         // subscribe to the static event bus (safe to do at init; events only fire in-game)
@@ -385,16 +399,37 @@ public class ExternalControlServer implements ClientModInitializer {
 
     // ---- server / client lifecycle --------------------------------------
 
+    /**
+     * ⚠ CATCHES Throwable, NOT IOException, AND PER CONNECTION AS WELL AS PER
+     * LISTENER.
+     *
+     * This is the only thread accepting bridge connections, and nothing restarts
+     * it. It used to catch IOException alone, so any RuntimeException escaping
+     * handleClient ended the thread for the rest of the Minecraft session -
+     * `Minecraft.getInstance()` is dereferenced unguarded on this thread in
+     * several places (sendHello, runCommand, the tic branch, and
+     * stopAfterControlLoss, which runs in handleClient's `finally`, so even a
+     * clean disconnect can throw). The visible symptom is the worst kind: the
+     * bridge just loops on ECONNREFUSED, and its only log for that is at debug
+     * level, so the link is dead and silent until someone restarts the game.
+     *
+     * Wrapping each connection separately means one bad client cannot take the
+     * listener down with it.
+     */
     private void runServer() {
         while (true) {
             try (ServerSocket ss = new ServerSocket(PORT, 1, InetAddress.getByName("127.0.0.1"))) {
                 log("listening on 127.0.0.1:" + PORT);
                 while (true) {
                     Socket s = ss.accept();
-                    handleClient(s); // one bridge at a time; blocks until it disconnects
+                    try {
+                        handleClient(s); // one bridge at a time; blocks until it disconnects
+                    } catch (Throwable t) {
+                        log("bridge connection failed: " + t);
+                    }
                 }
-            } catch (IOException e) {
-                log("server error: " + e.getMessage() + " (retrying in 5s)");
+            } catch (Throwable t) {
+                log("server error: " + t + " (retrying in 5s)");
                 sleep(5000);
             }
         }
@@ -831,6 +866,36 @@ public class ExternalControlServer implements ClientModInitializer {
             }
         } catch (Throwable ignored) { }
 
+        // WHAT ARE THEY WEARING? Armour is synced for every rendered player and was
+        // simply never read - only the main hand was. On a survival server this is the
+        // single most-used social read there is: somebody in full diamond is set up and
+        // somebody in nothing has just respawned or just lost everything, and those are
+        // completely different conversations. Reported as the best TIER worn rather than
+        // four item ids, because "he's in netherite" is the thing a person actually says.
+        String armor = "";
+        boolean geared = false;
+        try {
+            int best = -1;
+            int worn = 0;
+            final String[] tiers = { "leather", "golden", "chainmail", "iron", "diamond", "netherite" };
+            for (var slot : new net.minecraft.world.entity.EquipmentSlot[] {
+                    net.minecraft.world.entity.EquipmentSlot.HEAD,
+                    net.minecraft.world.entity.EquipmentSlot.CHEST,
+                    net.minecraft.world.entity.EquipmentSlot.LEGS,
+                    net.minecraft.world.entity.EquipmentSlot.FEET }) {
+                var piece = other.getItemBySlot(slot);
+                if (piece == null || piece.isEmpty()) continue;
+                worn++;
+                String id = BuiltInRegistries.ITEM.getKey(piece.getItem()).getPath();
+                for (int t = 0; t < tiers.length; t++) {
+                    if (id.startsWith(tiers[t] + "_")) { if (t > best) best = t; break; }
+                }
+            }
+            if (best >= 0) armor = tiers[best];
+            // "kitted out" is four pieces of the good stuff, not one lucky helmet.
+            geared = worn >= 4 && best >= 4;
+        } catch (Throwable ignored) { }
+
         String name = "";
         try { name = other.getGameProfile().name(); } catch (Throwable ignored) { }
         String display = "";
@@ -839,7 +904,7 @@ public class ExternalControlServer implements ClientModInitializer {
         return new NearbyPerson(name, display, dist,
                 relativeDirection(dx, dz, yaw), other.getY() - me.getY(),
                 watching, other.isCrouching(), other.isOnFire(),
-                other.hurtTime > 0, threats, holding);
+                other.hurtTime > 0, threats, holding, armor, geared);
     }
 
     static String relativeDirection(double dx, double dz, float yaw) {
@@ -873,7 +938,7 @@ public class ExternalControlServer implements ClientModInitializer {
      */
     record NearbyPerson(String name, String display, double dist, String dir, double dy,
                         boolean watching, boolean sneaking, boolean onFire, boolean hurt,
-                        int threats, String holding) { }
+                        int threats, String holding, String armor, boolean geared) { }
 
     /** How many people ride in the readout. More than this and it is a crowd, not a scene. */
     static final int PEOPLE_MAX = 6;
@@ -958,7 +1023,20 @@ public class ExternalControlServer implements ClientModInitializer {
     // expands one shell at a time and stops as soon as a shell is more than a tenth
     // solid, so standing in a tunnel costs a handful of block lookups and only a real
     // hall ever walks the full radius. capped so this can never become a survey.
-    private static final int CLEAR_SCAN_MAX_RADIUS = 22;      // edge 45
+    // ⚠⚠ THIS CAP IS SET BY THE ONLY CONSUMER, NOT BY AMBITION. host-side, the sole
+    // reader of `clearEdge` is the home-site assessment, whose STRICTEST demand is
+    // `clearEdge < 17` (HOME_SITE_MIN_CLEAR_EDGE in minecraft_tool.js; the relax
+    // ladder below it only ever asks for 15/12/9). So every radius past 8 measures a
+    // difference nothing can act on - edge 19 and edge 45 are the same answer.
+    //
+    // It was 22, and the cost of those unusable radii was not small: the shell
+    // early-out fires only when a shell is >10% solid, which never happens under
+    // open sky, so a plain/desert/cleared yard walked all 22 shells for
+    // 74,910 getBlockState calls and 542,938 loop iterations, in ONE mc.execute
+    // frame, every 2s, on the render thread. At 9 that is 5,529 reads - a 93% cut
+    // with zero behaviour change, and 19 still leaves two blocks of headroom over
+    // the threshold. Raise the host-side threshold above 19 and you must raise this.
+    private static final int CLEAR_SCAN_MAX_RADIUS = 9;       // edge 19
     private static final double CLEAR_SHELL_SOLID_TOLERANCE = 0.10;
 
     /**
@@ -2202,6 +2280,80 @@ public class ExternalControlServer implements ClientModInitializer {
                     gs.addProperty("botAction", botAction);
                     gs.add("botTaskPath", botTaskPath);
                     gs.addProperty("botTaskDepth", depth);
+
+                    // ---- WHO OWNS THE TICK, AND IS THE USER'S JOB MERELY PREEMPTED ----
+                    //
+                    // ⚠ THE READOUT ABOVE IS NOT ALWAYS ABOUT HER JOB. `getCurrentTaskChain()`
+                    // is WHICHEVER chain won this tick, so the moment MobDefenseChain (58-80)
+                    // outranks UserTaskChain (50), `botTask` quietly stops describing the job
+                    // burnt asked for and starts describing the fight - with nothing saying
+                    // the subject changed. Node then sees a task making no progress in a
+                    // small circle, which is its exact definition of a stalled or looping
+                    // goal, and it aborts the job and blacklists the verb for two minutes.
+                    // Being attacked while walking somewhere therefore lost the destination
+                    // and then suppressed it.
+                    //
+                    // AltoClef itself is fine: a chain takeover calls onInterrupt, never
+                    // stop - `_mainTask` survives and SingleTaskChain resumes it by itself
+                    // once defense drops back under 50. So node does not need to re-issue
+                    // anything (re-issuing would be WORSE: a fresh task tears down the tree
+                    // that was about to resume). It only needs to be told to stop killing
+                    // it, and that is what these two fields are for.
+                    //
+                    // ⚠ `combat.mode` IS NOT THIS. That is a latch on the defense chain and
+                    // it can still read FIGHT/FLEE while the chain has already lost the
+                    // tick. "Who is holding the tick" is the honest question, so it is asked
+                    // directly here rather than inferred from the colour of the engagement.
+                    try {
+                        adris.altoclef.tasksystem.TaskRunner runner =
+                                acMod != null ? acMod.getTaskRunner() : null;
+                        adris.altoclef.tasksystem.TaskChain current =
+                                runner != null ? runner.getCurrentTaskChain() : null;
+                        adris.altoclef.chains.UserTaskChain userChain =
+                                acMod != null ? acMod.getUserTaskChain() : null;
+                        if (current != null) gs.addProperty("chain", current.getName());
+                        // "she has a job, and something else is holding the tick." Idle
+                        // filler is deliberately not a job - see UserTaskChain.isRunningIdleTask.
+                        if (userChain != null) {
+                            boolean hasJob = userChain.isActive() && !userChain.isRunningIdleTask();
+                            gs.addProperty("preempted", hasJob && current != userChain);
+                        }
+                    } catch (Throwable ignored) { /* readout is best-effort, like botTask */ }
+
+                    // ---- THE COMBAT READOUT ----
+                    // MobDefenseChain made the entire fight-or-flight decision in private:
+                    // burnt could see a hostile COUNT and her own health, and nothing about
+                    // what the machine had decided to do about it. So when she narrated a
+                    // fight, she was guessing - which is exactly the "says 'fighting back'
+                    // for absolutely no reason" report. Now the decision itself is on the
+                    // wire and she can talk about the plan she is actually executing.
+                    //
+                    // ⚠ ABSENT MEANS "THIS JAR CANNOT TELL", NEVER "SHE IS NOT FIGHTING".
+                    // The whole block is omitted rather than sent as a false calm, so an
+                    // older companion degrades to the previous behaviour instead of
+                    // teaching burnt she is safe.
+                    if (acMod != null && acMod.getMobDefenseChain() != null) {
+                        adris.altoclef.chains.MobDefenseChain defense = acMod.getMobDefenseChain();
+                        JsonObject combat = new JsonObject();
+                        combat.addProperty("mode", defense.getCombatMode());
+                        combat.addProperty("ranged", defense.isFightingAtRange());
+                        combat.addProperty("gearingUp", defense.isGearingUp());
+                        combat.addProperty("standingGround", defense.isStandingItsGround());
+                        // ⚠ a plain field read. this poll is its own thread; asking the
+                        // chain to WORK OUT the answer here would scan entities and
+                        // corrupt its tick-keyed threat cache under TaskRunner.
+                        combat.addProperty("couldWinIfGeared", defense.couldWinCurrentFightIfGeared());
+                        net.minecraft.world.entity.Entity combatTarget = defense.getCombatTarget();
+                        if (combatTarget != null) {
+                            combat.addProperty("target",
+                                    BuiltInRegistries.ENTITY_TYPE.getKey(combatTarget.getType()).getPath());
+                            combat.addProperty("targetDist",
+                                    Math.round(combatTarget.distanceTo(p) * 10.0) / 10.0);
+                        }
+                        combat.addProperty("arrows", adris.altoclef.util.helpers.CombatGear.arrowCount(acMod));
+                        combat.addProperty("canShoot", adris.altoclef.util.helpers.CombatGear.canShoot(acMod));
+                        gs.add("combat", combat);
+                    }
                 } catch (Throwable t) { /* task readout is best-effort */ }
 
                 if (mc.level != null) {
@@ -2459,6 +2611,13 @@ public class ExternalControlServer implements ClientModInitializer {
                             if (person.hurt()) po.addProperty("hurt", true);
                             if (person.threats() > 0) po.addProperty("threats", person.threats());
                             if (!person.holding().isEmpty()) po.addProperty("holding", person.holding());
+                            // ⚠ ALWAYS SENT, "none" when she looked and they had nothing on.
+                            // Omitting it on empty would make "no armour" and "this jar is too
+                            // old to tell" the same wire state, and node would then confidently
+                            // announce that every player on the server is naked. Absent must
+                            // mean only one thing: the companion cannot answer.
+                            po.addProperty("armor", person.armor().isEmpty() ? "none" : person.armor());
+                            if (person.geared()) po.addProperty("geared", true);
                             peopleArr.add(po);
                         }
                         gs.add("nearbyPeople", peopleArr);
@@ -2521,6 +2680,72 @@ public class ExternalControlServer implements ClientModInitializer {
                         lastOnlineNames = online;
                     } catch (Throwable ignored) { }
 
+                    // WHAT SHE HAS ACTUALLY ACHIEVED, from the real advancement tree.
+                    //
+                    // This replaces guessing from a chat announcement. The client holds the
+                    // complete server-authoritative set, including everything she earned
+                    // before this code existed and everything on servers that suppress the
+                    // announcement - neither of which the chat regex could ever see.
+                    //
+                    // ⚠ SENT AS A DELTA, NOT A DUMP. Vanilla ships ~120 advancements and this
+                    // poll runs every 2 seconds; shipping the full list would be ~4KB of
+                    // unchanged JSON 30 times a minute down a local socket for no reason. The
+                    // full set goes ONCE (first poll after joining, `advancementsAll`), and
+                    // after that only newly-completed ids (`advancementsNew`). Node keeps the
+                    // ledger; this is a feed, not a mirror.
+                    try {
+                        var conn = mc.getConnection();
+                        if (conn != null) {
+                            var adv = conn.getAdvancements();
+                            if (adv instanceof adris.altoclef.mixins.ClientAdvancementsAccessor accessor) {
+                                java.util.Set<String> done = new java.util.LinkedHashSet<>();
+                                for (var e : accessor.getProgress().entrySet()) {
+                                    if (e.getValue() != null && e.getValue().isDone() && e.getKey() != null) {
+                                        done.add(e.getKey().id().toString());
+                                    }
+                                }
+                                if (lastAdvancements == null) {
+                                    // first reading of the session: the whole set, once.
+                                    JsonArray all = new JsonArray();
+                                    for (String id : done) all.add(id);
+                                    gs.add("advancementsAll", all);
+                                    gs.addProperty("advancementCount", done.size());
+                                } else {
+                                    JsonArray fresh = new JsonArray();
+                                    for (String id : done) if (!lastAdvancements.contains(id)) fresh.add(id);
+                                    if (!fresh.isEmpty()) {
+                                        gs.add("advancementsNew", fresh);
+                                        gs.addProperty("advancementCount", done.size());
+                                    }
+                                }
+                                lastAdvancements = done;
+                            }
+                        }
+                    } catch (Throwable ignored) { }
+
+                    // BOSS BARS: the one bit of UI that means "something is happening".
+                    // A raid, the dragon, a wither, or any server plugin driving an event
+                    // bar. Always sent (even empty) - the bridge merges with Object.assign,
+                    // so a field that stops being sent keeps its last value forever and a
+                    // finished raid would stay on screen in her head for the rest of the
+                    // session.
+                    try {
+                        JsonArray bars = new JsonArray();
+                        if (mc.gui != null && mc.gui.getBossOverlay()
+                                instanceof adris.altoclef.mixins.BossHealthOverlayAccessor bossAccessor) {
+                            for (var ev : bossAccessor.getEvents().values()) {
+                                if (ev == null) continue;
+                                JsonObject bar = new JsonObject();
+                                bar.addProperty("name", ev.getName() == null ? "" : ev.getName().getString());
+                                bar.addProperty("percent", Math.round(ev.getProgress() * 100f));
+                                try { bar.addProperty("color", ev.getColor().name().toLowerCase()); } catch (Throwable ignored) { }
+                                bars.add(bar);
+                                if (bars.size() >= 4) break;
+                            }
+                        }
+                        gs.add("bossBars", bars);
+                    } catch (Throwable ignored) { }
+
                     try {
                         // nearby-resource affordance scan. the poll is ~every 2s (not per-tick),
                         // so a small box is cheap: read-only, reports nearest ores/logs/water/lava
@@ -2546,6 +2771,22 @@ public class ExternalControlServer implements ClientModInitializer {
                         double[] cropD = { Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE };
                         int[] cropCount = new int[cropIds.length];
                         int[] cropRipe = new int[cropIds.length];
+                        // WHAT KIND OF PLACE IS THIS? The scan already reads every block
+                        // state in the box, so recognising the blocks that ONLY occur inside
+                        // real dungeon content costs a string compare and nothing else.
+                        //
+                        // These four are load-bearing because each one identifies a structure
+                        // uniquely, with no false positives worth worrying about:
+                        //   spawner       -> the classic mossy-cobble dungeon (or a mineshaft)
+                        //   trial_spawner -> a TRIAL CHAMBER, and nothing else in the game
+                        //   vault         -> likewise, and it is the reward room
+                        //   sculk_shrieker-> the deep dark / ancient city
+                        // Before this she could stand in a trial chamber and have no idea:
+                        // nothing anywhere in the stack referenced trials, vaults or spawners.
+                        double spawnerD = Double.MAX_VALUE, trialD = Double.MAX_VALUE,
+                               vaultD = Double.MAX_VALUE, shriekerD = Double.MAX_VALUE;
+                        int spawnerN = 0, trialN = 0, vaultN = 0;
+                        boolean ominousVault = false;
                         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
                         int bx = bp.getX(), by = bp.getY(), bz = bp.getZ();
                         for (int dx = -R; dx <= R; dx++) for (int dz = -R; dz <= R; dz++) for (int dy = -RY; dy <= RY; dy++) {
@@ -2570,6 +2811,34 @@ public class ExternalControlServer implements ClientModInitializer {
                             else if (id.equals("hay_block")) { if (d2 < hayD) hayD = d2; }
                             else if (id.equals("chest") || id.equals("trapped_chest") || id.equals("barrel") || id.equals("ender_chest")) { if (d2 < chestD) chestD = d2; }
                             else if (id.endsWith("_bed")) { if (d2 < bedD) bedD = d2; }
+                            // ⚠ `trial_spawner` must be tested BEFORE `spawner`: a plain
+                            // `endsWith("spawner")` would swallow it and a trial chamber
+                            // would report as an ordinary dungeon forever. Exact ids, in the
+                            // specific-first order, for exactly that reason.
+                            else if (id.equals("trial_spawner")) { trialN++; if (d2 < trialD) trialD = d2; }
+                            else if (id.equals("spawner")) { spawnerN++; if (d2 < spawnerD) spawnerD = d2; }
+                            else if (id.equals("vault")) {
+                                vaultN++;
+                                if (d2 < vaultD) vaultD = d2;
+                                // The ominous variant is a BLOCKSTATE, not a separate block.
+                                //
+                                // ⚠ Read the value through the property instance the state
+                                // ITSELF carries. `BooleanProperty.create("ominous")` builds a
+                                // brand-new property object which the state's own map will
+                                // never match, so the lookup would have silently answered
+                                // "not ominous" for every vault in the game - the failure
+                                // being indistinguishable from there simply not being one.
+                                // Defensive: an absent property means ordinary, never a throw
+                                // that takes the whole affordance scan down with it.
+                                try {
+                                    for (var prop : state.getProperties()) {
+                                        if (!prop.getName().equals("ominous")) continue;
+                                        ominousVault = "true".equals(String.valueOf(state.getValue(prop)));
+                                        break;
+                                    }
+                                } catch (Throwable ignored) { }
+                            }
+                            else if (id.equals("sculk_shrieker")) { if (d2 < shriekerD) shriekerD = d2; }
                             else {
                                 for (int ci = 0; ci < cropIds.length; ci++) {
                                     if (!id.equals(cropIds[ci])) continue;
@@ -2602,6 +2871,24 @@ public class ExternalControlServer implements ClientModInitializer {
                         if (smokerD < Double.MAX_VALUE) nb.addProperty("smoker", (int) Math.round(Math.sqrt(smokerD)));
                         if (campfireD < Double.MAX_VALUE) nb.addProperty("campfire", (int) Math.round(Math.sqrt(campfireD)));
                         if (hayD < Double.MAX_VALUE) nb.addProperty("hay", (int) Math.round(Math.sqrt(hayD)));
+                        // DUNGEON CONTENT. Absent key = "none in the box", which for these
+                        // is honest: unlike a crop's ripeness there is no ambiguity about
+                        // whether a spawner is there. Counts ride along because ONE trial
+                        // spawner is a corner of a chamber and six is the middle of one.
+                        if (spawnerD < Double.MAX_VALUE) {
+                            nb.addProperty("spawner", (int) Math.round(Math.sqrt(spawnerD)));
+                            nb.addProperty("spawnerCount", spawnerN);
+                        }
+                        if (trialD < Double.MAX_VALUE) {
+                            nb.addProperty("trialSpawner", (int) Math.round(Math.sqrt(trialD)));
+                            nb.addProperty("trialSpawnerCount", trialN);
+                        }
+                        if (vaultD < Double.MAX_VALUE) {
+                            nb.addProperty("vault", (int) Math.round(Math.sqrt(vaultD)));
+                            nb.addProperty("vaultCount", vaultN);
+                            if (ominousVault) nb.addProperty("ominousVault", true);
+                        }
+                        if (shriekerD < Double.MAX_VALUE) nb.addProperty("sculkShrieker", (int) Math.round(Math.sqrt(shriekerD)));
                         for (int ci = 0; ci < cropIds.length; ci++) {
                             if (cropD[ci] == Double.MAX_VALUE) continue;
                             // `wheat`/`wheatCount` keep their old names and meanings so an
@@ -3166,6 +3453,11 @@ public class ExternalControlServer implements ClientModInitializer {
         // reconnecting into a busy server would report every player as a fresh
         // arrival. null re-seeds silently on the next poll.
         lastOnlineNames = null;
+        // ⚠ SAME REASONING, AND PER-SERVER BESIDES. Advancements do not travel between
+        // servers, so keeping one world's completed set would make every advancement
+        // she already holds on the NEXT world read as "not new" and none of them would
+        // ever be sent. null makes the next poll re-send the full set for that world.
+        lastAdvancements = null;
     }
 
     private static int resolvePort() {

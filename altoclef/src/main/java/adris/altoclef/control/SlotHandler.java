@@ -22,6 +22,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Predicate;
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.entity.EquipmentSlot;
 import adris.altoclef.util.helpers.ItemVersionHelper;
 
 
@@ -102,6 +103,40 @@ public class SlotHandler {
                 _mod.getSlotHandler().clickSlot(PlayerSlot.OFFHAND_SLOT, 0, ContainerInput.PICKUP);
             }
         }
+    }
+
+    /**
+     * put ONE armor piece on, without a task.
+     * <p>
+     * EquipArmorTask does this properly but it is a Task, so it needs the task slot -
+     * and the one moment she most needs armor on is mid-defense, where MobDefenseChain
+     * owns that slot and any second contender for it is how every freeze in that file
+     * started. this is the same two-click PICKUP dance as
+     * {@link #forceEquipItemToOffhand}, which KillAura already runs mid-fight, so the
+     * pattern is proven under exactly these conditions.
+     * <p>
+     * ⚠ refuses while an external container is open: a click aimed at an armor slot
+     * index lands somewhere else entirely inside a chest menu. the player's own default
+     * menu IS an InventoryMenu, so this only stands down for a real chest/furnace screen.
+     *
+     * @return true when the piece is already on (nothing left to do for it).
+     */
+    public boolean forceEquipArmorPiece(Item toEquip) {
+        EquipmentSlot armorSlot = ItemVersionHelper.getArmorSlot(toEquip);
+        if (armorSlot == null) return false;
+        Slot target = PlayerSlot.getEquipSlot(armorSlot);
+        if (target == null) return false;
+        if (StorageHelper.getItemStackInSlot(target).getItem() == toEquip) return true;
+        if (!(_mod.getPlayer().containerMenu instanceof net.minecraft.world.inventory.InventoryMenu)) return false;
+        List<Slot> currentItemSlot = _mod.getItemStorage().getSlotsWithItemPlayerInventory(false, toEquip);
+        for (Slot slot : currentItemSlot) {
+            if (!Slot.isCursor(slot)) {
+                clickSlot(slot, 0, ContainerInput.PICKUP);
+            } else {
+                clickSlot(target, 0, ContainerInput.PICKUP);
+            }
+        }
+        return false;
     }
 
     public boolean forceEquipItem(Item toEquip) {

@@ -26,12 +26,12 @@ Port from `MINECRAFT_BRIDGE_PORT`, default `7431`. Bound to `127.0.0.1`.
 |---|---|---|
 | `handshake` | `{type, source, version, capabilities}` | Sent on connect. |
 | `heartbeat` | `{type, timestamp, gameState}` | Liveness ping, carrying a state snapshot; answer with `heartbeat_ack`. |
-| `bridge_status` | `{type, gameConnected, companionSocketConnected, ...}` | Whether the bridge's own link to the game is up. This is how you know the difference between "bridge running" and "game running". |
-| `state` | `{type, gameState:{...}, observedAt}` | Live game state, roughly every 2s. `observedAt` is what the staleness checks read. |
+| `bridge_status` | `{type, altoclefConnected, companionSocketConnected, username, timestamp}` | Whether the bridge's own link to the game is up. This is how you know the difference between "bridge running" and "game running". ⚠ the wire field is `altoclefConnected`; `getStatus().gameConnected` is the library's own name for it, so a third-party controller reading `gameConnected` off the wire gets `undefined` forever. `username` is the only place the in-game player name reaches hop 1. |
+| `state` | `{type, gameState:{...}, observedAt}` | Live game state, roughly every 2s. `observedAt` is what the staleness checks read. ⚠ the bridge forwards its own **accumulated** snapshot, not the companion's frame — a key the companion stops sending keeps its last value. See [stale fields](#conditionally-sent-fields). |
 | `event` | `{type, event, data}` | Something happened (see [events](#game-events)). |
 | `response` | `{type, action_id, status, error?, result?}` | Outcome for the action with that `action_id`. **Not always terminal** — see below. |
-| `queue_status` | `{type, ...}` | The bridge's own action queue depth. |
-| `log` | `{type, level, message}` | Bridge-side log line, for your console. |
+| `queue_status` | `{type, ...}` | *Reserved — the reference bridge never sends this.* |
+| `log` | `{type, level, message}` | *Reserved — the reference bridge never sends this;* `log()` writes to its console and emits a local EventEmitter event only. |
 
 `status` is one of `executing`, `success`, `error`. **`executing` is a
 non-terminal acknowledgement** — it means "accepted, still running", and a
@@ -61,20 +61,30 @@ Bound to localhost on purpose — the bot must never be reachable off-box.
 ```jsonc
 {"type":"command","id":"<id>","command":"get diamond 3"}  // no leading '@'
 {"type":"chat","id":"<id>","text":"#explore"}             // raw line (baritone/chat)
-{"type":"ping"}
+{"type":"ping"}                                           // companion implements it;
+                                                          // the reference bridge never sends it
 ```
+
+`id` is omitted on one command: the control-loss `stop` the bridge issues when its
+own link drops. Nothing is waiting on that one.
 
 ### Companion -> bridge
 
 ```jsonc
 {"type":"hello","username":"Steve"}
 {"type":"ack","id":"<id>"}
-{"type":"finished","id":"<id>"}              // from altoclef's onFinish
-{"type":"error","id":"<id>","error":"..."}   // from altoclef's onError
+{"type":"finished","id":"<id>"}              // carries type + id only, never a result
+{"type":"error","id":"<id>","error":"..."}   // an ABORTED finish arrives here, not above
 {"type":"state","gameState":{...}}           // ~every 2s
-{"type":"event","event":"task_finished"|"chat",...}
-{"type":"pong"}
+{"type":"event","event":"...","data":{...}}  // payload is ALWAYS nested under "data"
+{"type":"pong"}                              // the reference bridge has no case for this
+                                             // and logs it as an unknown message
 ```
+
+⚠ `finished` and `error` both come out of one `sendTaskOutcome` on the companion
+side: a task that was *cancelled* rather than completed is turned into an `error`
+frame carrying its abort reason. That is the only thing separating "done" from
+"gave up" — the game reports a cancelled task exactly like a finished one.
 
 **Completion is real.** `finished` / `error` are driven by AltoClef's actual
 `TaskFinishedEvent`, not a timer. An earlier version of the bridge faked
@@ -106,14 +116,55 @@ skipped when the value cannot be read this tick.
 | `timeOfDay`, `weather` | `day`/`night`, `clear`/`rain`/`thunder` |
 | `rainingHere`, `skyVisible` | roof- and biome-aware: standing **in** the rain differs from rain existing somewhere |
 | `biome` | |
-| `nearbyHostiles`, `nearbyHostileTypes`, `nearbyPlayers` | counts and kinds, not a full entity dump |
-| `nearby` | the resource-affordance scan: nearest ore, water, wheat, bed, chest, furnace, smoker, crafting table |
-| `overWater`, `clearEdge` | standing over water; how much clear ground is around her |
+| `nearbyHostiles`, `nearbyHostileTypes`, `nearbyPlayers` | counts and kinds |
+| `nearbyCreatures` | the ranked entity readout, nearest-and-most-interesting first, capped at 6: `{type, dist, dir, vert?, notable?, boss?, hostile?, aggro?, baby?, tame?, name?}`. **Sent every poll even when empty**, deliberately — see [stale fields](#conditionally-sent-fields). `aggro` comes from the synced aggressive flag, not from a server-side target a client cannot see |
+| `nearbyCreatureTypes`, `foodAnimals`, `villagers` | the same sweep, summarised |
+| `nearbyPeople` | per-player: `{name, display?, dist, dir, vert?, watching?, sneaking?, onFire?, hurt?, threats?, holding?, armor, geared?}`. `watching` is "looking right at her" |
+| `onlinePlayers`, `onlinePlayerNames` | the tab list, not the loaded-entity sweep |
+| `bossBars` | `{name, percent, color}`, max 4 |
+| `nearby` | the resource-affordance scan (~35 keys): `nearestOre`/`nearestOreDist`, `ores`, `logs`, `water`, `lava`, `craftingTable`, `furnace`, `chest`, `bed`, `smoker`, `campfire`, `hay`; structure finds `spawner`, `trialSpawner`, `vault`, `ominousVault`, `sculkShrieker` (each with a `…Count`); and per crop (`wheat`, `carrot`, `potato`, `beetroot`, `berries`) a bare key plus `…Count` and `…Ripe`. ⚠ a missing `…Ripe` means *this build cannot tell*, never zero — a crop is present at any growth age but only harvestable at the last one |
+| `containers` | remembered chests/furnaces: `{dim,x,y,z,type,empty,full,at,items:{id:count}}`. `at` is when it was last actually read, not now |
+| `overWater`, `clearEdge` | standing over water; the edge of the largest clear cube she is standing in. ⚠ `clearEdge` is capped just above the largest threshold anything reads, because it is a shell scan on the render thread |
+| `lightLevel`, `depthBelowSurface` | |
+| `moonPhase`, `secondsUntilSunset`, `skyColorPhase` | `moonPhase` 0-7 (0 = full); `skyColorPhase` is one of `sunrise`, `morning`, `midday`, `afternoon`, `golden_hour`, `sunset`, `dusk`, `night`, `predawn`. **Overworld only** |
+| `saveName` | singleplayer world name. With `server`, this is what scopes per-world memory |
+| `chain`, `preempted` | which AltoClef chain owns her right now, and whether a non-user chain has taken over |
+| `combat` | `{mode, ranged, gearingUp, standingGround, couldWinIfGeared, target?, targetDist?, arrows, canShoot}`. ⚠ **omitted entirely when unreadable — absent is not "not fighting"** |
+| `advancementsAll` | the full id set, **first poll of a session only** |
+| `advancementsNew`, `advancementCount` | the delta on later polls, sent only when non-empty |
 | `homeSite` | the survey of a candidate or established home site |
 | `botTask` | high-level goal + phase, e.g. `beating the game.: getting blaze rods` |
 | `botAction` | deepest micro-action |
 | `botTaskPath`, `botTaskDepth` | the whole task chain, outermost first — this is what a "why is she doing that" readout is built from |
 | `settlementBuild` | exact toaster survey: kind/role/anchor/dimensions, phase, percent, shell/interior checks, two-slot check, walk-through check, side-torch counts, and remaining stone |
+
+Three fields on this frame come from the **bridge**, not the game: `currentTask`
+(the relay's own view of which action owns the task slot — distinct from
+`botTask`), plus `nearbyEntities` and `isInCombat`, which are vestigial and always
+`[]` / `false`.
+
+<a name="conditionally-sent-fields"></a>
+### ⚠ Conditionally-sent fields, and why that matters
+
+The bridge merges each companion frame into a running snapshot and forwards *the
+snapshot*. That is right for state — last known health is the best answer — and
+wrong for anything sent conditionally, because **a field that stops being sent
+keeps its last value forever**.
+
+- `advancementsAll` / `advancementsNew` describe a moment, not a condition, so the
+  bridge drops them from the snapshot the instant it has forwarded them. Without
+  that they latch and re-deliver the same advancements on every poll, which on the
+  reference implementation meant rewriting the whole memory ledger to disk every
+  two seconds.
+- `combat`, `preempted` and `chain` are each inside their own `try` on the
+  companion side, so they genuinely can stop arriving. A consumer that treats
+  absent as "unknown" cannot see that through the merge — budget your own timeout
+  rather than waiting for the field to disappear.
+- `moonPhase`, `secondsUntilSunset` and `skyColorPhase` are **overworld only**, so
+  they hold their last overworld reading while she is in the nether or the end.
+  Gate them on `dimension` yourself.
+- `server` survives a return to singleplayer; `saveName` survives a join. Read them
+  together with `multiplayer`, which is always sent.
 
 `botTask` is what lets a character say what it is genuinely doing right now. It
 comes from `getTaskRunner().getCurrentTaskChain()`; older mod builds without the
@@ -126,10 +177,28 @@ comes from `getTaskRunner().getCurrentTaskChain()`; older mod builds without the
 Delivered as `{type:'event', event, data}` and re-emitted by the Node library as
 `gameEvent(event, data)`. This is the main feed for a VTuber brain.
 
-The full set the companion emits: `chat`, `creeper_spotted`, `damage_taken`,
-`death`, `diamond_found`, `dimension_changed`, `hostiles_nearby`,
-`inventory_change`, `low_hunger`, `manual_control`, `nightfall`,
-`protection_denied`, `respawn`, `task_finished`, `weather_changed`.
+The full set the companion emits: `achievement`, `block_broken`, `chat`,
+`creeper_spotted`, `damage_taken`, `death`, `diamond_found`,
+`dimension_changed`, `entity_killed`, `hostiles_nearby`, `inventory_change`,
+`item_collected`, `low_hunger`, `manual_control`, `nightfall`, `player_joined`,
+`player_left`, `protection_denied`, `rare_find`, `respawn`, `task_finished`,
+`weather_changed`.
+
+`task_finished` carries an `abortReason` when the task was cut short rather than
+completed. **Read it.** The game reports a cancelled task exactly like a finished
+one, so without it a goal abandoned at 34% is indistinguishable from a job done —
+and a controller that books it as a success will never retry.
+
+`position_update` and `time_update` are handled by the reference bridge and the
+Node library but emitted by nothing; treat them as reserved.
+
+The Node library **synthesises** a further set on the same `gameEvent` channel,
+with no wire origin — they come from its own perception and memory layers:
+`place_discovered`, `first_time`, `helping_player`, `noticings`,
+`creature_spotted`, `biome_changed`, `bread_opportunity`, `player_approached`,
+`room_quiet_moment`, `oven_installed`, `target_unreachable`, `pinned_by_mobs`,
+`request_opportunity`, `home_unreachable`, `homestead_settled`,
+`expedition_started`, `expedition_ended`.
 
 Note `death` and `diamond_found` are singular — the human-readable *labels* read
 "died" and "diamonds found", but a handler must match the event name.
@@ -158,17 +227,41 @@ reconnecting, preventing an old task from continuing unsupervised.
 
 1. **Node side** — add it to the action enum and, if it needs no game round
    trip, answer it locally from `getStatus()` / memory.
-2. **Bridge** — map it to an AltoClef command string in the translation table.
+2. **Bridge** — add the name to `SUPPORTED_ACTIONS` **and** map it to a command
+   string in `_translate`. Both: `_handleAction` checks the set and rejects with
+   `unsupported minecraft action` *before* `_translate` is ever reached, so a
+   translation on its own is dead code. A control verb that starts no goal must
+   also go into `NON_TASK_ACTIONS`, or its instant completion blanks the
+   `currentTask` of a goal that is still running.
 3. **Mod side** — only if AltoClef has no command for it; add a `Command`
    subclass and register it. `PlaceCommand.java` in the fork is a small worked
    example.
 
+⚠ An action handled *only* by your own controller, above the library, is a trap:
+anything the library's own chat parser or autonomy can produce reaches the bridge
+directly and will be rejected there. Handle it inside the library, or make sure
+nothing else can emit it.
+
 Actions that never reach the game (answered from memory) include `status`,
 `enable`, `disable`, `autonomous`, `favorite`, `unfavorite`, `favorites`,
-`set_home`, `set_outpost`, `outposts`, `gamer`, `gamer_stop`.
+`set_home`, `set_outpost`, `outposts`, `gamer`, `gamer_stop`, `places`,
+`remember_place`, `forget_place`, `food_spots`, `forget_food`, `stores`, and
+`retreat` (composed node-side out of other verbs). `go_place`, like `go_home` and
+`go_outpost`, is a coordinate rewrite: it *does* reach the game, as a `move`.
 
 `inventory` and `coords` look like they belong on that list and do not — both
 are real companion commands and need a live game.
+
+### Game-bound actions not shown elsewhere in this doc
+
+| Action | Becomes | Notes |
+|---|---|---|
+| `stock_food` | `@food <score>` | a forage. deliberately **not** `eat`, which is a safety action and skips the busy gate. `amount` is a food *score* (nutrition × count), not an item count |
+| `withdraw` | `@withdraw <item> <n>` | take back out of a chest. clamp to what the chest actually has — over-asking has no give-up |
+| `peek` | `@peek x y z` | read a container without taking anything. do this before sizing a withdraw; the cache only refreshes while the screen is open |
+| `place_block` | `@place_at x y z <block>` | lighting, shoring, ornaments at an exact coordinate. deliberately **not** `install_appliance`, which files against the settlement ledger and counts toward its completion |
+| `protect_settlement` | `@protect_settlement …` | "never mine or bridge through this building". starts no goal |
+| `tic` | `@tic crouch\|jump\|flex` | a one-second fidget. the library sends this itself |
 
 ### Settlement actions
 
@@ -177,7 +270,7 @@ are real companion commands and need a live game.
 | `build_settlement` | `role` (`homestead`/`outpost`); needs a settlement already saved | `@toaster_build ...` |
 | `install_appliance` | `target` (see allowlist below), integer `x,y,z` | `@place_at ...` |
 | `set_outpost` | local `target` name and optional `level` | persisted only |
-| `build_outpost` | saved outpost name | resolves its persisted geometry, then builds |
+| `build_outpost` | saved outpost name | *node-side only* — resolves its persisted geometry and is rewritten into `build_settlement` before it reaches the bridge, which has no `build_outpost` of its own |
 
 `build_settlement` takes no dimensions from you. The floorplan is the only legal
 shape, so the bridge **resolves** width/depth/height from `role` rather than

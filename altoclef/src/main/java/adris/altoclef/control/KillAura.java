@@ -33,6 +33,7 @@ import net.minecraft.world.entity.monster.illager.Pillager;
 import net.minecraft.world.entity.monster.skeleton.Stray;
 import net.minecraft.core.component.DataComponents;
 import adris.altoclef.util.helpers.ItemVersionHelper;
+import adris.altoclef.util.helpers.CombatGear;
 import net.minecraft.world.entity.projectile.throwableitemprojectile.AbstractThrownPotion;
 
 /**
@@ -46,25 +47,22 @@ public class KillAura {
     private double _forceFieldRange = Double.POSITIVE_INFINITY;
     private Entity _forceHit = null;
 
+    /**
+     * ⚠ same two defects as AbstractKillEntityTask.bestWeapon had: sword-only (so an axe,
+     * which out-damages the sword of its own material, was invisible) and a per-iteration
+     * decision rather than a maximum - it re-equipped inside the loop, so the LAST sword
+     * the inventory yielded won, not the best one. Worse here than there, because this
+     * runs on the force field every tick: a wooden sword sorted after a diamond one meant
+     * she swapped weapons repeatedly mid-swing.
+     */
     public static void equipWeapon(AltoClef mod) {
-        List<ItemStack> invStacks = mod.getItemStorage().getItemStacksPlayerInventory(true);
-        if (!invStacks.isEmpty()) {
-            float handDamage = Float.NEGATIVE_INFINITY;
-            for (ItemStack invStack : invStacks) {
-                Item item = invStack.getItem();
-                if (ItemVersionHelper.isSword(item)) {
-                    float itemDamage = ItemVersionHelper.getAttackDamage(item);
-                    Item handItem = StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot()).getItem();
-                    if (ItemVersionHelper.isSword(handItem)) {
-                        handDamage = ItemVersionHelper.getAttackDamage(handItem);
-                    }
-                    if (itemDamage > handDamage) {
-                        mod.getSlotHandler().forceEquipItem(item);
-                    } else {
-                        mod.getSlotHandler().forceEquipItem(handItem);
-                    }
-                }
-            }
+        Item best = CombatGear.bestMeleeWeapon(mod);
+        if (best == null) return;
+        Item handItem = StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot()).getItem();
+        if (handItem == best) return;
+        float handDamage = ItemVersionHelper.isMeleeWeapon(handItem) ? ItemVersionHelper.getAttackDamage(handItem) : 0;
+        if (ItemVersionHelper.getAttackDamage(best) > handDamage) {
+            mod.getSlotHandler().forceEquipItem(best);
         }
     }
 

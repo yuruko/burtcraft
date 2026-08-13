@@ -100,6 +100,24 @@ public class HeroTask extends Task {
         if (closest != null) {
             if (closest != _combatTarget || _combatTask == null) {
                 _combatTarget = closest;
+                // BOW OR BLADE, decided ONCE per target - same question, same answer, and
+                // deliberately the defense chain's own predicate rather than a second copy
+                // of it here. `@hero` is what burnt's `attack`/`defend` verbs and every
+                // viewer "kill that skeleton" run, so without this she could shoot
+                // reflexively but never because she or anyone else chose to.
+                //
+                // ⚠ latched with the target, not re-asked per tick: the inputs (distance,
+                // arrows, line of sight) all move constantly, and this assignment tears
+                // down and rebuilds the sub-task.
+                _combatTask = mod.getMobDefenseChain().shouldFightAtRange(mod, closest)
+                        ? new BowCombatTask(closest)
+                        : new KillEntityTask(closest);
+            }
+            // a ranged engagement that ran dry or could not line the shot up must fall
+            // back to the blade rather than sit here finished - the same one-way door the
+            // chain uses. Without it, HeroTask keeps returning a task that reports itself
+            // done and nothing ever kills the mob.
+            if (_combatTask instanceof BowCombatTask bow && bow.gaveUp()) {
                 _combatTask = new KillEntityTask(closest);
             }
             setDebugState("Finishing current hostile.");

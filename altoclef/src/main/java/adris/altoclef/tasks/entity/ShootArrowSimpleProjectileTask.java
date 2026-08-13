@@ -36,7 +36,12 @@ public class ShootArrowSimpleProjectileTask extends Task {
         shooting = false;
     }
 
-    private static Rotation calculateThrowLook(AltoClef mod, Entity target) {
+    /**
+     * gravity-corrected aim for a bow at the given charge. public because
+     * {@link BowCombatTask} fights a whole engagement with it and a second copy of
+     * ballistics is a second place for it to drift.
+     */
+    public static Rotation calculateThrowLook(AltoClef mod, Entity target) {
         // Velocity based on bow charge.
         float velocity = (mod.getPlayer().getTicksUsingItem() - mod.getPlayer().getUseItemRemainingTicks()) / 20f;
         velocity = (velocity * velocity + velocity * 2) / 3;
@@ -135,9 +140,17 @@ public class ShootArrowSimpleProjectileTask extends Task {
         return shot;
     }
 
+    /**
+     * ⚠ this used to be a flat {@code return false}, which is a live landmine for any
+     * caller inside a chain: {@code SingleTaskChain.setTask()} keeps the OLD task when
+     * the replacement {@code isEqual}, so "never equal" means every tick mints a fresh
+     * instance, tears the sub-task tree down and force-cancels baritone. That is the
+     * exact shape of every freeze in MobDefenseChain's history. Harmless while the only
+     * caller was Playground; not harmless now that ranged combat is real.
+     */
     @Override
     protected boolean isEqual(Task other) {
-        return false;
+        return other instanceof ShootArrowSimpleProjectileTask task && task.target == target;
     }
 
     @Override

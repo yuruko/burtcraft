@@ -356,7 +356,7 @@ const MOCK_LIVE = {
     botTask: 'mine diamond ore: digging down to y-54',
     botAction: 'break block',
     activeGoal: {
-        action: 'mine', target: 'diamond_ore', source: 'llm',
+        action: 'mine', target: 'diamond_ore', source: 'agent',
         runningForMs: 412000, lastProgressAgeMs: 3000, confinedMs: 180000
     },
     gameState: {

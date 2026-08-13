@@ -165,7 +165,7 @@ async function handleGameChat(sender, text) {
         // cheque. this example executes it to show the call; a production app
         // should decide per-sender whether server chat gets authority or only
         // gets to make a suggestion.
-        await runIt(command, 'viewer');
+        await runIt(command, 'request');
     } else {
         console.log('   -> no built-in verb matched');
         record(sender, text, { inGame: true });
@@ -210,7 +210,8 @@ async function runIt(command, source) {
             // soon as the game accepts the job; the tool keeps tracking it and
             // will emit actionComplete/actionFailed later.
             waitForCompletion: false,
-            // 'llm' | 'viewer' | 'autonomy' - your tags, applied consistently.
+            // one of the five the arbitration tables know: 'agent' | 'operator' | 'request'
+            // | 'autonomous' | 'gamer'. a made-up tag is neither preempting nor replaceable.
             // the core's own drives tag themselves 'autonomous' plus a family of
             // internal ones ('safety', 'water-escape', 'protection', 'recovery').
             // anything you did not set is the bot acting on its own.

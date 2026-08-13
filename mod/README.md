@@ -68,6 +68,9 @@ crash on stream.
 | `BURTCRAFT_INTENT_HUD` | on | set `0` to disable the HUD |
 | `BURTCRAFT_AUTO_THIRD_PERSON` | on | set `0` to disable |
 | `BURTCRAFT_KEEP_RENDERING` | on | set `0` to allow FPS throttling |
+| `BURTCRAFT_HIDE_TUTORIAL` | on | set `0` to leave the vanilla tutorial hints on screen |
+| `BURTCRAFT_VANITY_CAMERA` | on | set `0` to disable the occasional drop to third person |
+| `BURTCRAFT_TICS` | on | set `0` to disable the idle camera tics |
 
 The socket binds to localhost only, on purpose. The bot must never be reachable
 off-box.

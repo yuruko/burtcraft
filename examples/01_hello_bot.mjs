@@ -217,7 +217,7 @@ async function tryOneAction() {
             priority: 'normal',
             // ALWAYS tag the source. the autonomy loop and your llm are peers
             // competing for one bot; this is how you tell later who asked.
-            source: 'llm'
+            source: 'agent'
         });
         console.log('  action result:', result);
     } catch (err) {

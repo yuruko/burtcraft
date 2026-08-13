@@ -387,7 +387,7 @@ async function main() {
     console.log('dispatching, with nothing connected');
     console.log('='.repeat(72));
     for (const call of DEMO_CALLS) {
-        const result = await runMinecraftTool(call, { tool, source: 'llm' });
+        const result = await runMinecraftTool(call, { tool, source: 'agent' });
         console.log(`\n  call   : ${JSON.stringify(call)}`);
         console.log(`  result : ${result}`);
     }
